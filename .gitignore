@@ -1,0 +1,44 @@
+# Nvidia's Library
+third_party/nvngx_dlssnr.dll
+
+# Build outputs
+build/
+runtime/build/
+runtime/build-mingw/
+linux/build/
+out/
+dist/
+*.hsaco
+*.isa
+*.elf
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.dll
+*.exe
+*.cso
+kernels/gfx12_emulated/
+__pycache__/
+*.pyc
+*.log
+
+# Anything derived from NVIDIA's network must never be committed: extracted
+# PTX, captured launches (they hold weights), reference arrays, translation
+# caches and the network itself.
+*.ptx
+*.fatbin
+capture_*/
+captures/
+*.npz
+*.npy
+*.db
+# The network itself is shipped in the release package only: a copy kept in
+# third_party\ for packaging stays out of the repository.
+nvngx_dlssnr*.dll
+
+# Local tooling
+.vs/
+.vscode/
+*.user

@@ -1,0 +1,223 @@
+# Which translated kernels a native one stands in for.
+#
+# Point the proxy at this file with NVCUDA_PROXY_NATIVE. One kernel per line:
+#
+#   <ptx kernel name>  <code object>  block=x,y,z  args=<bytes>  [entry=<symbol>]
+#
+# block= and args= are not decoration: they are the gate. A build of DLSS whose
+# kernel has a different block shape or a different parameter size is a kernel
+# this native one was not written for, and the line below will refuse to run and
+# leave the translation in place rather than produce a wrong image.
+#
+# Measured on 310.8.0.0, at 2560x1440, from the proxy's own launch log. The
+# resolution is not a guess: 2560/16 = 160 and 1440/16 = 90 match the (160, 92)
+# tile grid the kernels are handed in their parameter.
+#
+#   kernel                                             ms    %   block    grid
+#   swin_8h_256_8_chained_fp8                       42.06  11.1  32x8x1   20x12x1
+#   pre_block_swin_1h_32_1_ds_fp8                   30.56   8.0  32x1x1   320x184x1
+#   swin_4h_128_4_chained_fp8                       30.29   8.0  32x4x1   40x23x1
+#   post_block_swin_1h_32_fp8                       28.70   7.5  32x1x1   321x185x1
+#   swin_1h_32_1_chained_fp8                        28.20   7.4  32x1x1   161x92x1
+#
+# The 88-byte parameter is passed by value, not by pointer (the PTX declares
+# .param .align 8 .b8 <name>_param_0[88]). Its layout, cross-checked between
+# what the kernel loads and what a real launch carried:
+#
+#   +0x00  const void*   input, into the working pool
+#   +0x08  const void*   second input, same pool
+#   +0x10  void*         output, into the weight/persistent pool
+#   +0x18  --            never read
+#   +0x20  int2          (160, 92) tiles, constant for a resolution
+#   +0x28  int2          window shift, alternates between launches (0,0)/(-4,-4)
+#   +0x30  const void*   third buffer
+#   +0x38  int2          (0, 0)
+#   +0x40  const void*   fourth buffer
+#   +0x48  --            never read
+#   +0x50  --            never read
+#
+# The same block again with eight heads and 256 channels, on eight warps. The
+# split is the 4H one; what differs is the memory: eight warps and 256 channels
+# do not fit with f16 buffers, so what crosses shared memory stays e4m3 and is
+# widened where it is used -- sixteen bytes read in one go are one operand, one
+# LDS read instead of two, and the values are the same to the bit. Checked on
+# two captured launches (21x12 at shift (-4,-4) and 20x12 at (0,-4)) against the
+# translation run here: every output byte and every ready flag identical.
+cc_tinlayout_fused_swin_8h_256_8_chained_fp8  swin_8h.hsaco  block=32,8,1  args=88  entry=cc_tinlayout_fused_swin_8h_256_8_chained_fp8_native
+
+# The first native kernel in service. Checked on a captured launch (ab_ffwd.py):
+# output bytes and ready flags identical to the translated kernel's, because it
+# issues the same WMMAs on the same operands; 0.22 ms per launch.
+cc_split_swin_16h_ffwd_512_chained_fp8  ffwd_512.hsaco  block=32,8,1  args=56  entry=cc_split_swin_16h_ffwd_512_chained_fp8_native
+
+# tin3::Conv2d1x1Layer<512, 512>: the same layer in two launch shapes, one code
+# object (conv1x1_512.hip). Checked on captured launches (ab_capture.py): output
+# bytes and ready flags identical to the translated kernels'.
+cc_split_swin_16h_proj_512_chained_fp8       conv1x1_512.hsaco  block=32,8,1  args=72  entry=cc_split_swin_16h_proj_512_chained_fp8_native
+cc_split_swin_16h_ffwd_proj_512_chained_fp8  conv1x1_512.hsaco  block=32,4,1  args=72  entry=cc_split_swin_16h_ffwd_proj_512_chained_fp8_native
+
+# The ViT stage's 1D linear layers. Their PTX splits K over the grid's four z
+# slices and sums the partials in f16, in turn, through a scratch buffer; the
+# native kernels do the same four partials in registers (ref_layers.py).
+cc_vit_1d_ffn_expand_chained_fp8      vit_ffn_expand.hsaco  block=32,4,1  args=72  entry=cc_vit_1d_ffn_expand_chained_fp8_native
+cc_vit_1d_ffn_contract_chained_fp8    vit_gemm.hsaco        block=32,4,1  args=72  entry=cc_vit_1d_ffn_contract_chained_fp8_native
+cc_vit_1d_projection_chained_fp8      vit_gemm.hsaco        block=32,4,1  args=72  entry=cc_vit_1d_projection_chained_fp8_native
+
+# The fused Swin block, one head, 32 channels: four SiLU branches, cosine
+# attention with the exponential done on the bits, and the projection onto the
+# scaled residual. Checked on two captured launches -- the kernel runs in pairs,
+# with different window shifts and grids ((-4,-4) at 161x93 and (-4,0) at
+# 161x92) -- with ab_capture.py --pool, which rebuilds the capture's windows as
+# one allocation because this kernel's surface is larger than the dumped window.
+# Every output byte and every ready flag equal to the translated kernel's, run
+# here on the same inputs. 87.3 -> 28.0 ms per frame over its 12 launches.
+cc_tinlayout_fused_swin_1h_32_1_chained_fp8  swin_1h.hsaco  block=32,1,1  args=96  entry=cc_tinlayout_fused_swin_1h_32_1_chained_fp8_native
+
+# The same block with two heads and 64 channels, on two warps: one takes a patch
+# row through the branches, then a head through the attention, then half the
+# output channels -- which is one 512-byte chunk of every patch. Checked on two
+# captured launches (the pair of shifts, 81x47 and 81x46) against the
+# translation run here: every output byte and every ready flag identical.
+cc_tinlayout_fused_swin_2h_64_2_chained_fp8  swin_2h.hsaco  block=32,2,1  args=88  entry=cc_tinlayout_fused_swin_2h_64_2_chained_fp8_native
+
+# The 16-head stage's attention, whole: one 8x8 window per block, the head
+# picked by the grid's z slice and the warp. Its 512 input channels cross LDS
+# one 32-channel chunk at a time, which is what keeps the block at 28 KB while
+# four warps share the window. Checked on two captured launches -- the kernel
+# runs in shifted pairs, (0,0) at 10x6x4 and (-4,-4) at 11x7x4 -- against the
+# translation run here: every output byte and every ready flag identical.
+cc_split_swin_16h_qkv_512_chained_fp8  qkv_512.hsaco  block=32,4,1  args=56  entry=cc_split_swin_16h_qkv_512_chained_fp8_native
+
+# The same block with four heads and 128 channels, on four warps, and the work
+# split four ways: a head each through the branches, then 32 output channels
+# each for the expansion (which is where the four heads chain), a head each
+# again through the attention, and 32 output channels each for the projection.
+# Its weights come in a 32-channel chunk at a time -- four warps holding whole
+# matrices would not fit in LDS. Checked on two captured launches (the pair of
+# shifts, 41x24 and 41x23) against the translation run here: every output byte
+# and every ready flag identical.
+cc_tinlayout_fused_swin_4h_128_4_chained_fp8  swin_4h.hsaco  block=32,4,1  args=88  entry=cc_tinlayout_fused_swin_4h_128_4_chained_fp8_native
+
+# The 1H block's downsampling sibling: the same block on the same weights, and
+# then one matrix more -- the window's 8x8 result averaged 2x2 in f16 and
+# projected onto 64 channels, into a second surface at half the resolution,
+# held as four planes of sixteen channels. Same code object as the plain 1H,
+# a second entry point. Checked on a captured launch: over the region the
+# dumped window can support, every byte of both outputs identical. (Past that
+# region a block's input is outside the dump and both sides compute from
+# zeros, which a byte diff cannot tell from "not written" -- the plain 1H
+# reads the same way against the same capture.)
+cc_tinlayout_fused_swin_1h_32_1_ds_wait_fp8  swin_1h.hsaco  block=32,1,1  args=96  entry=cc_tinlayout_fused_swin_1h_32_1_ds_wait_fp8_native
+
+# The 2H block's downsampling sibling, in its code object as a second entry.
+# The window's result is averaged 2x2 and projected onto 128 channels into a
+# surface at half the resolution, eight planes of sixteen; the two warps split
+# each of its two 64-output halves. Checked on a captured launch: over the
+# region the dumped window supports, every byte of both outputs identical.
+cc_tinlayout_fused_swin_2h_64_2_ds_wait_fp8  swin_2h.hsaco  block=32,2,1  args=88  entry=cc_tinlayout_fused_swin_2h_64_2_ds_wait_fp8_native
+
+# The 4H and 8H blocks' downsampling siblings, each a second entry in its own
+# code object. Same stage as the 1H's and the 2H's, scaled: the 2C outputs are
+# two groups of C and a warp takes 32 of each, so the halved surface has 2C/16
+# planes of sixteen channels. Checked on captured launches: over the region the
+# dumped window supports, every byte of every plane identical.
+cc_tinlayout_fused_swin_4h_128_4_ds_wait_fp8  swin_4h.hsaco  block=32,4,1  args=88  entry=cc_tinlayout_fused_swin_4h_128_4_ds_wait_fp8_native
+cc_tinlayout_fused_swin_8h_256_8_ds_wait_fp8  swin_8h.hsaco  block=32,8,1  args=88  entry=cc_tinlayout_fused_swin_8h_256_8_ds_wait_fp8_native
+
+# The 1H block's upsampling sibling, a third entry in the same code object. It
+# reads back the halved surface a ds_wait kernel wrote, the 4x4 under its
+# window, through one matrix of 32 outputs from 64; adds the full-resolution
+# input scaled per channel by a table of its own; and runs the block on that.
+# Its weight blob is the plain one with that matrix and that table inserted.
+# Checked on a captured launch (with a 16 MB window: the halved surface's four
+# planes do not fit in 8): over the region the dump supports, every output
+# byte identical, and every ready flag.
+cc_tinlayout_fused_swin_1h_32_1_upsample_tilesync_fp8  swin_1h.hsaco  block=32,1,1  args=96  entry=cc_tinlayout_fused_swin_1h_32_1_upsample_tilesync_fp8_native
+
+# The 2H, 4H and 8H blocks' upsampling siblings, a third entry in each code
+# object. The 1H one's stage, scaled: a matrix of C outputs from 2C over the
+# halved surface's 2C/16 planes, plus the input scaled per channel. One
+# difference from the 1H: the residual takes the sum narrowed to e4m3, not the
+# sum as it came. Checked on captured launches: over the region the dump
+# supports, every output byte and every ready flag identical.
+cc_tinlayout_fused_swin_2h_64_2_upsample_tilesync_fp8   swin_2h.hsaco  block=32,2,1  args=88  entry=cc_tinlayout_fused_swin_2h_64_2_upsample_tilesync_fp8_native
+cc_tinlayout_fused_swin_4h_128_4_upsample_tilesync_fp8  swin_4h.hsaco  block=32,4,1  args=88  entry=cc_tinlayout_fused_swin_4h_128_4_upsample_tilesync_fp8_native
+cc_tinlayout_fused_swin_8h_256_8_upsample_tilesync_fp8  swin_8h.hsaco  block=32,8,1  args=88  entry=cc_tinlayout_fused_swin_8h_256_8_upsample_tilesync_fp8_native
+
+# The view siblings, two more entries in each of the four code objects. The
+# chained block unchanged, with its input (inpview_tilesync) or its output
+# (outview_wait) as a plain surface instead of patches: planes of sixteen
+# channels at full resolution, the surface's dimensions at the parameter's
+# last pair (zero: the tokens' own). inpview signals and waits for nobody,
+# outview waits and signals nobody. Checked on captured launches: every output
+# byte and every ready flag identical -- except the 4H inpview, whose captured
+# weight blob is cut short by the end of its allocation; for that one the
+# network's image is the check.
+cc_tinlayout_fused_swin_1h_32_1_inpview_tilesync_fp8    swin_1h.hsaco  block=32,1,1  args=96  entry=cc_tinlayout_fused_swin_1h_32_1_inpview_tilesync_fp8_native
+cc_tinlayout_fused_swin_1h_32_1_outview_wait_fp8        swin_1h.hsaco  block=32,1,1  args=96  entry=cc_tinlayout_fused_swin_1h_32_1_outview_wait_fp8_native
+cc_tinlayout_fused_swin_2h_64_2_inpview_tilesync_fp8    swin_2h.hsaco  block=32,2,1  args=88  entry=cc_tinlayout_fused_swin_2h_64_2_inpview_tilesync_fp8_native
+cc_tinlayout_fused_swin_2h_64_2_outview_wait_fp8        swin_2h.hsaco  block=32,2,1  args=88  entry=cc_tinlayout_fused_swin_2h_64_2_outview_wait_fp8_native
+cc_tinlayout_fused_swin_4h_128_4_inpview_tilesync_fp8   swin_4h.hsaco  block=32,4,1  args=88  entry=cc_tinlayout_fused_swin_4h_128_4_inpview_tilesync_fp8_native
+cc_tinlayout_fused_swin_4h_128_4_outview_wait_fp8       swin_4h.hsaco  block=32,4,1  args=88  entry=cc_tinlayout_fused_swin_4h_128_4_outview_wait_fp8_native
+cc_tinlayout_fused_swin_8h_256_8_inpview_tilesync_fp8   swin_8h.hsaco  block=32,8,1  args=88  entry=cc_tinlayout_fused_swin_8h_256_8_inpview_tilesync_fp8_native
+cc_tinlayout_fused_swin_8h_256_8_outview_wait_fp8       swin_8h.hsaco  block=32,8,1  args=88  entry=cc_tinlayout_fused_swin_8h_256_8_outview_wait_fp8_native
+
+# The ViT stage's q, k, v projection: 1024 channels to 32 heads, q and k
+# normalised per head (q scaled by sqrt(32) and a learned f32 per head), each
+# written in the layout the attention reads -- q as activations, k in the
+# B-fragment layout, v transposed. The PTX splits K over two z slices and hands
+# a partial across through a scratch buffer; here the z slice picks the head
+# and each block runs both halves of K itself, in the same two chains, so the
+# scratch buffer is never written. Checked on a captured launch: q, k, v, the
+# counters and the ready flags identical, every byte.
+cc_vit_1d_qkv_chained_fp8  vit_qkv.hsaco  block=32,4,1  args=80  entry=cc_vit_1d_qkv_chained_fp8_native
+
+# The ViT stage's attention: all 960 tokens attend to all 960, one head per
+# block column, 256 queries per block row, keys in blocks of 64. The
+# exponential is the bit trick of the Swin blocks with its own constants; the
+# row sums follow the translation's lane tree (found by running the PTX
+# symbolically) and the normalisation comes after P . V. Checked on a captured
+# launch: every output byte and every ready flag identical.
+cc_vit_1d_attention_chained_fp8  vit_attention.hsaco  block=32,4,1  args=64  entry=cc_vit_1d_attention_chained_fp8_native
+
+# The pre block: the network's first layer, at full resolution. Its 16 inputs
+# per token come from the frame's textures -- colour, history reprojected
+# through the motion vector found at the nearest of five depths and sampled
+# with a five-tap Catmull-Rom, a fifth texture, gaussian noise from a hash --
+# sampled through the same descriptors ZLUDA hands over, with ZLUDA's own
+# approximate f32 operations. Then one f16 matrix onto 32 channels and the 1H
+# block, a third entry in swin_1h.hsaco. The network's harness binds only the
+# colour texture, so every branch was checked with pre_block_check.py instead:
+# synthetic textures, translated and native run on the same texture objects,
+# seven branch combinations on several sizes -- every output byte identical.
+cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8  swin_1h.hsaco  block=32,1,1  args=264  entry=cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native
+
+# The post block: the network's last layer, a fourth entry in swin_1h.hsaco.
+# The 1H block on the halved surface (nearest) and the full-resolution
+# features, each times a table of its own, then one f16 matrix onto a colour
+# and a blend logit per pixel, composed with the input colour and the history
+# reprojected through the motion vector (five-tap Catmull-Rom), and stored to
+# the output surface with the same image store the translation uses. Checked
+# with post_block_check.py on synthetic inputs, ten branch combinations on
+# several sizes: every texel identical.
+cc_tinlayout_fused_post_block_swin_1h_32_fp8  swin_1h.hsaco  block=32,1,1  args=184  entry=cc_tinlayout_fused_post_block_swin_1h_32_fp8_native
+
+# The ViT stage's first expansion, cc_vit_1d_ffn_expand_publish_fp8: the
+# chained layer as the first of its chain, which waits for nobody -- its PTX
+# never reads the producer's flags. Same code object, a second entry. Checked
+# on a captured launch: every output byte and every ready flag identical.
+cc_vit_1d_ffn_expand_publish_fp8  vit_ffn_expand.hsaco  block=32,4,1  args=72  entry=cc_vit_1d_ffn_expand_publish_fp8_native
+
+# The 1x1 convolution's view siblings, two more entries in conv1x1_512.hsaco:
+# the ffwd projection reading its residual as a plain surface (planes of
+# sixteen channels), and the attention's projection writing its output as one,
+# on four warps and raising no flag. Checked on captured launches: every
+# output byte and every ready flag identical.
+cc_split_swin_16h_ffwd_proj_inpview_512_chained_fp8  conv1x1_512.hsaco  block=32,4,1  args=72  entry=cc_split_swin_16h_ffwd_proj_inpview_512_chained_fp8_native
+cc_split_swin_16h_proj_512_outview_wait_fp8          conv1x1_512.hsaco  block=32,4,1  args=72  entry=cc_split_swin_16h_proj_512_outview_wait_fp8_native
+
+# The ffwd block's view sibling, a second entry in ffwd_512.hsaco: its input
+# as a plain surface, on four warps -- each wave takes both patch rows in
+# turn. It signals and waits for nobody. Checked on a captured launch: every
+# output byte and every ready flag identical; the eight-wave kernel unchanged.
+cc_split_swin_16h_ffwd_inpview_512_tilesync_fp8  ffwd_512.hsaco  block=32,4,1  args=56  entry=cc_split_swin_16h_ffwd_inpview_512_tilesync_fp8_native

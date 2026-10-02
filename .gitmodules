@@ -1,0 +1,7 @@
+[submodule "optiscaler"]
+	path = optiscaler
+	url = https://github.com/RedDukeDev/OptiScaler.git
+	branch = dlss5-nr
+[submodule "third_party/ZLUDA"]
+	path = third_party/ZLUDA
+	url = https://github.com/RedDukeDev/ZLUDA.git
