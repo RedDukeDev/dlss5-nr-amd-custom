@@ -117,7 +117,7 @@ typedef struct dlss5nr_settings {
 
     /* How the game's colour reaches the network's display space. */
     int32_t encoding;            /* enum dlss5nr_encoding */
-    float colour_strength;       /* 0 .. 2: 0 the game's hue, 1 the network's */
+    float colour_strength;       /* 0 .. 4: 0 the game's hue, 1 the network's, above 1 pushed further */
     int32_t exposure_mode;       /* enum dlss5nr_exposure_mode */
     float exposure;              /* the fixed exposure, or a multiplier on the others */
 

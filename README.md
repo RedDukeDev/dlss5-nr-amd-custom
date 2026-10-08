@@ -134,7 +134,8 @@ All in the same section of the menu:
   where 0 leaves faces as the game drew them.
 - **Detail:** how much of the network's light and detail is applied. 0 is the
   game's own image, 1 is the network's.
-- **Colour:** 0 keeps the game's colours, 1 takes the network's.
+- **Colour:** 0 keeps the game's colours, 1 takes the network's, up to 4 pushes
+  them further.
 - **Max ratio:** the most the network may brighten or darken a pixel. Lower it
   if the image flickers.
 - **Follow motion:** moves the network's result along the motion vectors to
