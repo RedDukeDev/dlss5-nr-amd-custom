@@ -45,6 +45,12 @@ case "$DLSSNR_HIP_LIB" in
 esac
 export STEAM_COMPAT_MOUNTS="${STEAM_COMPAT_MOUNTS:+$STEAM_COMPAT_MOUNTS:}$mounts"
 
+# ld.so splits LD_PRELOAD at spaces and at colons and cannot quote them, so a
+# path with a space in it (a game in "World of Warcraft") would be taken for
+# several libraries. LD_LIBRARY_PATH splits at colons only: the library goes in
+# by its name and the folder it is in by that.
+export LD_LIBRARY_PATH="$here${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+bridge=libdlss5nr_hip_bridge.so
 export LD_PRELOAD="$bridge${LD_PRELOAD:+:$LD_PRELOAD}"
 
 # The CUDA driver here is ours (zluda\nvcuda.dll), not Wine's. Proton sets

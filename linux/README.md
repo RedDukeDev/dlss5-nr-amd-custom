@@ -104,6 +104,11 @@ arrived as 0).
   override given to it, so the plugin's own `nvcuda.dll` is replaced by Wine's, which
   has no `cuInit`. `launch.sh` turns NVAPI off (`PROTON_DISABLE_NVAPI=1`) and
   sets `nvcuda=n`.
+- **Spaces in the path.** `ld.so` splits `LD_PRELOAD` at spaces and colons and cannot
+  quote them, so a game in `World of Warcraft/` had the bridge taken for three
+  libraries. `launch.sh` puts the library's name in `LD_PRELOAD` and its folder in
+  `LD_LIBRARY_PATH`, which splits at colons only (a colon in the path still
+  breaks it).
 - **Steam's container** does not know `/opt/rocm`: `dlopen("libamdhip64.so.7")` by
   soname fails there (`cuInit` answers 801, not supported). `launch.sh` finds the
   library, names it by path (`DLSSNR_HIP_LIB`) and shows `/opt/rocm` to the container.
