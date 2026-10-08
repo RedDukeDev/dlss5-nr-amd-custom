@@ -139,6 +139,10 @@ All in the same section of the menu:
   them further.
 - **Max ratio:** the most the network may brighten or darken a pixel. Lower it
   if the image flickers.
+- **Blend frames:** how many frames a new result takes to replace the one
+  before (0 to 8, 4 by default). The network decides some of its detail anew
+  with every result, which shows as a flicker each time it switches; blending
+  the two over a few frames smooths that out. 0 switches at once.
 - **Follow motion:** moves the network's result along the motion vectors to
   where the scene is now. Leave it on.
 - **Network history:** lets the network blend each result with its previous

@@ -59,7 +59,8 @@ cbuffer Constants : register(b0)
     uint   flags;           // see FLAG_ below
     uint   exposure_mode;   // 0 auto, 1 game texture, 2 fixed
     float  adaptation;      // 0..1, how far the exposure moves towards its target per frame
-    uint2  pad;
+    float  blend;           // compose: how much of the newest result, the rest from the one before
+    uint   pad;
 };
 
 static const uint FLAG_RESET       = 1;
@@ -481,6 +482,15 @@ void compose_main(uint3 id : SV_DispatchThreadID)
         float3 tint = 0.0;
         if (!gone(d) && all(at >= 0.0) && all(at <= 1.0)) {
             r = t3.SampleLevel(linear_clamp, at, 0).rgb;
+            // A result that has just arrived takes over from the one before over
+            // a few frames, not at once: its detail differs from the old one's
+            // wherever the network decided otherwise for the new framing.
+            if ((flags & FLAG_PREVIOUS) && blend < 1.0) {
+                float2 od = t6.SampleLevel(point_clamp, uv, 0).rg;
+                float2 there = uv + od * uv1_scale;
+                if (!gone(od) && all(there >= 0.0) && all(there <= 1.0))
+                    r = lerp(t2.SampleLevel(linear_clamp, there, 0).rgb, r, blend);
+            }
         } else if (flags & FLAG_FILL) {
             float depth = t5.SampleLevel(point_clamp, uv, 0).r;
             float2 older = (flags & FLAG_PREVIOUS) ? t6.SampleLevel(point_clamp, uv, 0).rg : GONE;

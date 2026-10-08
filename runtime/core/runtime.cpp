@@ -230,6 +230,9 @@ struct dlss5nr_context {
     uint32_t residual_width = 0, residual_height = 0;
     bool residual_valid = false;
     uint32_t residual_age = 0;
+    // Frames between the last two results, and the frame the last one arrived in.
+    uint32_t result_interval = 1000;
+    uint64_t arrival_frame = 0;
     uint64_t applied_sequence = 0;
     uint64_t applied_frame = ~0ull;   // the frame the composed result was captured in
     Flow applied_flow;
@@ -518,6 +521,7 @@ DLSS5NR_API void dlss5nr_default_settings(dlss5nr_settings *s) {
     s->wait_for_network = 0;
     s->passes = 1;
     s->keep_local_tone = 1;
+    s->blend_frames = 4;
 }
 
 DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context **out) {
@@ -1159,6 +1163,8 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
                 c->residual_valid = true;
                 c->applied_frame = slot.frame;
                 c->residual_age = 0;
+                c->result_interval = (uint32_t)std::max<uint64_t>(1, c->frame - c->arrival_frame);
+                c->arrival_frame = c->frame;
                 c->result_latency = (uint32_t)(c->frame - slot.frame);
             }
             std::lock_guard<std::mutex> guard(c->lock);
@@ -1187,6 +1193,13 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         // A result nothing new has replaced for max_age frames fades out.
         const int over = (int)c->residual_age - s.max_age;
         k.fade = over <= 0 ? 1.0f : powf(0.8f, (float)over);
+        // A result that has just arrived takes over from the one before over a
+        // few frames, but not for longer than the next one takes to come: with
+        // a result every frame (waiting for the network) there is nothing to
+        // blend, and the new one is shown as it is.
+        const int blend_frames =
+            std::min(std::min(std::max(s.blend_frames, 0), 8), (int)std::min<uint32_t>(c->result_interval, 8));
+        k.blend = blend_frames > 0 ? std::min(1.0f, (float)(c->residual_age + 1) / (float)blend_frames) : 1.0f;
         const bool apply = running && c->residual_valid && c->applied_flow.valid && k.fade > 0.01f &&
                            s.detail_strength != 0.0f;
         if (!apply) k.flags |= FLAG_COPY;

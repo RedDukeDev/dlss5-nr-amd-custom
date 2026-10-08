@@ -31,7 +31,8 @@ struct Constants {
     uint32_t flags;
     uint32_t exposure_mode;
     float adaptation;
-    uint32_t pad[2];
+    float blend;
+    uint32_t pad;
 };
 static_assert(sizeof(Constants) == 24 * 4, "24 root constants, as the cbuffer in shaders.h");
 

@@ -152,6 +152,13 @@ typedef struct dlss5nr_settings {
      * ones leave the lighting as it came, since the tone would push it further
      * each time. Only matters with more than one pass. */
     int32_t keep_local_tone;
+
+    /* Frames a new result takes to replace the one before, 0 .. 8: for that
+     * long the picture is a mix of the two, carried along the motion vectors,
+     * instead of switching at once. The network decides some of its detail anew
+     * with every result, which shows as a flicker at each switch; 0 switches at
+     * once. */
+    int32_t blend_frames;
 } dlss5nr_settings;
 
 typedef struct dlss5nr_frame {

@@ -35,6 +35,7 @@
 //                   [--linear] [--hdr] [--ratio] [--scroll dx,dy]
 //                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--wait] [--bare]
 //                   [--churn n] [--passes n] [--no-keep-tone]
+//                   [--light-step frame,gain] [--snap f1,f2,...]
 //                   [--skin v] [--local-tone v] [--local-structure v]
 //                   [--intensity v] [--style n]
 
@@ -291,6 +292,17 @@ int wmain(int argc, wchar_t **argv) {
     int scroll_x = 0, scroll_y = 0, object_x = 0, object_y = 0, orbit_x = 0, orbit_y = 0;
     int churn = 0, passes = 1;
     bool keep_tone = true;
+    // Experiments: from light_frame on the picture is lit light_gain times as much
+    // (in linear light); and the output is saved at the frames in snaps.
+    int light_frame = -1;
+    float light_gain = 1.0f;
+    std::vector<int> snaps;
+    // Consecutive frames, raw RGBA8, to out + ".series": count of them, from start
+    // frames after the warm-up.
+    int series_start = -1, series_count = 0;
+    // The moving object's motion vectors are this fraction of its real motion.
+    float object_mv_scale = 1.0f;
+    int blend_frames = -1;
     // The network's own controls, when given; the runtime's defaults otherwise.
     float skin = -2.0f, local_tone = -2.0f, local_structure = -2.0f, intensity = -2.0f;
     int style = -1;
@@ -326,6 +338,17 @@ int wmain(int argc, wchar_t **argv) {
         else if (key == L"--orbit") swscanf(value.c_str(), L"%d,%d", &orbit_x, &orbit_y);
         else if (key == L"--churn") churn = _wtoi(value.c_str());
         else if (key == L"--passes") passes = _wtoi(value.c_str());
+        else if (key == L"--light-step") swscanf(value.c_str(), L"%d,%f", &light_frame, &light_gain);
+        else if (key == L"--blend") blend_frames = _wtoi(value.c_str());
+        else if (key == L"--object-mv") object_mv_scale = (float)_wtof(value.c_str());
+        else if (key == L"--series") swscanf(value.c_str(), L"%d,%d", &series_start, &series_count);
+        else if (key == L"--snap") {
+            for (const wchar_t *c = value.c_str(); *c;) {
+                snaps.push_back(_wtoi(c));
+                while (*c && *c != L',') ++c;
+                if (*c == L',') ++c;
+            }
+        }
         else if (key == L"--skin") skin = (float)_wtof(value.c_str());
         else if (key == L"--local-tone") local_tone = (float)_wtof(value.c_str());
         else if (key == L"--local-structure") local_structure = (float)_wtof(value.c_str());
@@ -417,6 +440,7 @@ int wmain(int argc, wchar_t **argv) {
     settings.wait_for_network = wait ? 1 : 0;
     settings.passes = passes;
     settings.keep_local_tone = keep_tone ? 1 : 0;
+    if (blend_frames >= 0) settings.blend_frames = blend_frames;
     dlss5nr_set_settings(nr, &settings);
 
     // Until the network runs, frames are copies; wait for it rather than
@@ -439,6 +463,52 @@ int wmain(int argc, wchar_t **argv) {
         return 1;
     }
 
+    // The output as it is now, as 8 bit sRGB.
+    auto read_output = [&](std::vector<uint8_t> &result) {
+        ID3D12Resource *readback = gpu.buffer((UINT64)width * height * color_bytes + 65536 * 8, D3D12_HEAP_TYPE_READBACK,
+                                              D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        const D3D12_RESOURCE_DESC d = output->GetDesc();
+        gpu.device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+        gpu.begin();
+        barrier(gpu.cmd, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+        to.pResource = readback;
+        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint = fp;
+        from.pResource = output;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        gpu.cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        barrier(gpu.cmd, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        gpu.submit_and_wait();
+        uint8_t *mapped = nullptr;
+        readback->Map(0, nullptr, (void **)&mapped);
+        result.resize((size_t)width * height * 4);
+        for (UINT y = 0; y < height; ++y) {
+            const uint8_t *row = mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch;
+            if (!linear) {
+                memcpy(result.data() + (size_t)y * width * 4, row, (size_t)width * 4);
+                continue;
+            }
+            const uint16_t *halves = (const uint16_t *)row;
+            for (UINT i = 0; i < width * 4; ++i) {
+                const float v = from_half(halves[i]);
+                const float e = (i & 3) == 3 ? v : linear_to_srgb(v);
+                result[(size_t)y * width * 4 + i] = (uint8_t)(e * 255.0f + 0.5f);
+            }
+        }
+        readback->Unmap(0, nullptr);
+        release(readback);
+    };
+    // The output as it is now, written to `path`.
+    auto snapshot = [&](const std::wstring &path) -> bool {
+        std::vector<uint8_t> result;
+        read_output(result);
+        if (!save_png(path, result, width, height)) return false;
+        wprintf(L"written %ls\n", path.c_str());
+        return true;
+    };
+
     // Frames. The network's results arrive on its own thread; a frame with no
     // fresh result reprojects the last one. With --evaluations the loop ends
     // once that many results have been composed, however many frames it took.
@@ -454,7 +524,32 @@ int wmain(int argc, wchar_t **argv) {
     std::vector<uint16_t> motion_frame(object ? (size_t)width * height * 2 : 0);
     UINT object_now_x = 0, object_now_y = 0;
     std::vector<uint8_t> moved(scrolling || object ? pixels.size() : 0);
-    for (; frame < frames || composed < evaluations; ++frame) {
+    // The picture after the change of light.
+    std::vector<uint8_t> lit = pixels;
+    if (light_frame >= 0) {
+        for (size_t i = 0; i < (size_t)width * height * 4; ++i) {
+            if ((i & 3) == 3) continue;
+            if (linear) {
+                uint16_t h = ((const uint16_t *)pixels.data())[i];
+                ((uint16_t *)lit.data())[i] = to_half(from_half(h) * light_gain);
+            } else {
+                lit[i] = (uint8_t)(linear_to_srgb(srgb_to_linear(pixels[i] / 255.0f) * light_gain) * 255.0f + 0.5f);
+            }
+        }
+    }
+    // Both the change of light and the snapshots are counted in frames from the
+    // one in which the third result had been composed: before it nothing is
+    // there to be compared.
+    int warm = -1;
+    const auto picture = [&](int at) -> const std::vector<uint8_t> & {
+        return light_frame >= 0 && warm >= 0 && at >= warm + light_frame ? lit : pixels;
+    };
+    int last_snap = 0;
+    for (int at : snaps) last_snap = std::max(last_snap, at);
+    if (series_start >= 0) last_snap = std::max(last_snap, series_start + series_count);
+    FILE *series_file = nullptr;
+    if (series_start >= 0) _wfopen_s(&series_file, (out + L".series").c_str(), L"wb");
+    for (; frame < frames || composed < evaluations || (warm >= 0 && frame <= warm + last_snap); ++frame) {
         if ((churn & 8) && frame > 0 && frame % 10 == 0) {
             // A slider being dragged: a different size every few frames.
             settings.resolution_scale = 0.5f + 0.05f * (float)((frame / 10) % 11);
@@ -476,17 +571,22 @@ int wmain(int argc, wchar_t **argv) {
                 for (UINT x = 0; x < width; ++x) {
                     const UINT from_x = (x + width - sx) % width;
                     memcpy(&moved[((size_t)y * width + x) * color_bytes],
-                           &pixels[((size_t)from_y * width + from_x) * color_bytes], color_bytes);
+                           &picture(frame)[((size_t)from_y * width + from_x) * color_bytes], color_bytes);
                 }
             }
             barrier(gpu.cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
             gpu.upload(color, moved.data(), width, height, color_bytes, staging);
             barrier(gpu.cmd, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
+        if (!scrolling && !object && light_frame >= 0 && warm >= 0 && frame == warm + light_frame) {
+            barrier(gpu.cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.upload(color, lit.data(), width, height, color_bytes, staging);
+            barrier(gpu.cmd, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
         if (object) {
             object_now_x = (UINT)((kObjectAtX + (long long)frame * object_x) % (width - kObject));
             object_now_y = (UINT)((kObjectAtY + (long long)frame * object_y) % (height - kObject));
-            moved = pixels;
+            moved = picture(frame);
             if (orbit) {
                 // The background has moved by frame * orbit since the first frame.
                 const int sx = (int)(((long long)frame * orbit_x) % (long long)width + width) % (int)width;
@@ -494,8 +594,8 @@ int wmain(int argc, wchar_t **argv) {
                 for (UINT y = 0; y < height; ++y)
                     for (UINT x = 0; x < width; ++x)
                         memcpy(&moved[((size_t)y * width + x) * color_bytes],
-                               &pixels[((size_t)((y + height - sy) % height) * width + (x + width - sx) % width) *
-                                       color_bytes],
+                               &picture(frame)[((size_t)((y + height - sy) % height) * width + (x + width - sx) % width) *
+                                               color_bytes],
                                color_bytes);
             }
             std::fill(depth_frame.begin(), depth_frame.end(), scene_depth);
@@ -505,12 +605,12 @@ int wmain(int argc, wchar_t **argv) {
             }
             for (UINT y = 0; y < kObject; ++y) {
                 const size_t to = (size_t)(object_now_y + y) * width + object_now_x;
-                memcpy(&moved[to * color_bytes], &pixels[((size_t)(kObjectFromY + y) * width + kObjectFromX) * color_bytes],
+                memcpy(&moved[to * color_bytes], &picture(frame)[((size_t)(kObjectFromY + y) * width + kObjectFromX) * color_bytes],
                        (size_t)kObject * color_bytes);
                 for (UINT x = 0; x < kObject; ++x) {
                     depth_frame[to + x] = object_depth;
-                    motion_frame[2 * (to + x)] = to_half(-(float)object_x);   // current -> previous
-                    motion_frame[2 * (to + x) + 1] = to_half(-(float)object_y);
+                    motion_frame[2 * (to + x)] = to_half(-(float)object_x * object_mv_scale);   // current -> previous
+                    motion_frame[2 * (to + x) + 1] = to_half(-(float)object_y * object_mv_scale);
                 }
             }
             const D3D12_RESOURCE_STATES shown = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -545,8 +645,22 @@ int wmain(int argc, wchar_t **argv) {
         gpu.submit_and_wait();
         dlss5nr_present(nr, gpu.queue);
 
+        if (series_file && warm >= 0 && frame >= warm + series_start && frame < warm + series_start + series_count) {
+            std::vector<uint8_t> raw;
+            read_output(raw);
+            fwrite(raw.data(), 1, raw.size(), series_file);
+        }
+        for (int at : snaps)
+            if (warm >= 0 && warm + at == frame) {
+                wchar_t name[512];
+                swprintf(name, 512, L"%ls.f%d.png", out.c_str(), frame);
+                dlss5nr_get_status(nr, &status);
+                printf("snap frame %d: results %u, latency %u\n", frame, (unsigned)status.results, (unsigned)status.result_latency);
+                snapshot(name);
+            }
         dlss5nr_get_status(nr, &status);
         composed = (int)status.results;
+        if (warm < 0 && composed >= 3) warm = frame;
         if (frame > 100000) break;
         // A game's frame takes time; without it the harness would outrun the
         // network by thousands of frames and compose only reprojections.
@@ -564,44 +678,8 @@ int wmain(int argc, wchar_t **argv) {
         printf("scrolled by %lld,%lld in all\n", (long long)(frame - 1) * scroll_x, (long long)(frame - 1) * scroll_y);
 
     // Read back the output.
-    {
-        ID3D12Resource *readback = gpu.buffer((UINT64)width * height * color_bytes + 65536 * 8, D3D12_HEAP_TYPE_READBACK,
-                                              D3D12_RESOURCE_STATE_COPY_DEST);
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-        const D3D12_RESOURCE_DESC d = output->GetDesc();
-        gpu.device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
-        gpu.begin();
-        barrier(gpu.cmd, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
-        to.pResource = readback;
-        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        to.PlacedFootprint = fp;
-        from.pResource = output;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        gpu.cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-        barrier(gpu.cmd, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        gpu.submit_and_wait();
-        uint8_t *mapped = nullptr;
-        readback->Map(0, nullptr, (void **)&mapped);
-        std::vector<uint8_t> result((size_t)width * height * 4);
-        for (UINT y = 0; y < height; ++y) {
-            const uint8_t *row = mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch;
-            if (!linear) {
-                memcpy(result.data() + (size_t)y * width * 4, row, (size_t)width * 4);
-                continue;
-            }
-            const uint16_t *halves = (const uint16_t *)row;
-            for (UINT i = 0; i < width * 4; ++i) {
-                const float v = from_half(halves[i]);
-                const float e = (i & 3) == 3 ? v : linear_to_srgb(v);
-                result[(size_t)y * width * 4 + i] = (uint8_t)(e * 255.0f + 0.5f);
-            }
-        }
-        readback->Unmap(0, nullptr);
-        release(readback);
-        if (!save_png(out, result, width, height)) return 1;
-        wprintf(L"written %ls\n", out.c_str());
-    }
+    if (series_file) fclose(series_file);
+    if (!snapshot(out)) return 1;
 
     dlss5nr_destroy(nr);
     release(color);
