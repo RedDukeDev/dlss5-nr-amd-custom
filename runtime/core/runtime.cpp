@@ -269,6 +269,9 @@ struct dlss5nr_context {
     bool resize_released = false;      // worker has let go of the old ones
     uint64_t sequence = 0;
     NetworkControls controls;
+    // Not part of the controls: changing them leaves the feature as it is. Under lock.
+    int network_passes = 1;
+    bool keep_local_tone = true;
     bool stop = false;
 
     // Status, written by the worker, read anywhere.
@@ -380,6 +383,8 @@ void dlss5nr_context::run_worker() {
     for (;;) {
         int chosen = -1;
         NetworkControls controls_now;
+        int passes_now = 1;
+        bool keep_tone_now = true;
         {
             std::unique_lock<std::mutex> guard(lock);
             wake.wait(guard, [&] {
@@ -420,6 +425,8 @@ void dlss5nr_context::run_worker() {
                 if (i != chosen && slots[i].state == Slot::Captured && slots[i].fence) slots[i].state = Slot::Free;
             slots[chosen].state = Slot::Evaluating;
             controls_now = controls;
+            passes_now = network_passes;
+            keep_tone_now = keep_local_tone;
         }
 
         Slot &slot = slots[chosen];
@@ -453,6 +460,8 @@ void dlss5nr_context::run_worker() {
             desc.depth_inverted = slot.depth_inverted;
             desc.reset = slot.reset || slot.previous_frame != history_frame;
             desc.controls = created_controls;
+            desc.passes = passes_now;
+            desc.keep_local_tone = keep_tone_now;
             ok = network.evaluate(desc, error);
         }
         const auto finished = std::chrono::steady_clock::now();
@@ -507,6 +516,8 @@ DLSS5NR_API void dlss5nr_default_settings(dlss5nr_settings *s) {
     s->follow_motion = 1;
     s->network_history = 0;
     s->wait_for_network = 0;
+    s->passes = 1;
+    s->keep_local_tone = 1;
 }
 
 DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context **out) {
@@ -626,6 +637,8 @@ DLSS5NR_API void dlss5nr_set_settings(dlss5nr_context *c, const dlss5nr_settings
     c->controls.local_tone = next.local_tone;
     c->controls.local_structure = next.local_structure;
     c->controls.skin_structure = next.skin_structure;
+    c->network_passes = next.passes < 1 ? 1 : next.passes > 8 ? 8 : next.passes;
+    c->keep_local_tone = next.keep_local_tone != 0;
 }
 
 DLSS5NR_API void dlss5nr_get_status(dlss5nr_context *c, dlss5nr_status *s) {
@@ -1049,7 +1062,9 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
                 slot.fence = 0;
                 slot.frame = c->frame;
                 slot.previous_frame = previous_frame;
-                slot.reset = f->reset || !previous || !s.network_history;
+                // With more than one pass the network starts afresh on every one,
+                // so there is no history for the next capture to continue from.
+                slot.reset = f->reset || !previous || !s.network_history || s.passes > 1;
                 slot.depth_inverted = f->depth_inverted != 0;
             }
         }

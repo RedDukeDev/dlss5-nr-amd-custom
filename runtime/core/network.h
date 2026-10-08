@@ -78,6 +78,12 @@ struct EvaluateDesc {
     bool depth_inverted = false;
     bool reset = false;
     NetworkControls controls;
+    // The network run again on its own result, passes times: each pass takes
+    // the one before as its picture, with a blank history, and the last one
+    // writes `output`. keep_local_tone: whether the later ones keep applying the
+    // local tone (else it is zero for them).
+    int passes = 1;
+    bool keep_local_tone = true;
 };
 
 class Network {
@@ -115,6 +121,10 @@ private:
     bool import_copy(SharedImage &image, std::string &error);
     bool copy_in(const EvaluateDesc &desc, std::string &error);
     bool copy_out(const EvaluateDesc &desc, std::string &error);
+    // The image the passes hand each other when there are more than two of
+    // them: a CUDA array of the output's size and format, made when first wanted.
+    bool ensure_scratch(const SharedImage &like, std::string &error);
+    SharedImage scratch_;
 
     bool loaded_ = false;
     bool copy_mode_ = false;

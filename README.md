@@ -132,6 +132,7 @@ All in the same section of the menu:
   *Skin structure* is the detail it adds to faces and skin. It is automatic by
   default and follows the structure strength; untick Auto to set it yourself,
   where 0 leaves faces as the game drew them.
+- **Passes:** how many times the effect is applied, one on top of the other: each pass works on the result of the one before. More passes give a stronger effect, but too many look artificial and shift the colours (a blue scarf turns grey), and each takes as long as the first, so the network gets that much slower. **Keep local tone** says whether the later passes keep applying the local tone, which would push the lighting further each time; it only matters with more than one pass.
 - **Detail:** how much of the network's light and detail is applied. 0 is the
   game's own image, 1 is the network's.
 - **Colour:** 0 keeps the game's colours, 1 takes the network's, up to 4 pushes

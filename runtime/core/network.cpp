@@ -316,6 +316,13 @@ void *image_param(SharedImage &image) {
     return &image.descriptor;
 }
 
+// The same image in a given role: an image the network wrote in one pass is the
+// one it reads in the next, so what it is asked as follows the pass, not the image.
+void *image_param_as(SharedImage &image, bool to_write) {
+    image.descriptor.object = (to_write || !image.texture) ? image.surface : image.texture;
+    return &image.descriptor;
+}
+
 } // namespace
 
 void set_network_log(void (*sink)(int, const char *)) { g_log = sink; }
@@ -730,23 +737,19 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
         return false;
     }
     if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
+    const int passes = d.passes < 1 ? 1 : d.passes;
+    if (passes > 1 && !ensure_scratch(*d.output, error)) return false;
     if (copy_mode_ && !copy_in(d, error)) return false;
     NVSDK_NGX_Parameter *p = g.params;
     const uint32_t w = feature_width_, h = feature_height_;
 
-    p->Set(nr_param::Color, image_param(*d.color));
     p->Set(nr_param::Depth, image_param(*d.depth));
     p->Set(nr_param::MVec, image_param(*d.motion));
-    p->Set(nr_param::Output, image_param(*d.output));
-    // The network alters the finished image and asks for the buffer it lives
-    // in; the output stands for it.
-    p->Set(nr_param::Backbuffer, image_param(*d.output));
 
     // Motion vectors arrive already in pixels of the network's own size.
     p->Set(nr_param::MVecScaleX, 1.0f);
     p->Set(nr_param::MVecScaleY, 1.0f);
     p->Set(nr_param::DepthInverted, d.depth_inverted ? 1 : 0);
-    p->Set(nr_param::Reset, d.reset ? 1 : 0);
 
     // Every subrect covers the whole image. They are read on every evaluation,
     // and an absent value is indistinguishable from a rejected one.
@@ -764,7 +767,6 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
 
     p->Set(nr_param::Style, d.controls.style);
     p->Set(nr_param::Intensity, d.controls.intensity);
-    p->Set(nr_param::LocalToneStrength, d.controls.local_tone);
     p->Set(nr_param::LocalStructureStrength, d.controls.local_structure);
     p->Set(nr_param::SkinStructureStrength, d.controls.skin_structure);
     // Off: the correction composites against the UI textures (DLSSNR.UI and
@@ -776,12 +778,83 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
     p->Set("DLSS.Indicator.Invert.X.Axis", 0);
     p->Set("DLSS.Indicator.Invert.Y.Axis", 0);
 
-    if (!ngx_ok(g.ngx_evaluate(g.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
-    if (!cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error)) return false;
+    // The passes. The last writes the output, the one before it the scratch
+    // image, the one before that the output again, and so on back to the first,
+    // which reads the colour: no pass reads what it writes, and the colour, which
+    // the composition compares the result with, is never written.
+    SharedImage *source = d.color;
+    for (int pass = 0; pass < passes; ++pass) {
+        SharedImage *target = ((passes - 1 - pass) % 2 == 0) ? d.output : &scratch_;
+        p->Set(nr_param::Color, image_param_as(*source, false));
+        p->Set(nr_param::Output, image_param_as(*target, true));
+        // The network alters the finished image and asks for the buffer it lives
+        // in; the target stands for it.
+        p->Set(nr_param::Backbuffer, image_param_as(*target, true));
+        // A pass after the first works on a picture that is new to the network.
+        p->Set(nr_param::Reset, (pass > 0 || d.reset) ? 1 : 0);
+        p->Set(nr_param::LocalToneStrength, (pass > 0 && !d.keep_local_tone) ? 0.0f : d.controls.local_tone);
+        if (!ngx_ok(g.ngx_evaluate(g.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
+        if (!cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error)) return false;
+        source = target;
+    }
     return !copy_mode_ || copy_out(d, error);
 }
 
+bool Network::ensure_scratch(const SharedImage &like, std::string &error) {
+    if (scratch_.array && scratch_.width == like.width && scratch_.height == like.height &&
+        scratch_.dxgi_format == like.dxgi_format)
+        return true;
+    release(scratch_);
+    scratch_ = SharedImage{};
+    CUarray_format format;
+    unsigned channels;
+    if (!cuda_format_of(like.dxgi_format, format, channels)) {
+        error = "unsupported format for the passes' scratch image";
+        return false;
+    }
+    if (!g.cu.cuArray3DCreate || !g.cu.cuArrayDestroy) {
+        error = "more than one pass needs cuArray3DCreate and cuArrayDestroy";
+        return false;
+    }
+    CUDA_ARRAY3D_DESCRIPTOR array_desc{};
+    array_desc.Width = like.width;
+    array_desc.Height = like.height;
+    array_desc.Format = format;
+    array_desc.NumChannels = channels;
+    array_desc.Flags = 0x2; // CUDA_ARRAY3D_SURFACE_LDST
+    CUarray array = nullptr;
+    if (!cu_ok(g.cu.cuArray3DCreate(&array, &array_desc), "cuArray3DCreate (scratch)", error)) return false;
+    scratch_.array = array;
+    scratch_.owns_array = true;
+    scratch_.width = like.width;
+    scratch_.height = like.height;
+    scratch_.dxgi_format = like.dxgi_format;
+    scratch_.writable = true;
+    CUDA_RESOURCE_DESC resource{};
+    resource.resType = CU_RESOURCE_TYPE_ARRAY;
+    resource.res.array.hArray = array;
+    if (!cu_ok(g.cu.cuSurfObjectCreate(&scratch_.surface, &resource), "cuSurfObjectCreate (scratch)", error))
+        return false;
+    CUDA_TEXTURE_DESC sampling{};
+    sampling.filterMode = 0;
+    sampling.flags = 2;
+    for (int i = 0; i < 3; ++i) sampling.addressMode[i] = 1;
+    if (!cu_ok(g.cu.cuTexObjectCreate(&scratch_.texture, &resource, &sampling, nullptr),
+               "cuTexObjectCreate (scratch)", error))
+        return false;
+    scratch_.descriptor.width = like.width;
+    scratch_.descriptor.height = like.height;
+    scratch_.descriptor.pitch = 0;
+    scratch_.descriptor.format = (uint32_t)like.dxgi_format;
+    return true;
+}
+
 void Network::shutdown() {
+    if (scratch_.array || scratch_.surface) {
+        if (g.context) g.cu.cuCtxSetCurrent(g.context);
+        release(scratch_);
+        scratch_ = SharedImage{};
+    }
     if (g.feature && g.ngx_release) g.ngx_release(g.feature);
     g.feature = nullptr;
     if (loaded_ && g.ngx_shutdown) g.ngx_shutdown();

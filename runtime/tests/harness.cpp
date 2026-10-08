@@ -34,7 +34,7 @@
 //                   [--scale 1.0] [--motion dx,dy] [--depth 0.0] [--evaluations 3]
 //                   [--linear] [--hdr] [--ratio] [--scroll dx,dy]
 //                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--wait] [--bare]
-//                   [--churn n]
+//                   [--churn n] [--passes n] [--no-keep-tone]
 //                   [--skin v] [--local-tone v] [--local-structure v]
 //                   [--intensity v] [--style n]
 
@@ -289,7 +289,8 @@ int wmain(int argc, wchar_t **argv) {
     int frames = 60, evaluations = 3;
     float scale = 1.0f, motion_x = 0.0f, motion_y = 0.0f, depth_value = 0.0f;
     int scroll_x = 0, scroll_y = 0, object_x = 0, object_y = 0, orbit_x = 0, orbit_y = 0;
-    int churn = 0;
+    int churn = 0, passes = 1;
+    bool keep_tone = true;
     // The network's own controls, when given; the runtime's defaults otherwise.
     float skin = -2.0f, local_tone = -2.0f, local_structure = -2.0f, intensity = -2.0f;
     int style = -1;
@@ -302,11 +303,12 @@ int wmain(int argc, wchar_t **argv) {
         show_tracking |= flag == L"--show-tracking";
         wait |= flag == L"--wait";
         bare |= flag == L"--bare";
+        if (flag == L"--no-keep-tone") keep_tone = false;
     }
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::wstring key = argv[i], value = argv[i + 1];
         if (key == L"--linear" || key == L"--hdr" || key == L"--ratio" || key == L"--show-tracking" ||
-            key == L"--wait" || key == L"--bare") {
+            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone") {
             --i;
             continue;
         }
@@ -323,6 +325,7 @@ int wmain(int argc, wchar_t **argv) {
         else if (key == L"--object") swscanf(value.c_str(), L"%d,%d", &object_x, &object_y);
         else if (key == L"--orbit") swscanf(value.c_str(), L"%d,%d", &orbit_x, &orbit_y);
         else if (key == L"--churn") churn = _wtoi(value.c_str());
+        else if (key == L"--passes") passes = _wtoi(value.c_str());
         else if (key == L"--skin") skin = (float)_wtof(value.c_str());
         else if (key == L"--local-tone") local_tone = (float)_wtof(value.c_str());
         else if (key == L"--local-structure") local_structure = (float)_wtof(value.c_str());
@@ -412,6 +415,8 @@ int wmain(int argc, wchar_t **argv) {
     if (intensity > -2.0f) settings.intensity = intensity;
     if (style >= 0) settings.style = style;
     settings.wait_for_network = wait ? 1 : 0;
+    settings.passes = passes;
+    settings.keep_local_tone = keep_tone ? 1 : 0;
     dlss5nr_set_settings(nr, &settings);
 
     // Until the network runs, frames are copies; wait for it rather than

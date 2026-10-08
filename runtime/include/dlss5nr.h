@@ -142,6 +142,16 @@ typedef struct dlss5nr_settings {
      * and the frame rate is the network's. 0: the game never waits, and a
      * result is as many frames old as its evaluation took. */
     int32_t wait_for_network;
+
+    /* How many times the network runs on a frame, 1 .. 8. Each pass after the
+     * first takes the result of the one before as its picture, so the effect
+     * builds up, and each costs as much as the first. More than one pass means
+     * the network keeps no history between evaluations. */
+    int32_t passes;
+    /* 1: every pass applies local_tone. 0: only the first does, and the later
+     * ones leave the lighting as it came, since the tone would push it further
+     * each time. Only matters with more than one pass. */
+    int32_t keep_local_tone;
 } dlss5nr_settings;
 
 typedef struct dlss5nr_frame {
