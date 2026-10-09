@@ -121,9 +121,13 @@ All in the same section of the menu:
   lower quality. Off, it runs on the upscaled image.
 - **Without an upscaler** (on by default): lets the network run on the
   finished image when the game uses no upscaler.
-- **Wait for the network:** the game waits for the network on every frame.
-  Nothing trails behind moving objects, but the frame rate becomes the
-  network's: use it with a low network resolution, or before the upscaler.
+- **Wait for the network:** the game waits for the network on every frame and
+  the frame rate becomes the network's: use it with a low network resolution,
+  or before the upscaler. Each frame gets the answer for the frame before it,
+  carried along the motion vectors. **Apply on the same frame** (experimental,
+  off) makes the GPU wait inside the frame instead and applies the answer to
+  that very frame: nothing trails and the network keeps its history, which
+  steadies the detail, but every frame takes about twice as long.
 - **Network resolution:** runs the network on a smaller copy of the image. Its
   cost follows its pixels. Not shown when running before the upscaler, where
   the image is the game's own render resolution.

@@ -137,10 +137,14 @@ typedef struct dlss5nr_settings {
      * outside the image in the frame of the capture: green where they were
      * filled in from around them, red where not. For diagnosis. */
     int32_t show_tracking;
-    /* 1: dlss5nr_present does not return until the network has answered for
-     * the frame just captured. Every frame then gets a result one frame old,
-     * and the frame rate is the network's. 0: the game never waits, and a
-     * result is as many frames old as its evaluation took. */
+    /* 1: the frame waits for the network. The GPU waits inside the game's own
+     * command list until the network has answered for the frame it just
+     * captured, and the answer is composed into that very frame: nothing is
+     * carried along motion vectors, nothing trails, and the frame rate is the
+     * network's. (Until the network has answered once, and where the wait
+     * cannot be done, dlss5nr_present waits instead and every frame gets a
+     * result one frame old.) 0: the game never waits, and a result is as many
+     * frames old as its evaluation took. */
     int32_t wait_for_network;
 
     /* How many times the network runs on a frame, 1 .. 8. Each pass after the
@@ -159,6 +163,14 @@ typedef struct dlss5nr_settings {
      * with every result, which shows as a flicker at each switch; 0 switches at
      * once. */
     int32_t blend_frames;
+
+    /* With wait_for_network: 1 composes the network's answer into the very frame it was
+     * made from (the GPU waits for it inside the game's command list), 0 into the next
+     * one, which has a result one frame old to follow motion vectors with. The first
+     * leaves nothing trailing behind moving objects, but its frame takes longer: the
+     * capture is only known to the host after the GPU's cache has written it out, which
+     * takes some tens of milliseconds more. Experimental. */
+    int32_t wait_inside;
 } dlss5nr_settings;
 
 typedef struct dlss5nr_frame {

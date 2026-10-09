@@ -1,3 +1,4 @@
+#include <emmintrin.h>
 #include "network.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -654,9 +655,33 @@ bool Network::import_copy(SharedImage &t, std::string &error) {
 }
 
 // The inputs, out of the game's textures and into the network's arrays.
+void Network::record_stage_in(ID3D12GraphicsCommandList *cmd, const SharedImage &t) {
+    copier_barrier(cmd, t.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+    to.pResource = (ID3D12Resource *)t.staging;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = footprint_of(t);
+    from.pResource = t.resource;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    copier_barrier(cmd, t.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+void Network::record_stage_out(ID3D12GraphicsCommandList *cmd, const SharedImage &t) {
+    copier_barrier(cmd, t.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+    to.pResource = t.resource;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.pResource = (ID3D12Resource *)t.staging;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.PlacedFootprint = footprint_of(t);
+    cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    copier_barrier(cmd, t.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+}
+
 bool Network::copy_in(const EvaluateDesc &d, std::string &error) {
     SharedImage *inputs[] = {d.color, d.depth, d.motion};
-    if (!copier_run(
+    if (!d.staged_by_list && !copier_run(
             [&](ID3D12GraphicsCommandList *cmd) {
                 for (SharedImage *t : inputs) {
                     ID3D12Resource *texture = t->resource;
@@ -701,6 +726,10 @@ bool Network::copy_out(const EvaluateDesc &d, std::string &error) {
     copy.Height = t->height;
     if (!cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (out)", error)) return false;
     memcpy(t->staging_ptr, t->host, (size_t)t->row_pitch * t->height);
+    if (d.staged_by_list) {
+        _mm_sfence();   // the buffer is write-combined: what is written must be out before the frame is told
+        return true;
+    }
     return copier_run(
         [&](ID3D12GraphicsCommandList *cmd) {
             copier_barrier(cmd, t->resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);

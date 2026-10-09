@@ -22,7 +22,7 @@ constexpr UINT kTableSize = kSrvCount + kUavCount;
 constexpr UINT kRingTables = 1024;
 
 const char *const kEntry[] = {"exposure_main", "capture_main", "refresh_main", "soften_main", "track_main",
-                              "compose_main"};
+                              "compose_main",  "sync_signal_main", "sync_wait_main"};
 
 template <typename T>
 void release(T *&object) {
@@ -219,7 +219,7 @@ void Passes::dispatch(ID3D12GraphicsCommandList *cmd, Pass pass, const Constants
         D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
         view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         view.Format = DXGI_FORMAT_R32_TYPELESS;
-        view.Buffer.NumElements = 4;
+        view.Buffer.NumElements = b.buffer_words;
         view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_->CreateUnorderedAccessView(b.exposure_buffer, nullptr, &view, at);
     }
@@ -230,7 +230,7 @@ void Passes::dispatch(ID3D12GraphicsCommandList *cmd, Pass pass, const Constants
     cmd->SetPipelineState(pipelines_[(int)pass]);
     cmd->SetComputeRoot32BitConstants(0, sizeof(Constants) / 4, &constants, 0);
     cmd->SetComputeRootDescriptorTable(1, gpu);
-    if (pass == Pass::Exposure)
+    if (pass == Pass::Exposure || pass == Pass::SyncSignal || pass == Pass::SyncWait)
         cmd->Dispatch(1, 1, 1);
     else
         cmd->Dispatch((width + 7) / 8, (height + 7) / 8, 1);

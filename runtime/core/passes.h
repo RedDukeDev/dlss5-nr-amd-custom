@@ -11,7 +11,7 @@
 
 namespace dlss5nr {
 
-enum class Pass { Exposure, Capture, Refresh, Soften, Track, Compose, Count };
+enum class Pass { Exposure, Capture, Refresh, Soften, Track, Compose, SyncSignal, SyncWait, Count };
 
 // Mirrors the cbuffer in shaders.h, 24 dwords.
 struct Constants {
@@ -47,12 +47,15 @@ enum : uint32_t {
     FLAG_FILL = 256,
     FLAG_SHOW_TRACKING = 512,
     FLAG_PREVIOUS = 1024,
+    FLAG_SYNC = 2048,
+    FLAG_RAWMV = 4096,
 };
 
 struct Bindings {
     ID3D12Resource *srv[8] = {};
     ID3D12Resource *uav[3] = {};
     ID3D12Resource *exposure_buffer = nullptr;   // u3, raw
+    uint32_t buffer_words = 4;                   // how much of it the view covers
 };
 
 class Passes {

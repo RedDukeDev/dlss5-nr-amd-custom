@@ -123,9 +123,52 @@ An answer of the network for that very point, even an older one, beats a
 guess. What is left in the end is a patch with the right light and none of
 the network's detail, for as long as the next result takes.
 
-`wait_for_network` avoids all of it at the cost of the frame rate:
+`wait_for_network` avoids most of it at the cost of the frame rate:
 `dlss5nr_present` waits for the frame's own result, every frame is composed
 with a result one frame old, and the game runs at the network's rate.
+
+`wait_inside` (experimental) avoids all of it: the game's command list itself
+waits for the network, so that its answer is composed into the frame it was made
+from, and the game runs at the network's rate. It is slower than the other, and
+here is why: the host learns that the capture is in place from a word the GPU
+writes, and that write stays in the GPU's cache for between ten and a couple of
+hundred milliseconds (every way of writing it that was tried: the command
+processor's marker, a shader's store or atomic, a copy), until the reads of the
+wait itself push it out; the network only starts when the host has seen it.
+Waiting on the GPU for the capture, from the network's side, would avoid it
+(not done). Every
+frame is captured, so the network's own history is kept (the capture before is
+the previous frame, and the game's motion vectors lead back to it): without it
+every frame's detail is decided anew and flickers. The game may record the next
+frame while the network works on this one, which hides the time the game itself
+takes; frames are answered in order, and none is passed over.
+
+How the wait works. After the capture the list has the command processor write
+the capture's number into host memory (`WriteBufferImmediate`, which reaches
+memory at once, where a shader's write waits in the GPU's cache), and then a
+compute pass that reads lines of host memory, one after the other, until it
+finds that number. The worker thread, which was woken when the capture was
+recorded and looks for the number, runs the network and then writes the number
+into every line the pass has yet to read. The reading has to go from line to
+line: what a GPU has read stays in its cache, a word it keeps looking at is
+never seen to change, and only a line it has not read before comes from memory
+as it is then (measured here; every attempt with one word failed). A line is
+128 bytes, and a few frames' worth of them are kept apart so that none is read
+twice while still cached. A few microseconds pass between two looks, so that the
+lines, and the host memory they take, are not too many for the longest wait.
+The pass has a limit of lines, about three times what the network last took,
+so that a wait that ran out ends: the frame then goes on without the effect. The number of lines read is written back to the host;
+three waits in a row that ran out, and the frame goes back to waiting at
+present for ten seconds. The time one look takes (about a microsecond) is
+measured when it is first needed (two lengths, so that what a submission takes
+is not counted), together with a test that the answer is seen, and corrected
+as the waits go on.
+
+When the images are copied through host memory (Wine) the frame's own list
+copies the capture to the staging buffers and, after the wait, the answer from
+them: the worker only moves them between those and the network's arrays. If
+the answer is not seen (the test above), or the list does not allow it, the
+frame waits at present, and is composed with a result one frame old.
 
 The capture's motion vectors lead back to the capture the network's own
 history holds, through that capture's map (see *What the network is told*).

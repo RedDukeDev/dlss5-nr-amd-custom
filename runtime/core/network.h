@@ -3,7 +3,9 @@
 //
 // Everything here runs on the runtime's worker thread and nowhere else: the
 // CUDA context is current on that thread only, and the snippet's calls can take
-// tens of milliseconds. The game thread never calls into this file.
+// tens of milliseconds. The game thread never calls into this file, but for
+// the functions that record copies into a command list (record_stage_in and
+// record_stage_out), which touch no CUDA.
 
 #pragma once
 
@@ -12,6 +14,7 @@
 
 struct ID3D12Device;
 struct ID3D12Resource;
+struct ID3D12GraphicsCommandList;
 
 namespace dlss5nr {
 
@@ -84,6 +87,10 @@ struct EvaluateDesc {
     // local tone (else it is zero for them).
     int passes = 1;
     bool keep_local_tone = true;
+    // Copy mode: the game's own command list has already copied the inputs into
+    // their staging buffers, and copies the output out of its buffer after: the
+    // network only moves them between those and its arrays.
+    bool staged_by_list = false;
 };
 
 class Network {
@@ -106,6 +113,13 @@ public:
 
     // Imports a texture the game thread created. Idempotent.
     bool import(SharedImage &image, std::string &error);
+    // Copy mode, for a frame that waits inside its command list: the copies of
+    // an image to its staging buffer and from it, recorded into that list. False
+    // if the image has no staging buffer yet (the worker makes it when it first
+    // imports the image).
+    static bool staged(const SharedImage &image) { return image.staging != nullptr; }
+    static void record_stage_in(ID3D12GraphicsCommandList *cmd, const SharedImage &image);
+    static void record_stage_out(ID3D12GraphicsCommandList *cmd, const SharedImage &image);
     void release(SharedImage &image);
 
     // Runs the network once and waits for it: when this returns true the

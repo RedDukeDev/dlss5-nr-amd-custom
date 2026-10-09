@@ -35,7 +35,7 @@
 //                   [--linear] [--hdr] [--ratio] [--scroll dx,dy]
 //                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--wait] [--bare]
 //                   [--churn n] [--passes n] [--no-keep-tone]
-//                   [--light-step frame,gain] [--snap f1,f2,...]
+//                   [--light-step frame,gain] [--snap f1,f2,...] [--inside]
 //                   [--skin v] [--local-tone v] [--local-structure v]
 //                   [--intensity v] [--style n]
 
@@ -303,6 +303,7 @@ int wmain(int argc, wchar_t **argv) {
     // The moving object's motion vectors are this fraction of its real motion.
     float object_mv_scale = 1.0f;
     int blend_frames = -1;
+    bool inside = false;
     // The network's own controls, when given; the runtime's defaults otherwise.
     float skin = -2.0f, local_tone = -2.0f, local_structure = -2.0f, intensity = -2.0f;
     int style = -1;
@@ -316,11 +317,12 @@ int wmain(int argc, wchar_t **argv) {
         wait |= flag == L"--wait";
         bare |= flag == L"--bare";
         if (flag == L"--no-keep-tone") keep_tone = false;
+        inside |= flag == L"--inside";
     }
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::wstring key = argv[i], value = argv[i + 1];
         if (key == L"--linear" || key == L"--hdr" || key == L"--ratio" || key == L"--show-tracking" ||
-            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone") {
+            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone" || key == L"--inside") {
             --i;
             continue;
         }
@@ -441,6 +443,7 @@ int wmain(int argc, wchar_t **argv) {
     settings.passes = passes;
     settings.keep_local_tone = keep_tone ? 1 : 0;
     if (blend_frames >= 0) settings.blend_frames = blend_frames;
+    settings.wait_inside = inside ? 1 : 0;
     dlss5nr_set_settings(nr, &settings);
 
     // Until the network runs, frames are copies; wait for it rather than
@@ -549,6 +552,8 @@ int wmain(int argc, wchar_t **argv) {
     if (series_start >= 0) last_snap = std::max(last_snap, series_start + series_count);
     FILE *series_file = nullptr;
     if (series_start >= 0) _wfopen_s(&series_file, (out + L".series").c_str(), L"wb");
+    std::vector<double> frame_ms;
+    auto frame_began = std::chrono::steady_clock::now();
     for (; frame < frames || composed < evaluations || (warm >= 0 && frame <= warm + last_snap); ++frame) {
         if ((churn & 8) && frame > 0 && frame % 10 == 0) {
             // A slider being dragged: a different size every few frames.
@@ -561,6 +566,8 @@ int wmain(int argc, wchar_t **argv) {
             if (churn & 4) settings.resolution_scale = 1.0f - 0.25f * (float)((frame / 90) % 3);
             dlss5nr_set_settings(nr, &settings);
         }
+        frame_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame_began).count());
+        frame_began = std::chrono::steady_clock::now();
         gpu.begin();
         if (scrolling && frame > 0) {
             // What was at x is now at x + frame * scroll.
@@ -672,6 +679,11 @@ int wmain(int argc, wchar_t **argv) {
            frame, composed, status.network_width, status.network_height, status.evaluation_ms,
            status.evaluations_per_second, status.native_kernels, record_ms / frame);
     printf("the last result was captured %u frames before it was composed\n", status.result_latency);
+    if (frame_ms.size() > 60) {
+        double sum = 0.0;
+        for (size_t i = frame_ms.size() - 40; i < frame_ms.size(); ++i) sum += frame_ms[i];
+        printf("the last 40 frames took %.1f ms each\n", sum / 40.0);
+    }
     if (object)
         printf("the object is at %u,%u, and moves by %d,%d a frame\n", object_now_x, object_now_y, object_x, object_y);
     if (scrolling)

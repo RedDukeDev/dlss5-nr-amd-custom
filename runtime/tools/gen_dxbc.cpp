@@ -24,7 +24,7 @@
 using namespace dlss5nr;
 
 static const char *const kEntry[] = {"exposure_main", "capture_main", "refresh_main", "soften_main", "track_main",
-                                     "compose_main"};
+                                     "compose_main",  "sync_signal_main", "sync_wait_main"};
 
 int wmain(int argc, wchar_t **argv) {
     if (argc != 3) {
@@ -44,7 +44,7 @@ int wmain(int argc, wchar_t **argv) {
     fprintf(out, "namespace dlss5nr {\n\n");
     fprintf(out, "// shader_hash(kShaderSource) when this was made.\n");
     fprintf(out, "inline constexpr uint64_t kDxbcSourceHash = 0x%016llxull;\n\n", (unsigned long long)shader_hash(kShaderSource));
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 8; ++i) {
         ID3DBlob *code = nullptr, *log = nullptr;
         if (FAILED(compile(kShaderSource, sizeof kShaderSource - 1, "dlss5nr", nullptr, nullptr, kEntry[i], "cs_5_1",
                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &log))) {
@@ -60,7 +60,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     fprintf(out, "struct Dxbc {\n    const unsigned char *data;\n    size_t size;\n};\n\n");
     fprintf(out, "inline constexpr Dxbc kDxbc[] = {\n");
-    for (int i = 0; i < 6; ++i) fprintf(out, "    {kDxbc_%s, sizeof kDxbc_%s},\n", kEntry[i], kEntry[i]);
+    for (int i = 0; i < 8; ++i) fprintf(out, "    {kDxbc_%s, sizeof kDxbc_%s},\n", kEntry[i], kEntry[i]);
     fprintf(out, "};\n\n} // namespace dlss5nr\n");
     fclose(out);
     return 0;

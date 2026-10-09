@@ -73,6 +73,8 @@ static const uint FLAG_DEPTH_CHECK = 128; // track: the previous frame's depth i
 static const uint FLAG_FILL        = 256; // compose: fill in what the network never saw
 static const uint FLAG_SHOW_TRACKING = 512;
 static const uint FLAG_PREVIOUS    = 1024; // compose: the result before this one is there
+static const uint FLAG_SYNC        = 2048; // compose: the frame waited for the network; t7 says if it answered
+static const uint FLAG_RAWMV       = 4096; // capture: the game's motion vectors (t2) are the way back to the capture before
 
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
@@ -279,6 +281,8 @@ void capture_main(uint3 id : SV_DispatchThreadID)
     u0[id.xy] = float4(to_net(proxy_of(c / white_point())), 1.0);
     u1[id.xy] = float4(t1.SampleLevel(point_clamp, uv * uv1_scale, 0).r, 0, 0, 0);
     float2 d = (flags & FLAG_IDENTITY) ? 0.0 : t3.Load(int3(id.xy, 0)).rg;
+    // When the capture before was the previous frame, its way back is one frame of motion.
+    if (flags & FLAG_RAWMV) d = t2.SampleLevel(point_clamp, uv * uv2_scale, 0).rg * motion_to_px;
     u2[id.xy] = float4(gone(d) ? 0.0 : d, 0, 0);
 }
 
@@ -472,6 +476,11 @@ void compose_main(uint3 id : SV_DispatchThreadID)
     if (any(id.xy >= size)) return;
     float4 c = t0.Load(int3(id.xy, 0));
     float4 result = c;
+    // A wait that ran out: the frame as the game made it.
+    if ((flags & FLAG_SYNC) && t7.Load(int3(0, 0, 0)).r < 0.5) {
+        u0[id.xy] = c;
+        return;
+    }
     if (!(flags & FLAG_COPY)) {
         float2 uv = (float2(id.xy) + 0.5) * inv_size;
         float2 d = (flags & FLAG_IDENTITY) ? 0.0 : t4.SampleLevel(point_clamp, uv, 0).rg;
@@ -516,6 +525,51 @@ void compose_main(uint3 id : SV_DispatchThreadID)
         result.rgb = (max(composed, 0.0) + tint) * wp;
     }
     u0[id.xy] = result;
+}
+
+// ------------------------------------------------------------------- sync
+// Waiting for the network inside the frame. The game's command list goes on
+// only once the network has answered, so the answer is composed into the very
+// frame it was made from. The GPU and the worker thread talk through host
+// memory (u3), a line of 128 bytes to a word: the capture's number is written
+// when it is in place (by the command processor, or sync_signal when the list
+// does not allow that), to the line of its own in a ring of four, which the worker
+// looks for; no shader writes to those lines, since a line a shader has written
+// stays in the GPU's cache and hides what is written to it after. The worker answers by
+// writing the capture's number (with the top bit set if the network failed)
+// into every line of a stretch of the buffer, from line exposure_mode on, and
+// sync_wait reads those lines one after the other, size.y of them at most,
+// until it finds its number. Every line is read once: what a GPU has read
+// stays in its cache, and a word it keeps looking at is never seen to change,
+// whatever the way it is read (measured), where a line it has not looked at
+// before is read from memory as it is then. Ending at the last line is the
+// wait running out; how many it read goes to the host (byte 512), and u0 gets 1
+// if the network answered, 0 if not.
+[numthreads(1, 1, 1)]
+void sync_signal_main()
+{
+    u3.Store((size.x % 4) * 128, size.x);
+    DeviceMemoryBarrier();
+}
+
+[numthreads(1, 1, 1)]
+void sync_wait_main()
+{
+    uint spins = 0;
+    uint answer = 0;
+    uint idle = 1;
+    [loop] while (spins < size.y) {
+        answer = u3.Load((exposure_mode + spins) * 128);
+        if ((answer & 0x7FFFFFFFu) == size.x) break;
+        ++spins;
+        // A few microseconds between two looks: the lines to read, and so the host
+        // memory they take, are as many as the wait is long over this.
+        [loop] for (uint i = 0; i < 3000; ++i) idle = idle * 1664525u + 1013904223u;
+    }
+    u3.Store(520, idle);
+    u3.Store(512, spins);
+    u3.Store(516, size.y);
+    u0[uint2(0, 0)] = float4(answer == size.x ? 1.0 : 0.0, 0.0, 0.0, 0.0);
 }
 )HLSL";
 
