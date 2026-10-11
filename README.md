@@ -63,8 +63,8 @@ Hardware-specific status:
    upscaler hands OptiScaler the game's depth and motion vectors, which let
    the network's result follow the scene. Without an upscaler it still runs,
    on the finished image (see *Without an upscaler* below).
-5. **Open OptiScaler's menu** with the Insert key. Under
-   *Neural Rendering (DLSS 5)*, tick *Enable*. Use *Save Settings* to keep it on
+5. **Open OptiScaler's menu** with the Insert key. In the *Neural Rendering*
+   tab (the same box is in the *Custom* tab too), tick *Enable*. Use *Save Settings* to keep it on
    for the next time. Alternatively, set `Enabled=true` in the
    `[NeuralRendering]` section of `OptiScaler.ini` before starting the game.
 
@@ -114,7 +114,7 @@ Note: some games, like for example Hogwarts Legacy, may need OverlayMenu=false i
 
 ## Settings
 
-All in the same section of the menu:
+All in the *Neural Rendering* tab of the menu, also shown in the *Custom* tab:
 
 - **Before the upscaler** (on by default): runs the network on the lower
   resolution image the game renders, before upscaling. Much faster, slightly
