@@ -49,10 +49,11 @@ enum : uint32_t {
     FLAG_PREVIOUS = 1024,
     FLAG_SYNC = 2048,
     FLAG_RAWMV = 4096,
+    FLAG_EDGES = 8192,
 };
 
 struct Bindings {
-    ID3D12Resource *srv[8] = {};
+    ID3D12Resource *srv[10] = {};
     ID3D12Resource *uav[3] = {};
     ID3D12Resource *exposure_buffer = nullptr;   // u3, raw
     uint32_t buffer_words = 4;                   // how much of it the view covers

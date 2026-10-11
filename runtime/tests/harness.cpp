@@ -36,6 +36,7 @@
 //                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--wait] [--bare]
 //                   [--churn n] [--passes n] [--no-keep-tone]
 //                   [--light-step frame,gain] [--snap f1,f2,...] [--inside]
+//                   [--depths object,scene] [--depth-inverted] [--dolly r]
 //                   [--skin v] [--local-tone v] [--local-structure v]
 //                   [--intensity v] [--style n]
 
@@ -303,6 +304,13 @@ int wmain(int argc, wchar_t **argv) {
     // The moving object's motion vectors are this fraction of its real motion.
     float object_mv_scale = 1.0f;
     int blend_frames = -1;
+    // Depth of the moving object and of the rest, as the depth buffer holds them.
+    float object_depth = 0.5f, scene_depth = 0.1f;
+    bool depth_inverted = false;
+    // --dolly r: the camera moves so that the background's depth value grows by r a frame
+    // (with the far plane at 0, towards it; away from it otherwise), as when it orbits a
+    // character or walks: the same surface keeps changing its depth.
+    float dolly = 0.0f;
     bool inside = false;
     // The network's own controls, when given; the runtime's defaults otherwise.
     float skin = -2.0f, local_tone = -2.0f, local_structure = -2.0f, intensity = -2.0f;
@@ -318,11 +326,12 @@ int wmain(int argc, wchar_t **argv) {
         bare |= flag == L"--bare";
         if (flag == L"--no-keep-tone") keep_tone = false;
         inside |= flag == L"--inside";
+        depth_inverted |= flag == L"--depth-inverted";
     }
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::wstring key = argv[i], value = argv[i + 1];
         if (key == L"--linear" || key == L"--hdr" || key == L"--ratio" || key == L"--show-tracking" ||
-            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone" || key == L"--inside") {
+            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone" || key == L"--inside" || key == L"--depth-inverted") {
             --i;
             continue;
         }
@@ -342,6 +351,8 @@ int wmain(int argc, wchar_t **argv) {
         else if (key == L"--passes") passes = _wtoi(value.c_str());
         else if (key == L"--light-step") swscanf(value.c_str(), L"%d,%f", &light_frame, &light_gain);
         else if (key == L"--blend") blend_frames = _wtoi(value.c_str());
+        else if (key == L"--depths") swscanf(value.c_str(), L"%f,%f", &object_depth, &scene_depth);
+        else if (key == L"--dolly") dolly = (float)_wtof(value.c_str());
         else if (key == L"--object-mv") object_mv_scale = (float)_wtof(value.c_str());
         else if (key == L"--series") swscanf(value.c_str(), L"%d,%d", &series_start, &series_count);
         else if (key == L"--snap") {
@@ -522,7 +533,6 @@ int wmain(int argc, wchar_t **argv) {
     const bool orbit = orbit_x || orbit_y;
     const bool object = object_x || object_y || orbit;
     const UINT kObject = 400, kObjectFromX = 200, kObjectFromY = 200, kObjectAtX = 300, kObjectAtY = 500;
-    const float object_depth = 0.5f, scene_depth = 0.1f;
     std::vector<float> depth_frame(object ? (size_t)width * height : 0);
     std::vector<uint16_t> motion_frame(object ? (size_t)width * height * 2 : 0);
     UINT object_now_x = 0, object_now_y = 0;
@@ -605,7 +615,8 @@ int wmain(int argc, wchar_t **argv) {
                                                color_bytes],
                                color_bytes);
             }
-            std::fill(depth_frame.begin(), depth_frame.end(), scene_depth);
+            std::fill(depth_frame.begin(), depth_frame.end(),
+                      dolly != 0.0f ? scene_depth * powf(1.0f + dolly, (float)(frame % 60)) : scene_depth);
             for (size_t i = 0; i < (size_t)width * height; ++i) {
                 motion_frame[2 * i] = to_half(-(float)orbit_x);   // current -> previous
                 motion_frame[2 * i + 1] = to_half(-(float)orbit_y);
@@ -638,6 +649,7 @@ int wmain(int argc, wchar_t **argv) {
         f.height = height;
         f.depth = bare ? nullptr : depth;
         f.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        f.depth_inverted = depth_inverted ? 1 : 0;
         f.motion = bare ? nullptr : motion;
         f.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         f.depth_width = f.motion_width = width;

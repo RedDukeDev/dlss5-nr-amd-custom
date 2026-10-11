@@ -273,6 +273,11 @@ struct dlss5nr_context {
     // this one may have.
     ID3D12Resource *residual_previous = nullptr;
     D3D12_RESOURCE_STATES residual_previous_state = {};
+    // How far each pixel of those two was from an edge in depth, in its capture.
+    ID3D12Resource *residual_edges = nullptr;
+    D3D12_RESOURCE_STATES residual_edges_state = {};
+    ID3D12Resource *residual_previous_edges = nullptr;
+    D3D12_RESOURCE_STATES residual_previous_edges_state = {};
     Flow previous_flow;
     // One per slot, from the frame it was captured in. The one of the capture
     // the network last took becomes the next capture's motion vectors.
@@ -818,6 +823,8 @@ DLSS5NR_API void dlss5nr_destroy(dlss5nr_context *c) {
     release(c->residual);
     release(c->residual_soft);
     release(c->residual_previous);
+    release(c->residual_edges);
+    release(c->residual_previous_edges);
     for (ID3D12Resource *&map : c->previous_flow.map) release(map);
     for (ID3D12Resource *&map : c->applied_flow.map) release(map);
     for (ID3D12Resource *&map : c->idle_flow.map) release(map);
@@ -1123,6 +1130,8 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         remake(c->applied_flow);
         remake(c->previous_flow);
         replace(c->residual_previous, c->residual_previous_state, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        replace(c->residual_edges, c->residual_edges_state, DXGI_FORMAT_R16_FLOAT);
+        replace(c->residual_previous_edges, c->residual_previous_edges_state, DXGI_FORMAT_R16_FLOAT);
         remake(c->idle_flow);
         for (Flow &flow : c->slot_flow) remake(flow);
         for (int m = 0; m < 2; ++m) replace(c->depth_history[m], c->depth_history_state[m], DXGI_FORMAT_R32_FLOAT);
@@ -1525,19 +1534,24 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
                 if (c->residual_valid && c->applied_flow.valid) {
                     std::swap(c->residual, c->residual_previous);
                     std::swap(c->residual_state, c->residual_previous_state);
+                    std::swap(c->residual_edges, c->residual_previous_edges);
+                    std::swap(c->residual_edges_state, c->residual_previous_edges_state);
                     std::swap(c->applied_flow, c->previous_flow);
                 } else {
                     c->previous_flow.valid = false;
                 }
                 to_state(c->residual, c->residual_state, write);
+                to_state(c->residual_edges, c->residual_edges_state, write);
                 Bindings b;
                 b.srv[0] = slot.output.resource;
                 b.srv[1] = slot.color.resource;
                 b.srv[2] = slot.depth.resource;
                 b.uav[0] = c->residual;
+                b.uav[1] = c->residual_edges;
                 b.exposure_buffer = c->exposure_buffer;
                 c->passes.dispatch(cmd, Pass::Refresh, k, b, nw, nh);
                 to_state(c->residual, c->residual_state, read);
+                to_state(c->residual_edges, c->residual_edges_state, read);
                 {
                     const uint32_t sw = (nw + 15) / 16, sh = (nh + 15) / 16;
                     Constants soft = base;
@@ -1618,6 +1632,10 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         const bool older = !sync_active && apply && c->previous_flow.valid && !c->previous_flow.identity &&
                            s.follow_motion;
         if (older) k.flags |= FLAG_PREVIOUS;
+        // Halos around edges that have moved since: needs this frame's depth.
+        const bool edges = !sync_active && apply && c->depth_history_valid && s.follow_motion &&
+                           !(c->applied_flow.identity);
+        if (edges) k.flags |= FLAG_EDGES;
         if (s.composition == DLSS5NR_COMPOSITION_REPLACE) k.flags |= FLAG_REPLACE;
         const D3D12_RESOURCE_STATES output_write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         transition(cmd, f->output, output_state, output_write);
@@ -1631,6 +1649,8 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         b.srv[5] = apply && !sync_active && c->depth_history_valid ? c->depth_history[c->depth_current] : nullptr;
         b.srv[7] = apply && sync_active ? c->sync_status : nullptr;
         b.srv[2] = older ? c->residual_previous : nullptr;
+        b.srv[8] = edges ? c->residual_edges : nullptr;
+        b.srv[9] = edges && older ? c->residual_previous_edges : nullptr;
         b.srv[6] = older ? c->previous_flow.map[c->previous_flow.current] : nullptr;
         b.uav[0] = f->output;
         b.exposure_buffer = c->exposure_buffer;

@@ -89,13 +89,54 @@ frame, where the same point of the scene was in the frame of the capture. It
 starts at zero in that frame and is moved on by every frame after it, along
 the game's motion vectors: a pixel's displacement is its motion vector plus the
 displacement, one frame earlier, of the point it came from. A point that was
-outside the image, or behind something else then -- its depth one frame earlier
-disagrees with its depth now -- is marked as gone. The composition samples
-the residual through the map of its capture.
+outside the image, or behind something else then -- something nearer was
+where it came from, one frame earlier -- is marked as gone. The composition
+samples the residual through the map of its capture.
+
+Depth buffers are not linear: with the far plane at 1, things a few metres
+apart differ by a fraction of a percent in depth, and only 1 - depth tells them
+apart; with the far plane at 0 (reversed), only the depth does. Depths are
+compared both ways, or an object and the wall behind it pass for the same
+surface, and the wall the object uncovers is given the object's residual. And
+the same surface does not keep its depth from one frame to the next: a camera
+orbiting a character, or walking, brings it nearer or takes it away by a few
+percent a frame. A point counts as hidden only where something more than 10%
+nearer was in its place the frame before; held to a fixed tolerance instead, a
+moving camera marks the whole background as gone, which then shows only the
+network's light until the camera stops and the next result arrives.
+
+Nothing far off is taken for the sky. With the far plane at 0 a mountain a few
+kilometres away has a depth of a few 1e-5 against the sky's 0: no absolute floor
+is put under the comparisons, or the sky uncovered beside a mountain would be
+given the mountain's residual. The depth a residual keeps in its alpha, a half
+float, is the logarithm of one over the distance, which holds about 2% of it at
+any distance.
 
 How late a result is decides how much of this there is to do, so the capture
 that waits for the network is replaced on every frame: an evaluation starts
 from the newest frame there is, and a result is one evaluation late, not two.
+
+#### Halos left behind
+
+Around the outline of something against what is behind it, the network lights
+up or darkens the pixels of the background that touch the outline: a halo. Those
+pixels are background, and the tracking moves them with the background, which
+is right for everything else the network did to them; but the halo belongs to
+the outline. When the two move apart -- a camera orbiting a character moves the
+background behind a character that stays where it is on screen -- the halo is
+carried away with the background, and shows as a light copy of the outline where
+it was when the network looked.
+
+So each result keeps, beside its residual, how far each of its pixels was from
+the outline of something in front of it in its capture, and the composition
+compares it with how far the pixel is from one now. Only a neighbour nearer by
+more than a fifth of the distance makes an outline: the depth of a slope, or of
+the bumps of a rock, changes by more than any small tolerance over a few pixels,
+and counted as edges they would be everywhere. Where that changed, the pixel takes what the result
+did to the same surface nearby, away from any edge, in place of its own: the
+network's light and detail for that surface, without the halo. Where the outline
+is still where it was, nothing changes. The result before, while it is blended
+out, is treated the same way. Show tracking tints those pixels yellow.
 
 #### What the network never saw
 

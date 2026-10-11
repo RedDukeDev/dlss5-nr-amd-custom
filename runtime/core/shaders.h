@@ -74,7 +74,8 @@ static const uint FLAG_FILL        = 256; // compose: fill in what the network n
 static const uint FLAG_SHOW_TRACKING = 512;
 static const uint FLAG_PREVIOUS    = 1024; // compose: the result before this one is there
 static const uint FLAG_SYNC        = 2048; // compose: the frame waited for the network; t7 says if it answered
-static const uint FLAG_RAWMV       = 4096; // capture: the game's motion vectors (t2) are the way back to the capture before
+static const uint FLAG_RAWMV       = 4096;
+static const uint FLAG_EDGES       = 8192; // compose: how far each pixel of the results was from an edge (t8, t9) // capture: the game's motion vectors (t2) are the way back to the capture before
 
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
@@ -86,6 +87,8 @@ Texture2D<float4> t4 : register(t4);
 Texture2D<float4> t5 : register(t5);
 Texture2D<float4> t6 : register(t6);
 Texture2D<float4> t7 : register(t7);
+Texture2D<float4> t8 : register(t8);
+Texture2D<float4> t9 : register(t9);
 RWTexture2D<float4> u0 : register(u0);
 RWTexture2D<float4> u1 : register(u1);
 RWTexture2D<float4> u2 : register(u2);
@@ -236,13 +239,59 @@ static const float GONE = 1e9;
 
 bool gone(float2 d) { return d.x >= 1e8; }
 
+// Two depths of the same surface in the same frame: within `tolerance` of each other,
+// relative to the depth and also to one minus it. Depth buffers are not linear: with
+// the far plane at 1 everything a few metres off is crowded under 1 and only
+// 1 - depth tells it apart, with it at 0 (reversed) only the depth does; whichever
+// way the game has it, the one that tells them apart decides. No floor beyond what
+// a float holds: a mountain a few kilometres off has a depth of a few 1e-5 against
+// the sky's 0, and is still not the sky.
+bool same_depth(float a, float b, float tolerance)
+{
+    float apart = abs(a - b);
+    return apart <= max(tolerance * max(abs(a), abs(b)), 1e-9) &&
+           apart <= max(tolerance * max(abs(1.0 - a), abs(1.0 - b)), 1e-9);
+}
+
+// One over the distance, up to a constant: the depth with the far plane at 0
+// (FLAG_DEPTH_INV), 1 - depth otherwise (a few metres out).
+float closeness(float d) { return (flags & FLAG_DEPTH_INV) ? d : 1.0 - d; }
+
+// The depth `before` of a point in an earlier frame and `now` in this one, of the same
+// surface: the camera moves (orbiting a character, walking), so the same surface gets
+// nearer or farther from frame to frame, by more than any fixed tolerance allows.
+// What says it was hidden then is something nearer there: by more than `nearer`, as a
+// fraction of its distance. Farther then is the camera having come closer, up to
+// `farther`. Depth is taken as proportional to one over the distance, which it is with
+// the far plane at 0 (FLAG_DEPTH_INV) and, a few metres out, as 1 - depth otherwise.
+bool continues(float before, float now, float nearer, float farther)
+{
+    float wb = closeness(before);
+    float wn = closeness(now);
+    if (max(wb, wn) < 1e-12) return true;  // both the sky
+    float ratio = wb / max(wn, 1e-12);     // the distance now over the distance then
+    return ratio <= 1.0 + nearer && ratio * (1.0 + farther) >= 1.0;
+}
+
+// A depth into a half float and back, as the logarithm of its closeness: the same
+// relative precision (about 2%) at any distance, a hand's breadth or kilometres off,
+// where the depth itself would lose everything past a few hundred metres. The sky
+// (closeness 0) comes back as 2^-100, which nothing else is near.
+float pack_depth(float d) { return log2(max(closeness(d), 1e-30)); }
+float unpack_depth(float p)
+{
+    float c = exp2(p);
+    return (flags & FLAG_DEPTH_INV) ? c : 1.0 - c;
+}
+
 // Moves a displacement map (t0) on by one frame, into u0: the game's motion
 // vectors (t2) say where each pixel was in the previous frame, and the map
 // there says where that was then. FLAG_IDENTITY: the earlier frame is the
 // previous one, and the map starts from nothing.
 //
 // Occlusion: the depth of the previous frame (t3) where the pixel came from
-// has to agree with this pixel's depth (t1). Where it does not, the pixel was
+// has to agree with this pixel's depth (t1), allowing for the camera having
+// moved (see "continues"). Where something nearer was there, the pixel was
 // covered then, and what the map holds there belongs to whatever covered it.
 // FLAG_KEEP_DEPTH also writes this frame's depth (u1), for the next frame.
 [numthreads(8, 8, 1)]
@@ -259,8 +308,7 @@ void track_main(uint3 id : SV_DispatchThreadID)
     if (all(from >= 0.0) && all(from < float2(size))) {
         int2 at = int2(from);
         float before = t3.Load(int3(at, 0)).r;
-        bool seen = !(flags & FLAG_DEPTH_CHECK) ||
-                    abs(before - depth) <= 0.02 * max(max(abs(before), abs(depth)), 1e-6);
+        bool seen = !(flags & FLAG_DEPTH_CHECK) || continues(before, depth, 0.10, 0.30);
         float2 earlier = (flags & FLAG_IDENTITY) ? 0.0 : t0.Load(int3(at, 0)).rg;
         if (seen && !gone(earlier)) d = mv + earlier;
     }
@@ -293,12 +341,43 @@ void capture_main(uint3 id : SV_DispatchThreadID)
 // that slot's displacement map. It is never blended with older answers, which
 // the network re-decides with every framing. The capture's depth (t2) goes
 // with it, in alpha: it says what surface each of its pixels showed.
+// How far a pixel is from the outline of something in front of it, up to
+// EDGE_REACH pixels of the network's size (EDGE_REACH: none that near), `uv` and
+// `texel` in the texture coordinates of the depth. The network lights up or
+// darkens the pixels of the background around the outline of something nearer: a
+// halo that belongs to the outline, not to the pixels it is on, and that has to go
+// when the outline moves away. Only a neighbour clearly nearer counts, by more than
+// a fifth of the distance: a slope, or the bumps of a rock, change the depth by
+// more than any small tolerance over a few pixels, and are not outlines.
+static const int EDGE_STEPS = 5;
+static const float EDGE_DISTANCE[EDGE_STEPS] = {1, 2, 4, 6, 8};
+static const float EDGE_REACH = 10.0;
+static const float2 EDGE_DIRECTIONS[8] = {float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+                                          float2(0.7071, 0.7071), float2(-0.7071, 0.7071),
+                                          float2(0.7071, -0.7071), float2(-0.7071, -0.7071)};
+
+float edge_distance(Texture2D<float4> depth_of, float2 uv, float2 texel)
+{
+    float here = closeness(depth_of.SampleLevel(point_clamp, uv, 0).r);
+    float found = EDGE_REACH;
+    [unroll] for (int j = EDGE_STEPS - 1; j >= 0; --j) {
+        [unroll] for (int i = 0; i < 8; ++i) {
+            float2 spot = clamp(uv + EDGE_DIRECTIONS[i] * EDGE_DISTANCE[j] * texel, 0.0, 1.0);
+            float there = closeness(depth_of.SampleLevel(point_clamp, spot, 0).r);
+            if (there > here * 1.25 + 1e-12) found = EDGE_DISTANCE[j];
+        }
+    }
+    return found;
+}
+
 [numthreads(8, 8, 1)]
 void refresh_main(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= size)) return;
+    // How far each pixel was from an edge, beside the residual (u1).
+    u1[id.xy] = float4(edge_distance(t2, (float2(id.xy) + 0.5) * inv_size, inv_size), 0, 0, 0);
     float3 r = from_net(t0.Load(int3(id.xy, 0)).rgb) - from_net(t1.Load(int3(id.xy, 0)).rgb);
-    u0[id.xy] = float4(r, t2.Load(int3(id.xy, 0)).r);
+    u0[id.xy] = float4(r, pack_depth(t2.Load(int3(id.xy, 0)).r));
 }
 
 // What the network did to the light of a place, without what it did to its
@@ -379,6 +458,42 @@ float3 compose(float3 frame, float3 r)
     return answer_y <= 1e-5 ? frame : result;
 }
 
+// ---- halos left behind
+//
+// A pixel of a result that was near an edge when the network looked (its distance
+// in `edges`) and is not as near one now (`now`) carries a halo that belongs to
+// that edge. It takes instead what the result did around it, on its own surface
+// and away from any edge: the network's own light and detail for that surface,
+// without the halo. `residual` and `edges` at `at`, in texture coordinates of the
+// network's size; `texel` one pixel of it.
+static const float HALO_REACH[4] = {4, 8, 12, 16};
+
+float3 without_halo(Texture2D<float4> residual, Texture2D<float4> edges, float2 at, float now, float2 texel,
+                    float3 r, inout float taken)
+{
+    float then = edges.SampleLevel(point_clamp, at, 0).r;
+    if (then >= EDGE_REACH && now >= EDGE_REACH) return r;
+    float moved = saturate((abs(then - now) - 1.0) / 2.0);
+    if (moved <= 0.0) return r;
+    float depth = unpack_depth(residual.SampleLevel(point_clamp, at, 0).a);
+    float3 sum = 0.0;
+    float count = 0.0;
+    [unroll] for (int j = 0; j < 4; ++j) {
+        if (count > 0.0) continue;   // found nearer already
+        [unroll] for (int i = 0; i < 8; ++i) {
+            float2 spot = at + EDGE_DIRECTIONS[i] * (then + HALO_REACH[j]) * texel;
+            if (any(spot < 0.0) || any(spot > 1.0)) continue;
+            float4 v = residual.SampleLevel(point_clamp, spot, 0);
+            if (edges.SampleLevel(point_clamp, spot, 0).r < EDGE_REACH) continue;
+            if (!continues(unpack_depth(v.a), depth, 0.15, 0.15)) continue;   // the same surface
+            sum += v.rgb;
+            count += 1.0;
+        }
+    }
+    if (count > 0.0) taken = max(taken, moved);
+    return count > 0.0 ? lerp(r, sum / count, moved) : r;
+}
+
 // ---- pixels the network never saw
 //
 // A pixel whose point was behind something, or outside the image, in the
@@ -398,16 +513,17 @@ static const float2 DIRECTIONS[8] = {float2(1, 0), float2(-1, 0), float2(0, 1), 
 static const int REACHES = 7;
 static const float REACH[REACHES] = {6, 12, 24, 48, 96, 192, 384};   // pixels of the network's size
 
-bool same_surface(float a, float b) { return abs(a - b) <= 0.05 * max(max(abs(a), abs(b)), 1e-6); }
+bool same_surface(float a, float b) { return same_depth(a, b, 0.05); }
 
 // The network's own answer for this point, from a result (its residual and
 // its displacement map) that did see it: read where the borrowed displacement
 // leads, and taken only if what that capture showed there was this pixel's
 // surface -- its depth then (the residual's alpha) against the depth now.
 // Nearest first.
-bool borrow(Texture2D<float4> residual, Texture2D<float4> map, float2 uv, float depth, out float3 r)
+bool borrow(Texture2D<float4> residual, Texture2D<float4> map, float2 uv, float depth, out float3 r, out float2 from)
 {
     r = 0.0;
+    from = uv;
     bool found = false;
     [loop] for (int j = 0; j < REACHES && !found; ++j) {
         [loop] for (int i = 0; i < 8 && !found; ++i) {
@@ -417,8 +533,9 @@ bool borrow(Texture2D<float4> residual, Texture2D<float4> map, float2 uv, float 
             if (gone(d) || !same_surface(t5.SampleLevel(point_clamp, spot, 0).r, depth)) continue;
             float2 at = uv + d * uv1_scale;
             if (any(at < 0.0) || any(at > 1.0)) continue;
-            if (!same_surface(residual.SampleLevel(point_clamp, at, 0).a, depth)) continue;
+            if (!continues(unpack_depth(residual.SampleLevel(point_clamp, at, 0).a), depth, 0.10, 0.5)) continue;
             r = residual.SampleLevel(linear_clamp, at, 0).rgb;
+            from = at;
             found = true;
         }
     }
@@ -469,7 +586,7 @@ bool fill_in(float2 uv, float depth, out float3 gain)
 // the network for that very point, even an older one, beats a guess.
 // FLAG_SHOW_TRACKING tints those pixels: cyan from the same result, blue from
 // the one before, green where only the gain was filled in, red where nothing
-// was found.
+// was found; and yellow where a halo left behind by an edge was taken off.
 [numthreads(8, 8, 1)]
 void compose_main(uint3 id : SV_DispatchThreadID)
 {
@@ -491,27 +608,49 @@ void compose_main(uint3 id : SV_DispatchThreadID)
         float3 tint = 0.0;
         if (!gone(d) && all(at >= 0.0) && all(at <= 1.0)) {
             r = t3.SampleLevel(linear_clamp, at, 0).rgb;
+            // Halos left behind by edges that have moved (FLAG_EDGES; t5 is this
+            // frame's depth at the network's size).
+            float now = (flags & FLAG_EDGES) ? edge_distance(t5, uv, uv1_scale) : EDGE_REACH;
+            float halo = 0.0;
+            if (flags & FLAG_EDGES) r = without_halo(t3, t8, at, now, uv1_scale, r, halo);
             // A result that has just arrived takes over from the one before over
             // a few frames, not at once: its detail differs from the old one's
             // wherever the network decided otherwise for the new framing.
             if ((flags & FLAG_PREVIOUS) && blend < 1.0) {
                 float2 od = t6.SampleLevel(point_clamp, uv, 0).rg;
                 float2 there = uv + od * uv1_scale;
-                if (!gone(od) && all(there >= 0.0) && all(there <= 1.0))
-                    r = lerp(t2.SampleLevel(linear_clamp, there, 0).rgb, r, blend);
+                if (!gone(od) && all(there >= 0.0) && all(there <= 1.0)) {
+                    float3 before = t2.SampleLevel(linear_clamp, there, 0).rgb;
+                    if (flags & FLAG_EDGES) before = without_halo(t2, t9, there, now, uv1_scale, before, halo);
+                    r = lerp(before, r, blend);
+                }
             }
+            tint = float3(0.3, 0.3, 0.0) * halo;
         } else if (flags & FLAG_FILL) {
             float depth = t5.SampleLevel(point_clamp, uv, 0).r;
             float2 older = (flags & FLAG_PREVIOUS) ? t6.SampleLevel(point_clamp, uv, 0).rg : GONE;
             float2 there = uv + older * uv1_scale;
-            if (borrow(t3, t4, uv, depth, r)) {
+            float2 from;
+            // A halo in what is filled in is taken off too (FLAG_EDGES). What is borrowed
+            // was another pixel's, by an outline that is not this pixel's: off whenever
+            // it was near one, as if this pixel were far from any (EDGE_REACH).
+            float halo = 0.0;
+            bool found = true;
+            if (borrow(t3, t4, uv, depth, r, from)) {
+                if (flags & FLAG_EDGES) r = without_halo(t3, t8, from, EDGE_REACH, uv1_scale, r, halo);
                 tint = float3(0.0, 0.25, 0.25);
             } else if (!gone(older) && all(there >= 0.0) && all(there <= 1.0)) {
                 r = t2.SampleLevel(linear_clamp, there, 0).rgb;
+                if (flags & FLAG_EDGES) r = without_halo(t2, t9, there, edge_distance(t5, uv, uv1_scale), uv1_scale, r, halo);
                 tint = float3(0.0, 0.0, 0.3);
-            } else if ((flags & FLAG_PREVIOUS) && borrow(t2, t6, uv, depth, r)) {
+            } else if ((flags & FLAG_PREVIOUS) && borrow(t2, t6, uv, depth, r, from)) {
+                if (flags & FLAG_EDGES) r = without_halo(t2, t9, from, EDGE_REACH, uv1_scale, r, halo);
                 tint = float3(0.0, 0.0, 0.3);
             } else {
+                found = false;
+            }
+            if (halo > 0.0) tint = lerp(tint, float3(0.3, 0.3, 0.0), halo);
+            if (!found) {
                 float3 gain = 1.0;
                 tint = fill_in(uv, depth, gain) ? float3(0.0, 0.25, 0.0) : float3(0.25, 0.0, 0.0);
                 r = proxy_of(frame) * (gain - 1.0);

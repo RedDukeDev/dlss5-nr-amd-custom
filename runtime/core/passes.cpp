@@ -13,10 +13,10 @@
 namespace dlss5nr {
 namespace {
 
-constexpr UINT kSrvCount = 8;
+constexpr UINT kSrvCount = 10;
 constexpr UINT kUavCount = 4;
 constexpr UINT kTableSize = kSrvCount + kUavCount;
-// A dispatch takes one table of twelve. A frame records at most twelve dispatches,
+// A dispatch takes one table of fourteen. A frame records at most twelve dispatches,
 // so the ring covers a hundred frames in flight before it reuses a
 // table the GPU may still read.
 constexpr UINT kRingTables = 1024;
