@@ -110,16 +110,26 @@ with a Direct3D 11 game under Proton (DXVK), nor with OptiScaler's frame generat
 
 ## Vulkan
 
-A Vulkan game is enhanced at the end of its frame: at `vkQueuePresentKHR`, the swapchain image is
-copied into an image shared with a Direct3D 12 device, the runtime works there, and the result is
-copied back over the swapchain image, with the Direct3D 12 fences imported as timeline semaphores for
-the order between the two. The menu is drawn after it, so it is not enhanced. As without an upscaler in
-Direct3D 12, there are no depth or motion vectors to follow, and the game's interface is part of the
-image: the result trails behind what moves, which *Wait for the network* avoids at a cost in
-frame rate. This is the case whatever upscaler the game uses. Tested on Windows with a small
-Vulkan program (`runtime/tests/dx11/vkapp.cpp`): BGRA8 and RGBA8 swapchains come back byte for byte at
-zero strength. Not tested yet: Vulkan upscalers running on Direct3D 12 (`ffx_12`...), where depth and
-motion vectors could be used, HDR swapchains, DXVK and vkd3d-proton (these go through the DXGI path).
+Two ways, by the upscaler OptiScaler uses in the game (`VulkanUpscaler` in OptiScaler.ini):
+
+- **A Vulkan upscaler running on Direct3D 12** (`ffx_12`, `fsr21_12`): the upscaler's inputs already
+  go to Direct3D 12 for it, so the neural rendering works there as in a Direct3D 12 game, before
+  or after the upscaler, with depth and motion vectors.
+- **Any other** (the default, native `fsr22`, `ffx`, `xess`... or no upscaler at all): the finished
+  image, at `vkQueuePresentKHR`. The swapchain image is copied into an image shared with a
+  Direct3D 12 device, the runtime works there, and the result is copied back over the swapchain image,
+  with the Direct3D 12 fences imported as timeline semaphores for the order between the two APIs.
+  The menu is drawn after it, so it is not enhanced. As without an upscaler in Direct3D 12, there are no
+  depth or motion vectors to follow, and the game's interface is part of the image: the result trails
+  behind what moves, which *Wait for the network* avoids at a cost in frame rate.
+
+So for a Vulkan game that has an upscaler, `VulkanUpscaler=ffx_12` gives the better picture, at the
+cost of OptiScaler's copies of the upscaler's inputs and output.
+
+Tested on Windows with two small Vulkan programs (`runtime/tests/dx11/vkapp.cpp` and `vkngx.cpp`):
+BGRA8 and RGBA8 swapchains come back byte for byte at zero strength, and `ffx_12` and the default
+upscaler both hold 60 fps. Not tested yet: HDR swapchains, window resizing, DXVK and vkd3d-proton (these
+go through the DXGI path).
 
 ## Linux 
 

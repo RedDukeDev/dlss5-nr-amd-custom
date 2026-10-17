@@ -7,6 +7,8 @@ window to a BMP at a chosen time, so what OptiScaler did to the picture is in it
     dx11app.cpp   no upscaler: a flip-model swap chain and a procedural scene (the finished-image path)
     vkapp.cpp     a Vulkan game: a swapchain, the scene drawn on the CPU and copied in (no shaders), so
                   OptiScaler enhances the finished image at vkQueuePresentKHR
+    vkngx.cpp     the same through the NGX Vulkan API, with depth and motion vectors (OptiScaler answers
+                  as FSR 2.2; `VulkanUpscaler=ffx_12` takes the upscaler to Direct3D 12)
     dx11ngx.cpp   the scene at render resolution with depth and motion vectors, upscaled through the
                   NGX Direct3D 11 API as a DLSS game does (OptiScaler answers, as FSR 2.2 unless
                   Dx11Upscaler says otherwise)
@@ -15,6 +17,7 @@ Build with the Visual Studio developer prompt (dx11ngx needs OptiScaler's NGX he
 
     cl /O2 /EHsc /std:c++17 dx11app.cpp
     cl /O2 /EHsc /std:c++17 /I <OptiScaler>\external\vulkan\include vkapp.cpp
+    cl /O2 /EHsc /std:c++17 /I <OptiScaler>\external\vulkan\include /I <OptiScaler>\external\nvngx_dlss_sdk vkngx.cpp
     cl /O2 /EHsc /std:c++17 /I <OptiScaler>\external\nvngx_dlss_sdk dx11ngx.cpp
 
 Run them in a folder holding the package with OptiScaler.dll copied to `dxgi.dll` beside the exe
@@ -22,6 +25,7 @@ Run them in a folder holding the package with OptiScaler.dll copied to `dxgi.dll
 
     dx11app.exe  [seconds] [capture_at] [out.bmp] [width] [height] [rgba|bgra|srgb|fp16] [freeze_time]
     vkapp.exe    [seconds] [capture_at] [out.bmp] [width] [height] [freeze_time] [bgra|rgba]
+    vkngx.exe    [seconds] [capture_at] [out.bmp] [out_w] [out_h] [render_percent] [freeze_time]
     dx11ngx.exe  [seconds] [capture_at] [out.bmp] [out_w] [out_h] [render_percent] [freeze_time]
 
 `freeze_time` stops the animation, which makes two runs comparable. `NOVSYNC=1` in the environment
