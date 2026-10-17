@@ -84,6 +84,7 @@ __device__ void conv1x1(const ConvArgs &args) {
                 for (int c = c0; c < c1; ++c) wait_flag(args.ready_in + c + in_tiles_x * (PLANES * (r + bz) + p));
     }
     __syncthreads();
+    acquire_tiles();
 
     // Patch addressing as the PTX does it, including its special cases for
     // dimensions of 4..7; out-of-range patches read as zeros.
@@ -245,6 +246,7 @@ __device__ void conv1x1(const ConvArgs &args) {
         }
     }
 
+    release_tiles();
     __syncthreads();
     if (lane == 0 && wave == 0 && args.ready_out)
         raise_flag(args.ready_out + 2 * by * tiles_x + blockIdx.x);

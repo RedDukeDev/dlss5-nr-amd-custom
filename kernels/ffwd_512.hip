@@ -122,6 +122,7 @@ __device__ __forceinline__ void ffwd(const FfwdArgs &args) {
             }
     }
     __syncthreads();
+    acquire_tiles();
 
     // ------------------------------------------------ who loads what
     //
@@ -329,6 +330,8 @@ __device__ __forceinline__ void ffwd(const FfwdArgs &args) {
     __syncthreads();
     }   // passes
 
+    release_tiles();
+    __syncthreads();
     if (lane == 0 && wave == 0 && args.ready_out)
         raise_flag(args.ready_out + (2 * by + bz) * tiles_x + bx);
 }

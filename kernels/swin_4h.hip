@@ -185,6 +185,7 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
             for (int c = c0; c < c1; ++c) wait_flag(args.ready_in + r * cols + c);
     }
     __syncthreads();
+    acquire_tiles();
 
     // ---------------------------------------------- the window as f16 rows
     {   // warp w reads patch w: four chunks of 32 channels into its 16 rows
@@ -639,6 +640,7 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
         }
     }
 
+    release_tiles();
     __syncthreads();
     if (lane == 0 && warp == 0 && args.ready_out) raise_flag(args.ready_out + by * tiles_x + bx);
 }

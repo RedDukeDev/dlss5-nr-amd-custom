@@ -107,10 +107,22 @@ The census above found two kinds of change in the kernels this directory replace
     with the pre block native -- the kernels then overlap differently -- the smaller
     network's image came out different from the translation's by up to 9 levels. Every
     native kernel that waits or raises a flag now fences the same way
-    (`acquire_tiles`, `release_tiles` in dlssnr_hip.h). Both networks now match the
-    translation exactly, and the whole network runs about four times faster than the
-    translation (2560x1440: 229 -> 57 ms the smaller network, 391 -> 98 ms the
-    larger).
+    (`acquire_tiles`, `release_tiles` in dlssnr_hip.h).
+  - **One more kernel**: `cc_vit_1d_projection_wait_fp8`, the smaller network's last
+    projection of its vit stage, is `cc_vit_1d_projection_chained_fp8` with no flag to
+    raise.
+  - **The 1H blocks in 8 KB of LDS, not 10**: they are bound by how many blocks fit
+    at once -- adding LDS to the pre block made it 1.5 times as slow at 16 KB and 3
+    times at 32 -- and only the q, k and v weights, staged together, needed more than
+    8. Staged one at a time, sixteen blocks fit in a WGP where twelve did: the pre
+    block went from 10.5 to 8.4 ms at 2560x1440, the whole network's kernels from
+    63.5 to 54.7 ms. `pre_block_bench.py` times it and checks the bytes.
+
+Both networks match the translation exactly, at 2560x1440 and 1704x960, and the whole
+network runs about four times faster than the translation (2560x1440: 199 -> 47 ms the
+smaller network, 340 -> 86 ms the larger; 1704x960: 106 -> 27 and 183 -> 45).
+`DLSS5NR_GATE_PROFILE=1` logs every kernel's GPU time, native or translated, from the
+gate: the 2H blocks, at 32 KB of LDS a block, are what holds the most now.
 
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of

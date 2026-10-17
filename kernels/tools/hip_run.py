@@ -81,19 +81,19 @@ class Hip:
         if sync:
             self.check(self.hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
 
-    def time(self, fn, grid, block, param_bytes, repeat=50, before=None):
+    def time(self, fn, grid, block, param_bytes, repeat=50, before=None, shared=0):
         """Average milliseconds per launch over `repeat` launches, by HIP events.
         `before` runs ahead of every launch outside the timed region is not
         possible with events on one stream, so it is timed along; keep it cheap."""
         start, stop = ctypes.c_void_p(), ctypes.c_void_p()
         self.check(self.hip.hipEventCreate(ctypes.byref(start)), "hipEventCreate")
         self.check(self.hip.hipEventCreate(ctypes.byref(stop)), "hipEventCreate")
-        self.launch(fn, grid, block, param_bytes)
+        self.launch(fn, grid, block, param_bytes, shared=shared)
         self.check(self.hip.hipEventRecord(start, None), "hipEventRecord")
         for _ in range(repeat):
             if before:
                 before()
-            self.launch(fn, grid, block, param_bytes, sync=False)
+            self.launch(fn, grid, block, param_bytes, shared=shared, sync=False)
         self.check(self.hip.hipEventRecord(stop, None), "hipEventRecord")
         self.check(self.hip.hipEventSynchronize(stop), "hipEventSynchronize")
         ms = ctypes.c_float()

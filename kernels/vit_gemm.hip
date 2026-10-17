@@ -212,3 +212,11 @@ cc_vit_1d_ffn_contract_chained_fp8_native(VitArgs args) { vit_gemm<4096>(args); 
 
 extern "C" __global__ __launch_bounds__(128) void
 cc_vit_1d_projection_chained_fp8_native(VitArgs args) { vit_gemm<1024>(args); }
+
+// cc_vit_1d_projection_wait_fp8 (310.9.16, the smaller network): the same layer at the
+// end of its stage, with no consumer to tell. The PTX never reads ready_out.
+extern "C" __global__ __launch_bounds__(128) void
+cc_vit_1d_projection_wait_fp8_native(VitArgs args) {
+    args.ready_out = nullptr;
+    vit_gemm<1024>(args);
+}

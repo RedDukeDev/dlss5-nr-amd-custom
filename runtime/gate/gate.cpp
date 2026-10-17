@@ -101,6 +101,83 @@ const char *name_of(CUfunction f) {
 
 } // namespace
 
+// DLSS5NR_GATE_PROFILE=1: the GPU time of every kernel, native or translated, from a pair
+// of events around each launch, waited for at once (which serialises the network, so
+// the times are the kernels' own, not the frame's), summed per kernel and logged every
+// 2000 launches. What to make native next is the top of that list.
+namespace profile {
+
+typedef int (*event_create_fn)(void **);
+typedef int (*event_record_fn)(void *, void *);
+typedef int (*event_sync_fn)(void *);
+typedef int (*event_elapsed_fn)(float *, void *, void *);
+
+struct Entry {
+    char name[112];
+    double ms;
+    unsigned launches;
+    bool native;
+};
+Entry g_entries[256];
+unsigned g_count = 0, g_launches = 0;
+void *g_start = nullptr, *g_stop = nullptr;
+event_record_fn g_record = nullptr;
+event_sync_fn g_sync = nullptr;
+event_elapsed_fn g_elapsed = nullptr;
+
+inline bool on() {
+    static int state = -1;
+    if (state < 0) {
+        state = 0;
+        char v[8];
+        if (GetEnvironmentVariableA("DLSS5NR_GATE_PROFILE", v, sizeof v) > 0) {
+            HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+            auto create = hip ? (event_create_fn)GetProcAddress(hip, "hipEventCreate") : nullptr;
+            g_record = hip ? (event_record_fn)GetProcAddress(hip, "hipEventRecord") : nullptr;
+            g_sync = hip ? (event_sync_fn)GetProcAddress(hip, "hipEventSynchronize") : nullptr;
+            g_elapsed = hip ? (event_elapsed_fn)GetProcAddress(hip, "hipEventElapsedTime") : nullptr;
+            if (create && g_record && g_sync && g_elapsed && create(&g_start) == 0 && create(&g_stop) == 0) state = 1;
+            else logf("[profile] the HIP event functions are not there: no profile\n");
+        }
+    }
+    return state == 1;
+}
+
+inline void begin(CUstream stream) { g_record(g_start, stream); }
+
+inline void end(CUstream stream, const char *name, bool native_ran) {
+    g_record(g_stop, stream);
+    g_sync(g_stop);
+    float ms = 0.0f;
+    g_elapsed(&ms, g_start, g_stop);
+    unsigned i = 0;
+    while (i < g_count && strcmp(g_entries[i].name, name) != 0) ++i;
+    if (i == g_count) {
+        if (g_count == sizeof g_entries / sizeof g_entries[0]) return;
+        strncpy(g_entries[i].name, name, sizeof g_entries[i].name - 1);
+        ++g_count;
+    }
+    g_entries[i].ms += ms;
+    g_entries[i].launches += 1;
+    g_entries[i].native = native_ran;
+    if (++g_launches % 2000 != 0) return;
+    double total = 0.0;
+    for (unsigned k = 0; k < g_count; ++k) total += g_entries[k].ms;
+    logf("[profile] %u launches, %.1f ms of kernels\n", g_launches, total);
+    bool shown[256] = {};
+    for (unsigned rank = 0; rank < g_count; ++rank) {
+        unsigned best = g_count;
+        for (unsigned k = 0; k < g_count; ++k)
+            if (!shown[k] && (best == g_count || g_entries[k].ms > g_entries[best].ms)) best = k;
+        shown[best] = true;
+        const Entry &e = g_entries[best];
+        logf("[profile] %6.1f%% %9.2f ms %6u  %-10s %s\n", 100.0 * e.ms / total, e.ms, e.launches,
+             e.native ? "native" : "translated", e.name);
+    }
+}
+
+} // namespace profile
+
 extern "C" {
 
 __declspec(dllexport) CUresult cuModuleGetFunction(CUfunction *out, CUmodule module, const char *name) {
@@ -124,10 +201,17 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
                                               unsigned bx, unsigned by, unsigned bz, unsigned shared,
                                               CUstream stream, void **params, void **extra) {
     if (!g_launch) g_launch = real("cuLaunchKernel");
-    if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) return 0;
     auto fn = (CUresult (*)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                             unsigned, CUstream, void **, void **))g_launch;
-    return fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+    if (!profile::on()) {
+        if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) return 0;
+        return fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+    }
+    profile::begin(stream);
+    const bool native_ran = native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra);
+    const CUresult r = native_ran ? 0 : fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+    profile::end(stream, name_of(f), native_ran);
+    return r;
 }
 
 } // extern "C"

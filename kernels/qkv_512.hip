@@ -107,6 +107,7 @@ cc_split_swin_16h_qkv_512_chained_fp8_native(QkvArgs args) {
             }
     }
     __syncthreads();
+    acquire_tiles();
 
     // Tokens and weights are each the A operand of one product and the B of
     // another (v has the token as its row).
@@ -324,6 +325,7 @@ cc_split_swin_16h_qkv_512_chained_fp8_native(QkvArgs args) {
         }
     }
 
+    release_tiles();
     __syncthreads();
     if (lane == 0 && warp == 0 && args.ready_out)
         raise_flag(args.ready_out + (by * gridDim.z + bz) * gridDim.x + bx);

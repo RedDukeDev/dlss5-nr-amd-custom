@@ -62,6 +62,7 @@ cc_split_swin_16h_ffwd_proj_512_chained_fp8  conv1x1_512.hsaco  block=32,4,1  ar
 cc_vit_1d_ffn_expand_chained_fp8      vit_ffn_expand.hsaco  block=32,4,1  args=72  entry=cc_vit_1d_ffn_expand_chained_fp8_native
 cc_vit_1d_ffn_contract_chained_fp8    vit_gemm.hsaco        block=32,4,1  args=72  entry=cc_vit_1d_ffn_contract_chained_fp8_native
 cc_vit_1d_projection_chained_fp8      vit_gemm.hsaco        block=32,4,1  args=72  entry=cc_vit_1d_projection_chained_fp8_native
+cc_vit_1d_projection_wait_fp8         vit_gemm.hsaco        block=32,4,1  args=72  entry=cc_vit_1d_projection_wait_fp8_native
 
 # The fused Swin block, one head, 32 channels: four SiLU branches, cosine
 # attention with the exponential done on the bits, and the projection onto the
