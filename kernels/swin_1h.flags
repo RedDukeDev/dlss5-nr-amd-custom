@@ -1,1 +1,0 @@
--mllvm -amdgpu-sched-strategy=max-memory-clause

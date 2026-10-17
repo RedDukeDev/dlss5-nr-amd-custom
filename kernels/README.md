@@ -145,6 +145,18 @@ included, under the store's per-lane guard, so at the image's edge the WMMA ran 
 lanes off that had never loaded their operand. An empty asm on the result, before
 the guard, keeps it computed by every lane.
 
+Then the 1H attention, which ablations put at 70% of the block (the four branches,
+with half its WMMAs, are 17%): q, k and v were held through it as widened operands,
+192 registers, and the block spilled around them. They are now held as the rounded
+result tiles they come from, half the registers, and the operand is rebuilt at each
+use (on RDNA4 the operand is two registers already and stays); and on RDNA3 the
+probabilities stay f16 in place, already e4m3 values, instead of being narrowed to
+codes only to be widened back for P . V. With that the max-memory-clause scheduler
+(swin_1h.flags) went from helping to spilling, and is gone: no 1H kernel spills but
+ds_wait, by 7. At 2560x1440 the pre block went from 6.5 to 5.8 ms on its bench, the
+other texture-free kernels by a fifth to a quarter (ds_wait 13%), and in the
+network the post block from 5.4 to 4.5 ms.
+
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of
 the weights pointer>` the 64 KB it points to. That is how the new parameter's layout
@@ -507,11 +519,12 @@ clock moves a few per cent between runs:
     costs a few per cent; staging each 512-byte piece through LDS
     (bias_tile) pays in the 1H and 2H blocks and not in the wider ones, where
     the extra LDS or the synchronisation cost more -- kept where it pays;
-  * the scheduler strategy max-memory-clause makes the 1H code object 3.5%
-    faster; kept in swin_1h.flags, which build_kernel.py reads. The other
+  * the scheduler strategy max-memory-clause made the 1H code object 3.5%
+    faster, and was kept in swin_1h.flags (build_kernel.py reads <name>.flags)
+    until the 1H attention changed under it (see 310.9.16 above). The other
     blocks did not gain beyond the noise;
-  * ablations on the 1H block put a fifth of its time in the four branches,
-    and no single stage dominates: the rest is spread thin.
+  * ablations on the 1H block put a fifth of its time in the four branches;
+    the attention, measured later, is most of the rest.
 
 The proxy used to read at most 32 manifest lines and drop the rest without a
 word; the table is now 256 long and says so when a manifest outgrows it.

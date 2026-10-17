@@ -568,6 +568,35 @@ __device__ inline op8 frag_order_tile_b8(u32x4 q) { return fragment_order16(tile
 __device__ inline op8 frag_order_tile_a8(u32x4 q) { return fragment_order16(tile_to_operand(q)); }
 #endif
 
+// An operand held across a long stretch -- the attention's q, k and v -- in as few
+// registers as the layout allows. On RDNA3 that is the rounded result tile it is
+// made from, four registers where the operand takes eight, rebuilt at every use:
+// held whole, q, k and v were 192 registers through the attention and the kernel
+// spilled around them. The pin keeps the compiler from merging the rebuilds back
+// into one long-lived operand. On RDNA4 the operand is two registers already and
+// is held as it is.
+#ifdef DLSSNR_GFX12_LAYOUT
+typedef op8 kept8;
+__device__ inline kept8 keep_a8(u32x4 q) { return tile_to_a8(q); }
+__device__ inline kept8 keep_b8(u32x4 q) { return tile_to_b8(q); }
+__device__ inline kept8 keep_frag_a8(u32x4 q) { return frag_order_tile_a8(q); }
+__device__ inline op8 use_a8(kept8 k) { return k; }
+__device__ inline op8 use_b8(kept8 k) { return k; }
+__device__ inline op8 use_frag_a8(kept8 k) { return k; }
+#else
+typedef u32x4 kept8;
+__device__ inline kept8 keep_a8(u32x4 q) { return q; }
+__device__ inline kept8 keep_b8(u32x4 q) { return q; }
+__device__ inline kept8 keep_frag_a8(u32x4 q) { return q; }
+__device__ inline u32x4 pinned(u32x4 q) {
+    asm volatile("" : "+v"(q));
+    return q;
+}
+__device__ inline op8 use_a8(kept8 k) { return tile_to_a8(pinned(k)); }
+__device__ inline op8 use_b8(kept8 k) { return tile_to_b8(pinned(k)); }
+__device__ inline op8 use_frag_a8(kept8 k) { return frag_order_tile_a8(pinned(k)); }
+#endif
+
 // A 32-deep slice of e4m3 operands (slice below, on RDNA3).
 __device__ inline u32x4 slice(u32x4 acc, half16 a0, half16 b0, half16 a1, half16 b1);
 __device__ inline u32x4 slice8(u32x4 acc, op8 a0, op8 b0, op8 a1, op8 b1) {

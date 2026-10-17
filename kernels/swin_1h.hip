@@ -99,7 +99,8 @@ constexpr int PROW = 128;                     // a query's row of 64 keys, f16
 // LDS: the window's tokens as f16 rows (later the probabilities), and the
 // weight matrix in use.
 // The tokens' rows become the probabilities in f16 (32 queries x 64 keys), and
-// each query's row is narrowed in place, its 64 codes in the first half of it.
+// each query's row is rounded to e4m3 in place: as f16 on RDNA3, as its 64 codes
+// in the first half of it on RDNA4.
 //
 // 6 KB in all, which a block holds for its whole life: the kernels are bound by how
 // many blocks fit at once (measured: 16 KB a block made the pre block half again as
@@ -979,7 +980,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
     u32x4 Q[2][4], K[2][4];
     // v as the P . V product's A operand, its keys in the order the
     // translation's fragments hold them (fragment_order16, dlssnr_hip.h).
-    op8 vop[4][2];                               // [key tile][channel tile]
+    kept8 vop[4][2];                             // [key tile][channel tile]
     load_weights(W_QKV + SHIFT2, 32);
     for (int ct = 0; ct < 2; ++ct) {
         const op8 aq0 = wrow_a8(lds + LDS_W, ct * 16 + row16, 0);
@@ -999,11 +1000,11 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
             const op8 av1 = wrow_b8(lds + LDS_W, ct * 16 + row16, 1);
             u32x4 v = slice8((u32x4){0, 0, 0, 0}, b8_to_a8(sop[0][tt]), av0, b8_to_a8(sop[1][tt]), av1);
             for (int j = 0; j < 4; ++j) v[j] = round_e4m3x2(v[j]);
-            vop[tt][ct] = frag_order_tile_a8(v);
+            vop[tt][ct] = keep_frag_a8(v);
         }
 
     // ------------------------------------------------ cosine normalisation
-    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, op8 (&op)[2][4]) {
+    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, kept8 (&op)[2][4]) {
 // Without this the squares and their sums fuse into packed fmas, which round
 // once where the translation rounds twice.
 #pragma clang fp contract(off)
@@ -1037,11 +1038,11 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                     if (scale != 1.0f) v = v * s;
                     q[j] = round_e4m3x2(as_u32(v));
                 }
-                op[ct][tt] = as_a ? tile_to_a8(q) : tile_to_b8(q);
+                op[ct][tt] = as_a ? keep_a8(q) : keep_b8(q);
             }
         }
     };
-    op8 qop[2][4], kop[2][4];
+    kept8 qop[2][4], kop[2][4];
     normalise(Q, *(const float *)(args.weights + W_QK_SCALE + SHIFT2), true, qop);
     normalise(K, 1.0f, false, kop);
 
@@ -1051,7 +1052,8 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
     for (int half = 0; half < 2; ++half) {
         const uint8_t *bias = args.weights + W_BIAS + SHIFT2 + half * 0x1000;
         // scores[query][key] + bias, then the exponential; a lane owns a key.
-        for (int qt = 0; qt < 2; ++qt)
+        for (int qt = 0; qt < 2; ++qt) {
+            const op8 q0 = use_a8(qop[0][half * 2 + qt]), q1 = use_a8(qop[1][half * 2 + qt]);
             for (int kt = 0; kt < 4; ++kt) {
                 // The bias piece of this tile, 512 bytes in the PTX's fragment
                 // layout: one 16-byte load a lane into a free corner of LDS,
@@ -1076,7 +1078,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                     }
                     c[j] = pair;
                 }
-                u32x4 sc = slice8(c, qop[0][half * 2 + qt], kop[0][kt], qop[1][half * 2 + qt], kop[1][kt]);
+                u32x4 sc = slice8(c, q0, use_b8(kop[0][kt]), q1, use_b8(kop[1][kt]));
                 for (int j = 0; j < 4; ++j) sc[j] = exp2_trick(sc[j]);
                 // out to LDS as [query][key], where the normalisation happens
                 for (int j = 0; j < 4; ++j) {
@@ -1089,6 +1091,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                     *(uint16_t *)(lo + 2 * PROW) = (uint16_t)(w >> 16);
                 }
             }
+        }
         __builtin_amdgcn_wave_barrier();
 
         // One query per lane: sum its 64 keys, divide, narrow.
@@ -1111,6 +1114,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                                                              (_Float16)NORM_FLOOR);
             const _Float16 inv = (_Float16)__builtin_amdgcn_rcpf((float)total);
             const half2 f = {inv, inv};
+#ifdef DLSSNR_GFX12_LAYOUT
             // In place: the codes of keys 4i.. land on the halves of keys 2i.., read by then.
             uint8_t *dst = lds + LDS_TOK + lane * PROW;
             for (int i = 0; i < 16; ++i) {
@@ -1119,6 +1123,12 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                 const uint32_t codes = __builtin_amdgcn_perm(codes_e4m3x2(pair1), codes_e4m3x2(pair0), 0x06040200u);
                 *(uint32_t *)(dst + 4 * i) = codes;
             }
+#else
+            // In place and still f16, the e4m3 values themselves: RDNA3 multiplies
+            // them as f16, so codes would only be widened back.
+            uint32_t *dst = (uint32_t *)(lds + LDS_TOK + lane * PROW);
+            for (int i = 0; i < 32; ++i) dst[i] = round_e4m3x2(as_u32(as_half2(dst[i]) * f));
+#endif
         }
         __builtin_amdgcn_wave_barrier();
 
@@ -1135,13 +1145,18 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         for (int qt = 0; qt < 2; ++qt) {
             op8 pop[4];
             for (int kb = 0; kb < 4; ++kb) {
+#ifdef DLSSNR_GFX12_LAYOUT
                 const uint8_t *row = lds + LDS_TOK + (qt * 16 + row16) * PROW + kb * 16;
                 pop[kb] = frag_order_codes_b8(*(const u32x4 *)row);
+#else
+                const uint8_t *row = lds + LDS_TOK + (qt * 16 + row16) * PROW + kb * 32;
+                pop[kb] = frag_order_rounded_b8(*(const half16 *)row);
+#endif
             }
             u32x4 attn[2];
             for (int ct = 0; ct < 2; ++ct) {
-                u32x4 acc = slice8((u32x4){0, 0, 0, 0}, vop[0][ct], pop[0], vop[1][ct], pop[1]);
-                acc = slice8(acc, vop[2][ct], pop[2], vop[3][ct], pop[3]);
+                u32x4 acc = slice8((u32x4){0, 0, 0, 0}, use_frag_a8(vop[0][ct]), pop[0], use_frag_a8(vop[1][ct]), pop[1]);
+                acc = slice8(acc, use_frag_a8(vop[2][ct]), pop[2], use_frag_a8(vop[3][ct]), pop[3]);
                 for (int j = 0; j < 4; ++j) acc[j] = round_e4m3x2(acc[j]);
                 attn[ct] = acc;
             }
