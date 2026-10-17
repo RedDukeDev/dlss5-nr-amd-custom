@@ -74,8 +74,8 @@ static const uint FLAG_FILL        = 256; // compose: fill in what the network n
 static const uint FLAG_SHOW_TRACKING = 512;
 static const uint FLAG_PREVIOUS    = 1024; // compose: the result before this one is there
 static const uint FLAG_SYNC        = 2048; // compose: the frame waited for the network; t7 says if it answered
-static const uint FLAG_RAWMV       = 4096;
-static const uint FLAG_EDGES       = 8192; // compose: how far each pixel of the results was from an edge (t8, t9) // capture: the game's motion vectors (t2) are the way back to the capture before
+static const uint FLAG_RAWMV       = 4096; // capture: the game's motion vectors (t2) are the way back to the capture before
+static const uint FLAG_EDGES       = 8192; // compose: how far each pixel of the results was from an edge (t8, t9)
 
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
@@ -284,6 +284,31 @@ float unpack_depth(float p)
     return (flags & FLAG_DEPTH_INV) ? c : 1.0 - c;
 }
 
+// The game's motion vector for the point at `uv` (texture coordinates of the
+// network's size), in pixels of it: taken from the nearest surface among the 3 x 3
+// depth texels around it (t1, the game's depth; t2, its vectors), as every temporal
+// anti-aliasing does. At an outline the vector under a pixel can be the background's
+// while the pixel shows what is in front, and that is the one that moved.
+float2 nearest_motion(float2 uv)
+{
+    uint w, h;
+    t1.GetDimensions(w, h);
+    const float2 texel = 1.0 / float2(w, h);
+    const float2 centre = uv * uv1_scale;
+    float2 best = centre;
+    float nearest = -1.0;
+    [unroll] for (int j = -1; j <= 1; ++j)
+    [unroll] for (int i = -1; i <= 1; ++i) {
+        float2 p = centre + float2(i, j) * texel;
+        float c = closeness(t1.SampleLevel(point_clamp, p, 0).r);
+        if (c > nearest) {
+            nearest = c;
+            best = p;
+        }
+    }
+    return t2.SampleLevel(point_clamp, best / uv1_scale * uv2_scale, 0).rg * motion_to_px;
+}
+
 // Moves a displacement map (t0) on by one frame, into u0: the game's motion
 // vectors (t2) say where each pixel was in the previous frame, and the map
 // there says where that was then. FLAG_IDENTITY: the earlier frame is the
@@ -299,7 +324,7 @@ void track_main(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= size)) return;
     float2 uv = (float2(id.xy) + 0.5) * inv_size;
-    float2 mv = t2.SampleLevel(point_clamp, uv * uv2_scale, 0).rg * motion_to_px;
+    float2 mv = nearest_motion(uv);
     float depth = t1.SampleLevel(point_clamp, uv * uv1_scale, 0).r;
     if (flags & FLAG_KEEP_DEPTH) u1[id.xy] = float4(depth, 0, 0, 0);
 
@@ -341,6 +366,13 @@ void capture_main(uint3 id : SV_DispatchThreadID)
 // that slot's displacement map. It is never blended with older answers, which
 // the network re-decides with every framing. The capture's depth (t2) goes
 // with it, in alpha: it says what surface each of its pixels showed.
+// What a pixel looks like, as the network reads it (`n`): its luminance, and its
+// colour as red and blue less green. Compared with this frame's around the same
+// point, to tell whether an answer still belongs to what is shown there: a halo the
+// network put on the sky beside a dark sail can be as bright as the sky and still
+// not be the sky's colour.
+float3 print(float3 n) { return float3(luminance(n), n.r - n.g, n.b - n.g); }
+
 // How far a pixel is from the outline of something in front of it, up to
 // EDGE_REACH pixels of the network's size (EDGE_REACH: none that near), `uv` and
 // `texel` in the texture coordinates of the depth. The network lights up or
@@ -374,8 +406,10 @@ float edge_distance(Texture2D<float4> depth_of, float2 uv, float2 texel)
 void refresh_main(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= size)) return;
-    // How far each pixel was from an edge, beside the residual (u1).
-    u1[id.xy] = float4(edge_distance(t2, (float2(id.xy) + 0.5) * inv_size, inv_size), 0, 0, 0);
+    // How far each pixel was from an edge, and what the network saw there (t1, already
+    // as it reads it): its luminance and its colour (see "print"), beside the residual (u1).
+    float3 seen = print(t1.Load(int3(id.xy, 0)).rgb);
+    u1[id.xy] = float4(edge_distance(t2, (float2(id.xy) + 0.5) * inv_size, inv_size), seen);
     float3 r = from_net(t0.Load(int3(id.xy, 0)).rgb) - from_net(t1.Load(int3(id.xy, 0)).rgb);
     u0[id.xy] = float4(r, pack_depth(t2.Load(int3(id.xy, 0)).r));
 }
@@ -494,6 +528,70 @@ float3 without_halo(Texture2D<float4> residual, Texture2D<float4> edges, float2 
     return count > 0.0 ? lerp(r, sum / count, moved) : r;
 }
 
+// ---- answers that are not this pixel's
+//
+// The game's motion vectors leave out some motion: whatever its vertex shaders move
+// (sails turning, leaves and grass in the wind) moves on the screen with no vector to
+// say so, and the tracking carries the network's answer for it along with what is
+// behind. Left there, it shows as a copy of the thing where it was. What the network
+// saw where the answer comes from (`seen`, the luminance as the network reads it) has
+// to be something this frame shows around this pixel (`lo` to `hi`, the same for the
+// pixels of this frame within a pixel of the network's size): further out than a
+// little, the answer is someone else's. Held this way round, a thin line the frame
+// still shows passes, and one it no longer shows does not. 0 when it fits, up to 1 when
+// it clearly does not.
+float mismatch(float3 seen, float3 lo, float3 hi)
+{
+    // A little more allowed in bright places: light that changes (exposure adapting, a
+    // flame) changes the value more there.
+    float3 off = max(max(lo - seen, seen - hi), 0.0);
+    float light = saturate((off.x - 0.02 - 0.05 * max(seen.x, hi.x)) / 0.05);
+    float colour = saturate((max(off.y, off.z) - 0.03) / 0.05);
+    return max(light, colour);
+}
+
+// The range of what this frame (t0) looks like (see "print") around the output pixel
+// `p`, `step` output pixels apart: one pixel of the network's size.
+void around(int2 p, int step, float wp, out float3 lo, out float3 hi)
+{
+    lo = 1e9;
+    hi = -1e9;
+    [unroll] for (int j = -1; j <= 1; ++j)
+    [unroll] for (int i = -1; i <= 1; ++i) {
+        int2 q = clamp(p + int2(i, j) * step, int2(0, 0), int2(size) - 1);
+        float3 y = print(to_net(proxy_of(max(t0.Load(int3(q, 0)).rgb, 0.0) / wp)));
+        lo = min(lo, y);
+        hi = max(hi, y);
+    }
+}
+
+// A residual at `at` (texture coordinates of the network's size, `texel` one pixel),
+// bilinearly, with each of the four taps taken only where the surface the capture
+// showed there (the depth in its alpha) is this pixel's (`depth`): a read across an
+// outline would mix what the network did to the thing in front with what it did
+// behind, and leave a line of the one on the other. Where no tap is this surface, the
+// plain read.
+float3 surface_read(Texture2D<float4> residual, float2 at, float depth, float2 texel)
+{
+    const float2 pos = at / texel - 0.5;
+    const float2 f = pos - floor(pos);
+    const int2 i0 = int2(floor(pos));
+    uint w, h;
+    residual.GetDimensions(w, h);
+    float3 sum = 0.0;
+    float weight = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const int2 o = int2(k & 1, k >> 1);
+        const int2 t = clamp(i0 + o, int2(0, 0), int2(w, h) - 1);
+        const float4 v = residual.Load(int3(t, 0));
+        const float wb = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
+        const float wd = continues(unpack_depth(v.a), depth, 0.10, 0.5) ? 1.0 : 0.0;
+        sum += v.rgb * wb * wd;
+        weight += wb * wd;
+    }
+    return weight > 1e-3 ? sum / weight : residual.SampleLevel(linear_clamp, at, 0).rgb;
+}
+
 // ---- pixels the network never saw
 //
 // A pixel whose point was behind something, or outside the image, in the
@@ -510,8 +608,8 @@ float3 without_halo(Texture2D<float4> residual, Texture2D<float4> edges, float2 
 static const float2 DIRECTIONS[8] = {float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
                                      float2(0.7071, 0.7071), float2(-0.7071, 0.7071),
                                      float2(0.7071, -0.7071), float2(-0.7071, -0.7071)};
-static const int REACHES = 7;
-static const float REACH[REACHES] = {6, 12, 24, 48, 96, 192, 384};   // pixels of the network's size
+static const int REACHES = 9;
+static const float REACH[REACHES] = {6, 12, 24, 48, 96, 192, 384, 768, 1536};   // pixels of the network's size
 
 bool same_surface(float a, float b) { return same_depth(a, b, 0.05); }
 
@@ -548,19 +646,34 @@ bool borrow(Texture2D<float4> residual, Texture2D<float4> map, float2 uv, float 
 // network's detail belongs to the pixels it was made for, and carried over
 // here it shows as a faint copy of them; how much it lit or dimmed the place
 // is what this spot shares with its surroundings.
+// Steps half again as far each: what is still seen of a surface can be a narrow strip
+// beside what was hidden (the part of a tower above a character that walked past it).
+static const int FILL_REACHES = 16;
+static const float FILL_REACH[FILL_REACHES] = {4, 6, 9, 13, 19, 28, 42, 63, 94, 141, 211, 316, 474, 711, 1066, 1600};
+
+// Light found far away says less about this spot than light found next to it: the
+// network does not light a whole sky or a whole wall alike. What is found is taken in
+// full when near, and fades towards no change at all with its distance, over FILL_FADE
+// pixels of the network's size.
+static const float FILL_FADE = 768.0;
+
 bool fill_in(float2 uv, float depth, out float3 gain)
 {
     float3 sum = 0.0;
     float count = 0.0;
     [loop] for (int i = 0; i < 8; ++i) {
-        [loop] for (int j = 0; j < REACHES; ++j) {
-            float2 spot = uv + DIRECTIONS[i] * REACH[j] * uv1_scale;
+        [loop] for (int j = 0; j < FILL_REACHES; ++j) {
+            float2 spot = uv + DIRECTIONS[i] * FILL_REACH[j] * uv1_scale;
             if (any(spot < 0.0) || any(spot > 1.0)) break;
             float2 d = t4.SampleLevel(point_clamp, spot, 0).rg;
-            if (gone(d) || !same_surface(t5.SampleLevel(point_clamp, spot, 0).r, depth)) continue;
+            // The same thing, more loosely than for an answer: the light of a wall seen
+            // from below, its foot and its top some way apart in depth, is the same light.
+            const float there = t5.SampleLevel(point_clamp, spot, 0).r;
+            if (gone(d) || !same_depth(there, depth, 0.25)) continue;
             float2 at = spot + d * uv1_scale;
             if (any(at < 0.0) || any(at > 1.0)) continue;
-            sum += t1.SampleLevel(linear_clamp, at, 0).rgb;
+            const float trust = exp(-FILL_REACH[j] / FILL_FADE);
+            sum += 1.0 + (t1.SampleLevel(linear_clamp, at, 0).rgb - 1.0) * trust;
             count += 1.0;
             break;
         }
@@ -586,7 +699,8 @@ bool fill_in(float2 uv, float depth, out float3 gain)
 // the network for that very point, even an older one, beats a guess.
 // FLAG_SHOW_TRACKING tints those pixels: cyan from the same result, blue from
 // the one before, green where only the gain was filled in, red where nothing
-// was found; and yellow where a halo left behind by an edge was taken off.
+// was found; yellow where a halo left behind by an edge was taken off, orange
+// where an answer was not the pixel's (see "mismatch").
 [numthreads(8, 8, 1)]
 void compose_main(uint3 id : SV_DispatchThreadID)
 {
@@ -607,12 +721,23 @@ void compose_main(uint3 id : SV_DispatchThreadID)
         float3 r = 0.0;
         float3 tint = 0.0;
         if (!gone(d) && all(at >= 0.0) && all(at <= 1.0)) {
-            r = t3.SampleLevel(linear_clamp, at, 0).rgb;
+            const float depth_now = t5.SampleLevel(point_clamp, uv, 0).r;
+            r = (flags & FLAG_FILL) ? surface_read(t3, at, depth_now, uv1_scale) : t3.SampleLevel(linear_clamp, at, 0).rgb;
             // Halos left behind by edges that have moved (FLAG_EDGES; t5 is this
             // frame's depth at the network's size).
             float now = (flags & FLAG_EDGES) ? edge_distance(t5, uv, uv1_scale) : EDGE_REACH;
             float halo = 0.0;
+            float3 light = proxy_of(frame) * (t1.SampleLevel(linear_clamp, at, 0).rgb - 1.0);
             if (flags & FLAG_EDGES) r = without_halo(t3, t8, at, now, uv1_scale, r, halo);
+            // An answer that was carried here with what is behind something that moved
+            // on its own keeps only the network's light (t1, around it): see "mismatch".
+            float3 lo = 0.0, hi = 1.0;
+            float wrong = 0.0;
+            if (flags & FLAG_EDGES) {
+                around(int2(id.xy), max(1, (int)round(uv1_scale.x / inv_size.x)), wp, lo, hi);
+                wrong = mismatch(t8.SampleLevel(linear_clamp, at, 0).gba, lo, hi);
+                r = lerp(r, light, wrong);
+            }
             // A result that has just arrived takes over from the one before over
             // a few frames, not at once: its detail differs from the old one's
             // wherever the network decided otherwise for the new framing.
@@ -620,12 +745,19 @@ void compose_main(uint3 id : SV_DispatchThreadID)
                 float2 od = t6.SampleLevel(point_clamp, uv, 0).rg;
                 float2 there = uv + od * uv1_scale;
                 if (!gone(od) && all(there >= 0.0) && all(there <= 1.0)) {
-                    float3 before = t2.SampleLevel(linear_clamp, there, 0).rgb;
-                    if (flags & FLAG_EDGES) before = without_halo(t2, t9, there, now, uv1_scale, before, halo);
+                    float3 before = (flags & FLAG_FILL) ? surface_read(t2, there, depth_now, uv1_scale)
+                                                        : t2.SampleLevel(linear_clamp, there, 0).rgb;
+                    if (flags & FLAG_EDGES) {
+                        before = without_halo(t2, t9, there, now, uv1_scale, before, halo);
+                        float wrong_before = mismatch(t9.SampleLevel(linear_clamp, there, 0).gba, lo, hi);
+                        before = lerp(before, light, wrong_before);
+                        wrong = max(wrong, wrong_before * (1.0 - blend));
+                    }
                     r = lerp(before, r, blend);
                 }
             }
             tint = float3(0.3, 0.3, 0.0) * halo;
+            tint = lerp(tint, float3(0.35, 0.15, 0.0), wrong);
         } else if (flags & FLAG_FILL) {
             float depth = t5.SampleLevel(point_clamp, uv, 0).r;
             float2 older = (flags & FLAG_PREVIOUS) ? t6.SampleLevel(point_clamp, uv, 0).rg : GONE;
@@ -636,24 +768,55 @@ void compose_main(uint3 id : SV_DispatchThreadID)
             // it was near one, as if this pixel were far from any (EDGE_REACH).
             float halo = 0.0;
             bool found = true;
+            // What the capture showed where the answer comes from (see "print"), to check it
+            // against this frame: an answer borrowed from a place that has since changed
+            // its look -- a fade, a door opening -- is not this pixel's.
+            float3 seen = 0.0;
+            bool checked = false;
             if (borrow(t3, t4, uv, depth, r, from)) {
-                if (flags & FLAG_EDGES) r = without_halo(t3, t8, from, EDGE_REACH, uv1_scale, r, halo);
+                if (flags & FLAG_EDGES) {
+                    r = without_halo(t3, t8, from, EDGE_REACH, uv1_scale, r, halo);
+                    seen = t8.SampleLevel(linear_clamp, from, 0).gba;
+                    checked = true;
+                }
                 tint = float3(0.0, 0.25, 0.25);
             } else if (!gone(older) && all(there >= 0.0) && all(there <= 1.0)) {
                 r = t2.SampleLevel(linear_clamp, there, 0).rgb;
-                if (flags & FLAG_EDGES) r = without_halo(t2, t9, there, edge_distance(t5, uv, uv1_scale), uv1_scale, r, halo);
+                if ((flags & FLAG_EDGES) && (flags & FLAG_PREVIOUS)) {
+                    r = without_halo(t2, t9, there, edge_distance(t5, uv, uv1_scale), uv1_scale, r, halo);
+                    seen = t9.SampleLevel(linear_clamp, there, 0).gba;
+                    checked = true;
+                }
                 tint = float3(0.0, 0.0, 0.3);
             } else if ((flags & FLAG_PREVIOUS) && borrow(t2, t6, uv, depth, r, from)) {
-                if (flags & FLAG_EDGES) r = without_halo(t2, t9, from, EDGE_REACH, uv1_scale, r, halo);
+                if (flags & FLAG_EDGES) {
+                    r = without_halo(t2, t9, from, EDGE_REACH, uv1_scale, r, halo);
+                    seen = t9.SampleLevel(linear_clamp, from, 0).gba;
+                    checked = true;
+                }
                 tint = float3(0.0, 0.0, 0.3);
             } else {
                 found = false;
             }
             if (halo > 0.0) tint = lerp(tint, float3(0.3, 0.3, 0.0), halo);
-            if (!found) {
+            float wrong = 0.0;
+            if (found && checked) {
+                float3 lo, hi;
+                around(int2(id.xy), max(1, (int)round(uv1_scale.x / inv_size.x)), wp, lo, hi);
+                wrong = mismatch(seen, lo, hi);
+            }
+            if (!found || wrong > 0.0) {
+                // Only the network's light, from around it (see "fill_in").
                 float3 gain = 1.0;
-                tint = fill_in(uv, depth, gain) ? float3(0.0, 0.25, 0.0) : float3(0.25, 0.0, 0.0);
-                r = proxy_of(frame) * (gain - 1.0);
+                const bool lit = fill_in(uv, depth, gain);
+                const float3 light = proxy_of(frame) * (gain - 1.0);
+                if (found) {
+                    r = lerp(r, light, wrong);
+                    tint = lerp(tint, float3(0.35, 0.15, 0.0), wrong);
+                } else {
+                    r = light;
+                    tint = lit ? float3(0.0, 0.25, 0.0) : float3(0.25, 0.0, 0.0);
+                }
             }
         } else {
             tint = float3(0.25, 0.0, 0.0);

@@ -153,9 +153,10 @@ All in the *Neural Rendering* tab of the menu, also shown in the *Custom* tab:
   one, as it does on NVIDIA cards. Experimental, off by default.
 - **Show tracking:** tints the pixels the network never saw because something
   was in front of them: cyan and blue where its answer was found elsewhere,
-  green where only its light was filled in, red where nothing was found; and
+  green where only its light was filled in, red where nothing was found;
   yellow where a halo the network put around an edge was taken off, because the
-  edge has moved away since.
+  edge has moved away since; orange where the network's answer belonged to
+  something else, and only its light is kept.
 - **Input and Exposure:** how the game's colours are handed to the network.
   Exposure is measured from the image by default (Auto). Taking the game's own
   exposure (Game) showed visible artifacts around moving things in some

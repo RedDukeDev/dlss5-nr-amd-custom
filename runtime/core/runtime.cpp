@@ -1130,8 +1130,8 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         remake(c->applied_flow);
         remake(c->previous_flow);
         replace(c->residual_previous, c->residual_previous_state, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        replace(c->residual_edges, c->residual_edges_state, DXGI_FORMAT_R16_FLOAT);
-        replace(c->residual_previous_edges, c->residual_previous_edges_state, DXGI_FORMAT_R16_FLOAT);
+        replace(c->residual_edges, c->residual_edges_state, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        replace(c->residual_previous_edges, c->residual_previous_edges_state, DXGI_FORMAT_R16G16B16A16_FLOAT);
         remake(c->idle_flow);
         for (Flow &flow : c->slot_flow) remake(flow);
         for (int m = 0; m < 2; ++m) replace(c->depth_history[m], c->depth_history_state[m], DXGI_FORMAT_R32_FLOAT);

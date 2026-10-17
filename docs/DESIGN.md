@@ -138,6 +138,23 @@ network's light and detail for that surface, without the halo. Where the outline
 is still where it was, nothing changes. The result before, while it is blended
 out, is treated the same way. Show tracking tints those pixels yellow.
 
+#### Motion the game leaves out
+
+The game's motion vectors do not cover every motion: what its vertex shaders
+move -- sails turning, leaves and grass in the wind -- moves on screen with no
+vector saying so. The tracking would carry the network's answer for such a thing
+along with what is behind it, and it would show as a faint copy of the thing where
+it was.
+
+So each result keeps what the network saw at each of its pixels -- its luminance,
+and its colour as red and blue less green -- and the composition checks it against
+what the frame shows now around the pixel, within one pixel of the network's size:
+further out than a small margin (a little more in bright places, where light that changes
+moves the value more), the answer is someone else's, and only the network's light
+is kept (orange). The check is the one temporal anti-aliasing makes against its
+history, and it is made this way round on purpose: a thin line the frame still
+shows is in the range around the pixel; one the frame no longer shows is not.
+
 #### What the network never saw
 
 A pixel marked as gone has no residual of its own: whatever moved off it was
@@ -159,6 +176,15 @@ shape of that object, trailing behind it until the next result. In order:
    16 x 16 pixels, from the nearest pixels on the same surface. A gain rather
    than a difference, because the network relights, and not its detail, which
    carried over shows as a faint copy of where it came from.
+   The search runs outwards in eight directions, in steps half again as long,
+   up to 1600 pixels of the network's size: what is still seen of a surface can be
+   a narrow strip beside what was hidden (a tower above a character that walked
+   past it), and the surface may be matched loosely in depth (25%), as a wall
+   seen from below has its foot and its top some way apart. The farther the
+   light is found the less it is trusted, fading towards no change at all over
+   768 pixels: the network does not light a whole sky alike, and light taken
+   from across a newly exposed sky showed as a ghost of the shape that had
+   been in front of it.
 
 An answer of the network for that very point, even an older one, beats a
 guess. What is left in the end is a patch with the right light and none of
