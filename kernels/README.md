@@ -157,6 +157,12 @@ ds_wait, by 7. At 2560x1440 the pre block went from 6.5 to 5.8 ms on its bench, 
 other texture-free kernels by a fifth to a quarter (ds_wait 13%), and in the
 network the post block from 5.4 to 4.5 ms.
 
+The 2H block took the same kept k, and its residual is now read where the first
+pass's expansion adds it, through an opaque pointer: loaded at the top, its 64
+halves were held through the whole first pass and were most of the block's 154
+spilled registers. 14 are left; the block is about 8% faster (1.70 -> 1.56 ms on
+swin_bench.py, best of eight).
+
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of
 the weights pointer>` the 64 KB it points to. That is how the new parameter's layout

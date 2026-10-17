@@ -325,12 +325,12 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     }
 
     // ---------------------------------------------- the state, both passes
+    // The tokens, scaled, are only added at the first pass's expansion, and are read
+    // there: loaded at the top, their 64 halves were held, and spilled, through all
+    // of the first pass's branches.
     u32x4 S[4][2];                               // 4 channel tiles, this warp's 2 token tiles
-    for (int ct = 0; ct < 4; ++ct)
-        for (int tt = 0; tt < 2; ++tt)
-            S[ct][tt] = scaled_row(lds + LDS_TOK, ct, (warp * 2 + tt) * 16 + row16, scale1);
 
-    auto one_pass = [&](int base_a, int base_b, int expand) {
+    auto one_pass = [&](int base_a, int base_b, int expand, bool first) {
         u32x4 acc[2][2] = {};                    // 32 hidden channels, two token tiles
         for (int k = 0; k < 4; ++k) {
             load_weights(base_a + 0x400 * k, 32, 0, slot1);
@@ -368,12 +368,14 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
         for (int ct = 0; ct < 4; ++ct) {
             const op8 a0 = w_a(ct * 16 + row16, 0, slot1);
             const op8 a1 = w_a(ct * 16 + row16, 1, slot1);
-            for (int tt = 0; tt < 2; ++tt)
+            for (int tt = 0; tt < 2; ++tt) {
+                if (first) S[ct][tt] = scaled_row(opaque(lds) + LDS_TOK, ct, (warp * 2 + tt) * 16 + row16, scale1);
                 S[ct][tt] = slice8(S[ct][tt], a0, mid[0][tt], a1, mid[1][tt]);
+            }
         }
     };
-    one_pass(W_PASS0_A, W_PASS0_B, W_PASS0_EXPAND);
-    one_pass(W_PASS1_A, W_PASS1_B, W_PASS1_EXPAND);
+    one_pass(W_PASS0_A, W_PASS0_B, W_PASS0_EXPAND, true);
+    one_pass(W_PASS1_A, W_PASS1_B, W_PASS1_EXPAND, false);
 
     // The state crosses to the other warp narrowed, as it does over there.
     for (int ct = 0; ct < 4; ++ct)
@@ -459,7 +461,7 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     // k = 2ct and 2ct+1 of group t = j, blocks 1 and 3 are added before 0 and
     // 2, the four groups follow as (0 + 2) + (1 + 3), and the other parity,
     // which lives in the partner lane, comes last.
-    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, op8 (&op)[2][4]) {
+    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, kept8 (&op)[2][4]) {
 #pragma clang fp contract(off)
         for (int tt = 0; tt < 4; ++tt) {
             auto sq = [&](int ct, int j) { const half2 h = as_half2(M[ct][tt][j]); return h * h; };
@@ -481,20 +483,20 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
                     if (scale != 1.0f) v = v * s;
                     q[j] = round_e4m3x2(as_u32(v));
                 }
-                op[ct][tt] = as_a ? tile_to_a8(q) : tile_to_b8(q);
+                op[ct][tt] = as_a ? keep_a8(q) : keep_b8(q);
             }
         }
     };
     // q's operands go to the first slot, which q, k and v are done with, as codes
     // a row per token; k's stay in registers.
-    op8 kop[2][4];
+    kept8 kop[2][4];
     {
-        op8 qop[2][4];
+        kept8 qop[2][4];
         normalise(Q, *(const float *)(args.weights + W_QK_SCALE + SHIFT + 4 * warp), true, qop);
         __builtin_amdgcn_wave_barrier();
         for (int ct = 0; ct < 2; ++ct)
             for (int tt = 0; tt < 4; ++tt)
-                stash_codes(slot0 + (tt * 16 + row16) * 32 + ct * 16, qop[ct][tt]);
+                stash_codes(slot0 + (tt * 16 + row16) * 32 + ct * 16, use_a8(qop[ct][tt]));
     }
     normalise(K, 1.0f, false, kop);
     __builtin_amdgcn_s_waitcnt(0);
@@ -506,9 +508,10 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     u32x4 attn[2][4];                            // [channel tile][token tile]
     for (int qt = 0; qt < 4; ++qt) {
         // scores[query][key] + bias, then the exponential; a lane owns a key.
+        const op8 q0 = qop(0, qt), q1 = qop(1, qt);
         for (int kt = 0; kt < 4; ++kt) {
-                        u32x4 c = bias_tile(bias + (qt * 4 + kt) * 512, lds + LDS_TOK + warp * 32 * PROW + 16 * PROW, lane);
-            u32x4 sc = slice8(c, qop(0, qt), kop[0][kt], qop(1, qt), kop[1][kt]);
+            u32x4 c = bias_tile(bias + (qt * 4 + kt) * 512, lds + LDS_TOK + warp * 32 * PROW + 16 * PROW, lane);
+            u32x4 sc = slice8(c, q0, use_b8(kop[0][kt]), q1, use_b8(kop[1][kt]));
             for (int j = 0; j < 4; ++j) sc[j] = exp2_trick(sc[j]);
             // out to LDS as [query][key], where the normalisation happens: two
             // queries of one key, a row apart, written by byte address.
