@@ -171,6 +171,13 @@ typedef struct dlss5nr_settings {
      * capture is only known to the host after the GPU's cache has written it out, which
      * takes some tens of milliseconds more. Experimental. */
     int32_t wait_inside;
+
+    /* Which network the library runs: 0 the library's own default, 1 and up the
+     * presets it carries, in its order (version 310.9.16 carries two: 1 the
+     * larger network of the versions before, 2 the smaller one it now defaults
+     * to). A number the library does not carry falls back on its default. Read
+     * when the network is created, so a change starts it afresh. */
+    int32_t network_preset;
 } dlss5nr_settings;
 
 typedef struct dlss5nr_frame {

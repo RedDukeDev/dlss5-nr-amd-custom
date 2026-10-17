@@ -24,7 +24,7 @@ game ── OptiScaler (fork, optiscaler/) ──┐
                          shared textures (D3D12 <-> HIP)
 ```
 
-- **The network** is NVIDIA's own `nvngx_dlssnr.dll`, version 310.8.0.0,
+- **The network** is NVIDIA's own `nvngx_dlssnr.dll`, version 310.9.16.0,
   shipped as it is in the release package only; whoever packages keeps a copy
   in `third_party/`, which is not committed. Nothing derived
   from it is part of this repository: no PTX, no weights, no captures, no

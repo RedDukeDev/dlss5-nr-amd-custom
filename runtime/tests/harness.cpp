@@ -304,6 +304,7 @@ int wmain(int argc, wchar_t **argv) {
     // The moving object's motion vectors are this fraction of its real motion.
     float object_mv_scale = 1.0f;
     int blend_frames = -1;
+    int preset = 0;
     // Depth of the moving object and of the rest, as the depth buffer holds them.
     float object_depth = 0.5f, scene_depth = 0.1f;
     bool depth_inverted = false;
@@ -351,6 +352,7 @@ int wmain(int argc, wchar_t **argv) {
         else if (key == L"--passes") passes = _wtoi(value.c_str());
         else if (key == L"--light-step") swscanf(value.c_str(), L"%d,%f", &light_frame, &light_gain);
         else if (key == L"--blend") blend_frames = _wtoi(value.c_str());
+        else if (key == L"--preset") preset = _wtoi(value.c_str());
         else if (key == L"--depths") swscanf(value.c_str(), L"%f,%f", &object_depth, &scene_depth);
         else if (key == L"--dolly") dolly = (float)_wtof(value.c_str());
         else if (key == L"--object-mv") object_mv_scale = (float)_wtof(value.c_str());
@@ -454,6 +456,7 @@ int wmain(int argc, wchar_t **argv) {
     settings.passes = passes;
     settings.keep_local_tone = keep_tone ? 1 : 0;
     if (blend_frames >= 0) settings.blend_frames = blend_frames;
+    settings.network_preset = preset;
     settings.wait_inside = inside ? 1 : 0;
     dlss5nr_set_settings(nr, &settings);
 

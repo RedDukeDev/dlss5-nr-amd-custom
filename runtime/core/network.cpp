@@ -495,6 +495,7 @@ bool Network::create_feature(uint32_t width, uint32_t height, const NetworkContr
     p->Set(nr_param::LocalToneStrength, controls.local_tone);
     p->Set(nr_param::LocalStructureStrength, controls.local_structure);
     p->Set(nr_param::SkinStructureStrength, controls.skin_structure);
+    p->Set("DLSSNR.Hint.Render.Preset", (unsigned)(controls.preset < 0 ? 0 : controls.preset));
 
     // On the stand-in the id is SuperSampling: a snippet implements one feature,
     // and the selection that matters is which DLL was loaded.

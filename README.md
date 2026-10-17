@@ -131,6 +131,10 @@ All in the *Neural Rendering* tab of the menu, also shown in the *Custom* tab:
 - **Network resolution:** runs the network on a smaller copy of the image. Its
   cost follows its pixels. Not shown when running before the upscaler, where
   the image is the game's own render resolution.
+- **Network:** which network the library runs. *Library default* leaves the choice
+  to NVIDIA's library, which takes the smaller one since version 310.9.16.0;
+  *Preset 1* is the larger network the versions before carried (it is slower),
+  *Preset 2* the smaller one. A change restarts the network.
 - **Style, Intensity and the tone and structure strengths:** the network's own
   controls. Changing them restarts the network, which takes a moment.
   *Skin structure* is the detail it adds to faces and skin. It is automatic by
@@ -179,8 +183,9 @@ problem.
 - **OptiScaler:** `optiscaler\OptiScaler.sln`.
 - **NVIDIA's network:** `nvngx_dlssnr.dll` is too large for the repository and
   is only shipped in the release package. To build from source, take version
-  310.8.0.0 from the release package, or from a game that ships DLSS 5, and put
-  it in `third_party\`. It has to be the original signed file: builds patched
+  310.9.16.0 from the release package, or from a game that ships DLSS 5, and put
+  it in `third_party\`. (310.8.0.0, the version before, still runs, but the
+  translation cache of the package is made for 310.9.16.0.) It has to be the original signed file: builds patched
   to run on older NVIDIA cards cannot be translated.
 - **Package:** `python package.py --zluda <ZLUDA build> --optiscaler <OptiScaler
   build>` puts everything, the network and the translation cache included,

@@ -65,10 +65,12 @@ struct NetworkControls {
     float local_tone = 1.0f;
     float local_structure = 1.0f;
     float skin_structure = -1.0f;   // negative: automatic, follows local_structure
+    int32_t preset = 0;             // 0: the library's default; read when the feature is created
 
     bool operator==(const NetworkControls &o) const {
         return style == o.style && intensity == o.intensity && local_tone == o.local_tone &&
-               local_structure == o.local_structure && skin_structure == o.skin_structure;
+               local_structure == o.local_structure && skin_structure == o.skin_structure &&
+               preset == o.preset;
     }
     bool operator!=(const NetworkControls &o) const { return !(*this == o); }
 };

@@ -701,6 +701,7 @@ DLSS5NR_API void dlss5nr_default_settings(dlss5nr_settings *s) {
     s->keep_local_tone = 1;
     s->blend_frames = 4;
     s->wait_inside = 0;
+    s->network_preset = 0;
 }
 
 DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context **out) {
@@ -861,6 +862,7 @@ DLSS5NR_API void dlss5nr_set_settings(dlss5nr_context *c, const dlss5nr_settings
     c->controls.local_tone = next.local_tone;
     c->controls.local_structure = next.local_structure;
     c->controls.skin_structure = next.skin_structure;
+    c->controls.preset = next.network_preset < 0 ? 0 : next.network_preset;
     c->network_passes = next.passes < 1 ? 1 : next.passes > 8 ? 8 : next.passes;
     c->keep_local_tone = next.keep_local_tone != 0;
 }

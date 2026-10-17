@@ -116,7 +116,7 @@ def main():
     # would otherwise leave half rebuilt.
     network = os.path.join(ROOT, "third_party", "nvngx_dlssnr.dll")
     if not args.no_network and not os.path.isfile(network):
-        sys.exit("missing: %s (NVIDIA's network, version 310.8.0.0, is not in the repository: "
+        sys.exit("missing: %s (NVIDIA's network, version 310.9.16.0, is not in the repository: "
                  "put it there before packaging, or pass --no-network)" % network)
     if os.path.exists(args.out):
         shutil.rmtree(args.out)
