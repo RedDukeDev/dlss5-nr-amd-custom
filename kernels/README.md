@@ -122,7 +122,17 @@ Both networks match the translation exactly, at 2560x1440 and 1704x960, and the 
 network runs about four times faster than the translation (2560x1440: 199 -> 47 ms the
 smaller network, 340 -> 86 ms the larger; 1704x960: 106 -> 27 and 183 -> 45).
 `DLSS5NR_GATE_PROFILE=1` logs every kernel's GPU time, native or translated, from the
-gate: the 2H blocks, at 32 KB of LDS a block, are what holds the most now.
+gate.
+
+The 2H blocks then went from 32 KB of LDS to 20: the state is written over the tokens
+(each warp over its own rows, which only it was reading), the weights sit in three
+2 KB slots a warp reused stage by stage, and q's operands, v and the residual are kept
+as e4m3 codes, a byte a value, where they were f16. Six blocks fit in a WGP where four
+did; the four 2H kernels went from 10.0 to 9.0 ms of the frame. Less than the 1H
+blocks gained: `swin_bench.py 2h --shared=N` shows the 2H block 1.4 times as slow at two
+blocks as at four, but its sixteen thousand instructions a wave, a hundred and sixty
+of them WMMA, the rest the e4m3 rounding and the layout shuffles around them, with
+spills, are now what holds it.
 
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of

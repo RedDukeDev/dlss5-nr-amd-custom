@@ -87,13 +87,28 @@ static_assert(sizeof(SwinUpArgs) == 88, "the parameter is 88 bytes, by value");
 constexpr int ROW = 128;                      // an f16 row of 64 halves
 constexpr int PROW = 128;                     // a query's row of 64 keys, f16
 
-// LDS, 24 KB: the window's tokens (which become the probabilities and then the
-// attention the two warps exchange), the state they exchange first, and a
-// warp's own weight tile.
+// LDS, 20 KB. The block is bound by how many blocks fit at once (measured: from
+// four in a WGP to two made it 1.4 times as slow), so every byte held for longer
+// than it is used is given back:
+//
+//   rows   64 rows of 64 channels: the window's tokens, then the state the two warps
+//          exchange (each warp writes its own tokens' rows, which only it was
+//          reading), then the probabilities, then the attention they exchange
+//   slots  three 2 KB slots a warp, reused stage by stage: a matrix's 32 rows of
+//          32 inputs in each of the first two (two for 64 inputs, or for 64 rows
+//          of 32); then q's operands, the residual and v, as e4m3 codes, one byte
+//          a value where the rows hold f16
+//
+// The upsampling sibling's 16 low tokens, before anything else, go to warp 0's
+// third slot.
+constexpr int WROW = 64;                       // a weight row of 32 halves
+constexpr int SLOT = 32 * WROW;                // 2 KB
 constexpr int LDS_TOK = 0;                     // 64 rows of 64 channels
-constexpr int LDS_S = LDS_TOK + 64 * ROW;      // the state, 64 rows of 64
-constexpr int LDS_W = LDS_S + 64 * ROW;        // 2 x 64 rows of 64, one per warp
-constexpr int LDS_BYTES = LDS_W + 2 * 64 * ROW;
+constexpr int LDS_S = LDS_TOK;                 // the state, over the tokens
+constexpr int LDS_SLOTS = 64 * ROW;
+constexpr int LDS_UP = LDS_SLOTS + 2 * SLOT;   // warp 0's third slot, 16 rows of 64 channels
+constexpr int LDS_BYTES = LDS_SLOTS + 2 * 3 * SLOT;
+static_assert(16 * ROW <= SLOT, "the low tokens fit a slot");
 
 // The two passes' branch matrices. Plain constants, one set per pass: an array
 // indexed by the loop variable would be read as the first pass's in both.
@@ -139,6 +154,32 @@ __device__ inline uint32_t exp2_trick(uint32_t scores) {
     return result;
 }
 
+// Sixteen e4m3 values kept as codes: written whole by every lane, read back in
+// fragment order as an A operand of row 16n + lane % 16 (what raw_put16 and
+// frag_order_raw_a8 do with f16 on RDNA3, here in half the bytes everywhere).
+__device__ inline void codes_put16(uint8_t *at, half16 rounded) { *(u32x4 *)at = narrow16(rounded); }
+__device__ inline op8 frag_order_codes_a8_at(const uint8_t *base, int row_bytes, int row, int byte) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    row = (row & ~15) | sigma16(row & 15);
+#endif
+    return frag_order_codes_b8(*(const u32x4 *)(base + row * row_bytes + byte));
+}
+// An operand of e4m3 values kept by the lane that made it, as codes in a 16-byte slot.
+__device__ inline void stash_codes(uint8_t *slot, op8 v) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    *(u32x2 *)(slot + 8 * ((threadIdx.x >> 4) & 1)) = v;
+#else
+    *(u32x4 *)slot = narrow16(v);
+#endif
+}
+__device__ inline op8 unstash_codes(const uint8_t *slot) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    return *(const u32x2 *)(slot + 8 * ((threadIdx.x >> 4) & 1));
+#else
+    return widen16(*(const u32x4 *)slot);
+#endif
+}
+
 template <bool DS, bool UP = false, View VIEW = PATCHES>
 __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down,
                                              int out_dim_y, int out_dim_x,
@@ -156,7 +197,8 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     const int prow0 = 2 * by + (args.off_y >> 2), pcol0 = 2 * bx + (args.off_x >> 2);
     const int surf_y = args.view_y > 0 ? args.view_y : dim_y;
     const int surf_x = args.view_x > 0 ? args.view_x : dim_x;
-    uint8_t *my_w = lds + LDS_W + warp * 64 * ROW;
+    uint8_t *slot0 = lds + LDS_SLOTS + warp * 3 * SLOT;
+    uint8_t *slot1 = slot0 + SLOT, *slot2 = slot1 + SLOT;
 
     if (lane == 0 && warp == 0 && args.ready_in) {
         const int src_x = dim_x - min(args.src_off_x, 0), src_y = dim_y - min(args.src_off_y, 0);
@@ -194,21 +236,31 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     }
     __builtin_amdgcn_wave_barrier();
 
-    // A weight matrix as f16 rows in this warp's own tile: a row sits at its
+    // A weight matrix as f16 rows in this warp's own slots: a row sits at its
     // output channel's fragment position, so a result's row is directly the
-    // next operand's column. The two warps hold the same rows in the branch
-    // stages and their own head's in the rest, so no barrier is needed.
-    auto load_weights = [&](int offset, int rows, int col0) {
+    // next operand's column. Inputs 0..31 of rows 0..31 go to the first slot;
+    // inputs 32..63 (col0 32), or rows 32..63, to `hi`. The two warps hold the
+    // same rows in the branch stages and their own head's in the rest, so no
+    // barrier is needed.
+    auto load_weights = [&](int offset, int rows, int col0, uint8_t *hi) {
         for (int piece = 0; piece < rows / 16; ++piece) {
             const u32x4 v = *(const u32x4 *)(args.weights + offset + piece * 512 + lane * 16);
             for (int w = 0; w < 4; ++w) {
                 const FragWord f = b_fragment_word(lane, w);
                 const int n = piece * 16 + f.row;
-                stage4<ROW>(my_w, 32 * (n >> 5) + inv32(n & 31), col0 + f.column, v[w]);
+                const int r = 32 * (n >> 5) + inv32(n & 31);
+                stage4<WROW>(col0 != 0 || r >= 32 ? hi : slot0, r & 31, f.column, v[w]);
             }
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
+    };
+    // Its operands: row `row`, 32 inputs `kb`, of a matrix load_weights put in slot0 and hi.
+    auto w_a = [&](int row, int kb, const uint8_t *hi) {
+        return lds_a8<WROW>(kb >= 2 || row >= 32 ? hi : slot0, row & 31, (kb & 1) * 32);
+    };
+    auto w_b = [&](int row, int kb, const uint8_t *hi) {
+        return lds_b8<WROW>(kb >= 2 || row >= 32 ? hi : slot0, row & 31, (kb & 1) * 32);
     };
 
     // e4m3 rows as operands (dlssnr_hip.h, "fp8 operands"): a row is the A
@@ -256,22 +308,22 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
         const uint8_t *at = low + ((size_t)Y * low_x + X) * 16;
         u32x4 acc[2] = {};                       // this warp's 32 of the 64 outputs
         for (int half = 0; half < 2; ++half) {
-            load_weights(W_UP + 0x800 * (2 * half) + 0x400 * warp, 32, 0);
-            load_weights(W_UP + 0x800 * (2 * half + 1) + 0x400 * warp, 32, 32);
+            load_weights(W_UP + 0x800 * (2 * half) + 0x400 * warp, 32, 0, slot1);
+            load_weights(W_UP + 0x800 * (2 * half + 1) + 0x400 * warp, 32, 32, slot1);
             for (int cc = 0; cc < 2; ++cc) {
                 const int c = 2 * half + cc;     // a chunk is two planes
                 const u32x4 r0 = inside ? *(const u32x4 *)(at + (2 * c) * plane) : (u32x4){0, 0, 0, 0};
                 const u32x4 r1 = inside ? *(const u32x4 *)(at + (2 * c + 1) * plane) : (u32x4){0, 0, 0, 0};
                 for (int ct = 0; ct < 2; ++ct)
-                    acc[ct] = slice8(acc[ct], row_a(my_w, ct * 16 + row16, 2 * cc), codes_b8(r0),
-                                     row_a(my_w, ct * 16 + row16, 2 * cc + 1), codes_b8(r1));
+                    acc[ct] = slice8(acc[ct], w_a(ct * 16 + row16, 2 * cc, slot1), codes_b8(r0),
+                                     w_a(ct * 16 + row16, 2 * cc + 1, slot1), codes_b8(r1));
             }
         }
         for (int ct = 0; ct < 2; ++ct) {         // the sixteen low tokens as rows
             const u32x8 w = __builtin_bit_cast(u32x8, tile_to_operand(acc[ct]));
             const int b = 2 * (32 * warp + 16 * ct);
-            *(u32x4 *)(lds + LDS_S + lds_at<ROW>(row16, b)) = (u32x4){w[0], w[1], w[2], w[3]};
-            *(u32x4 *)(lds + LDS_S + lds_at<ROW>(row16, b + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
+            *(u32x4 *)(lds + LDS_UP + lds_at<ROW>(row16, b)) = (u32x4){w[0], w[1], w[2], w[3]};
+            *(u32x4 *)(lds + LDS_UP + lds_at<ROW>(row16, b + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
         }
         __syncthreads();
         // x = e4m3(up + in * T), the multiply and the add rounded apart. Here,
@@ -289,7 +341,7 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
             {
 #pragma clang fp contract(off)
                 const half16 scaled = lds_e4m3_row16<ROW>(lds + LDS_TOK, row, kb * 32) * tv;
-                sum = lds_row16<ROW>(lds + LDS_S, lr, kb * 32) + scaled;     // f16 rows, unrounded
+                sum = lds_row16<ROW>(lds + LDS_UP, lr, kb * 32) + scaled;    // f16 rows, unrounded
             }
             u32x8 w = __builtin_bit_cast(u32x8, sum);
             for (int j = 0; j < 8; ++j) w[j] = round_e4m3x2(w[j]);
@@ -307,12 +359,12 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     auto one_pass = [&](int base_a, int base_b, int expand) {
         u32x4 acc[2][2] = {};                    // 32 hidden channels, two token tiles
         for (int k = 0; k < 4; ++k) {
-            load_weights(base_a + 0x400 * k, 32, 0);
-            load_weights(base_a + 0x1000 + 0x400 * k, 32, 32);
+            load_weights(base_a + 0x400 * k, 32, 0, slot1);
+            load_weights(base_a + 0x1000 + 0x400 * k, 32, 32, slot1);
             op8 top[2][2];
             for (int ct = 0; ct < 2; ++ct) {
                 op8 a[4];
-                for (int kb = 0; kb < 4; ++kb) a[kb] = row_a(my_w, ct * 16 + row16, kb);
+                for (int kb = 0; kb < 4; ++kb) a[kb] = w_a(ct * 16 + row16, kb, slot1);
                 for (int tt = 0; tt < 2; ++tt) {
                     const int row = (warp * 2 + tt) * 16 + row16;
                     u32x4 t = slice8((u32x4){0, 0, 0, 0}, a[0], row_b(lds + LDS_TOK, row, 0),
@@ -323,10 +375,10 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
                     top[ct][tt] = tile_to_b8(t);
                 }
             }
-            load_weights(base_b + 0x400 * k, 32, 0);
+            load_weights(base_b + 0x400 * k, 32, 0, slot1);
             for (int ct = 0; ct < 2; ++ct) {
-                const op8 a0 = row_a(my_w, ct * 16 + row16, 0);
-                const op8 a1 = row_a(my_w, ct * 16 + row16, 1);
+                const op8 a0 = w_a(ct * 16 + row16, 0, slot1);
+                const op8 a1 = w_a(ct * 16 + row16, 1, slot1);
                 for (int tt = 0; tt < 2; ++tt)
                     acc[ct][tt] = slice8(acc[ct][tt], a0, top[0][tt], a1, top[1][tt]);
             }
@@ -338,10 +390,10 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
                 for (int j = 0; j < 4; ++j) q[j] = round_e4m3x2(q[j]);
                 mid[ct][tt] = tile_to_b8(q);
             }
-        load_weights(expand, 64, 0);
+        load_weights(expand, 64, 0, slot1);
         for (int ct = 0; ct < 4; ++ct) {
-            const op8 a0 = row_a(my_w, ct * 16 + row16, 0);
-            const op8 a1 = row_a(my_w, ct * 16 + row16, 1);
+            const op8 a0 = w_a(ct * 16 + row16, 0, slot1);
+            const op8 a1 = w_a(ct * 16 + row16, 1, slot1);
             for (int tt = 0; tt < 2; ++tt)
                 S[ct][tt] = slice8(S[ct][tt], a0, mid[0][tt], a1, mid[1][tt]);
         }
@@ -373,17 +425,18 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     auto sop_b = [&](int tt, int kb) { return row_b(lds + LDS_S, tt * 16 + row16, kb); };
 
     u32x4 Q[2][4], K[2][4];                      // 32 channels, four token tiles
-    // v, transposed -- a row per channel, a column per token -- goes to the
-    // half of this warp's weight rows the q, k and v matrices leave free.
-    uint8_t *vt = my_w + 32 * ROW;
+    // v, transposed -- a row per channel, a column per token -- as codes, to the
+    // third slot: 32 rows of 64 tokens.
+    uint8_t *vt = slot2;
+    constexpr int VT_ROW = 64;
     for (int which = 0; which < 3; ++which) {    // q, then k, then v
-        load_weights(W_QKV + SHIFT + 0xC00 * warp + 0x400 * which, 32, 0);
-        load_weights(W_QKV_HI + SHIFT + 0xC00 * warp + 0x400 * which, 32, 32);
+        load_weights(W_QKV + SHIFT + 0xC00 * warp + 0x400 * which, 32, 0, slot1);
+        load_weights(W_QKV_HI + SHIFT + 0xC00 * warp + 0x400 * which, 32, 32, slot1);
         for (int ct = 0; ct < 2; ++ct) {
             // v's weights are the B operand (below), q's and k's the A.
             op8 a[4];
             for (int kb = 0; kb < 4; ++kb)
-                a[kb] = which == 2 ? row_b(my_w, ct * 16 + row16, kb) : row_a(my_w, ct * 16 + row16, kb);
+                a[kb] = which == 2 ? w_b(ct * 16 + row16, kb, slot1) : w_a(ct * 16 + row16, kb, slot1);
             for (int tt = 0; tt < 4; ++tt) {
                 if (which == 2) {
                     // v is wanted with the token as the row, which is the P . V
@@ -391,7 +444,7 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
                     u32x4 t = slice8((u32x4){0, 0, 0, 0}, sop_a(tt, 0), a[0], sop_a(tt, 1), a[1]);
                     t = slice8(t, sop_a(tt, 2), a[2], sop_a(tt, 3), a[3]);
                     for (int j = 0; j < 4; ++j) t[j] = round_e4m3x2(t[j]);
-                    raw_put16(vt + (ct * 16 + row16) * ROW + tt * 32, tile_to_operand(t));
+                    codes_put16(vt + (ct * 16 + row16) * VT_ROW + tt * 16, tile_to_operand(t));
                     continue;
                 }
                 u32x4 t = slice8((u32x4){0, 0, 0, 0}, a[0], sop_b(tt, 0), a[1], sop_b(tt, 1));
@@ -401,6 +454,30 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
             }
         }
     }
+
+    // ---------------------------------------------- the residual
+    // This warp's 32 channels of the whole window's state, which the projection
+    // adds back, as codes in the second slot (q, k and v are done with it): the
+    // state's rows become the probabilities. Eight values a lane, in the result
+    // layout, for each of two channel tiles and four token tiles.
+    uint8_t *resid = slot1;
+    for (int ct = 0; ct < 2; ++ct)
+        for (int tt = 0; tt < 4; ++tt) {
+            const u32x4 v = row_tile(lds + LDS_S, 2 * warp + ct, tt * 16 + row16);
+            const u32x2 codes = {__builtin_amdgcn_perm(codes_e4m3x2(v[1]), codes_e4m3x2(v[0]), 0x06040200u),
+                                 __builtin_amdgcn_perm(codes_e4m3x2(v[3]), codes_e4m3x2(v[2]), 0x06040200u)};
+            *(u32x2 *)(resid + ((ct * 4 + tt) * 32 + lane) * 8) = codes;
+        }
+    auto resid_tile = [&](int ct, int tt) {
+        const u32x2 codes = *(const u32x2 *)(resid + ((ct * 4 + tt) * 32 + lane) * 8);
+        const u32x2 lo = widen4(codes[0]), hi = widen4(codes[1]);
+        u32x4 out = {lo[0], lo[1], hi[0], hi[1]};
+        for (int j = 0; j < 4; ++j) out[j] = as_u32(as_half2(out[j]) * scale_pair(scale2, 2 * warp + ct, j));
+        return out;
+    };
+    // Both warps have read the state, for q, k and v and for this, before either
+    // writes its probabilities over it.
+    __syncthreads();
 
     // ---------------------------------------------- cosine normalisation
     // The sum of squares keeps the translation's tree: a lane holds the 16
@@ -434,8 +511,8 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
             }
         }
     };
-    // q's operands go to the warp's weight rows the q, k and v matrices are
-    // done with, a row per token; k's stay in registers.
+    // q's operands go to the first slot, which q, k and v are done with, as codes
+    // a row per token; k's stay in registers.
     op8 kop[2][4];
     {
         op8 qop[2][4];
@@ -443,12 +520,12 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
         __builtin_amdgcn_wave_barrier();
         for (int ct = 0; ct < 2; ++ct)
             for (int tt = 0; tt < 4; ++tt)
-                stash_op8(my_w + (tt * 16 + row16) * 64 + ct * 32, qop[ct][tt]);
+                stash_codes(slot0 + (tt * 16 + row16) * 32 + ct * 16, qop[ct][tt]);
     }
     normalise(K, 1.0f, false, kop);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_wave_barrier();
-    auto qop = [&](int ct, int qt) { return unstash_op8(my_w + (qt * 16 + row16) * 64 + ct * 32); };
+    auto qop = [&](int ct, int qt) { return unstash_codes(slot0 + (qt * 16 + row16) * 32 + ct * 16); };
 
     // ---------------------------------------------- attention, head by head
     const uint8_t *bias = args.weights + W_BIAS + SHIFT + 0x2000 * warp;
@@ -511,7 +588,7 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
             pop[kb] = frag_order_rounded_b8(*(const half16 *)row);
         }
         for (int ct = 0; ct < 2; ++ct) {
-            auto vop = [&](int kb) { return frag_order_raw_a8(vt, ROW, ct * 16 + row16, kb * 32); };
+            auto vop = [&](int kb) { return frag_order_codes_a8_at(vt, VT_ROW, ct * 16 + row16, kb * 16); };
             u32x4 acc = slice8((u32x4){0, 0, 0, 0}, vop(0), pop[0], vop(1), pop[1]);
             acc = slice8(acc, vop(2), pop[2], vop(3), pop[3]);
             for (int j = 0; j < 4; ++j) acc[j] = round_e4m3x2(acc[j]);
@@ -538,15 +615,16 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
     // This warp takes output channels 32w.., over all four token tiles.
     // The projection is one 64 x 64 matrix: 2048 bytes of inputs 0..31 and then
     // the same for 32..63, sixteen output rows to a 512-byte piece.
-    load_weights(W_PROJ + SHIFT + 0x400 * warp, 32, 0);
-    load_weights(W_PROJ + SHIFT + 0x800 + 0x400 * warp, 32, 32);
+    // The residual is in the second slot, so the matrix takes the first and third.
+    load_weights(W_PROJ + SHIFT + 0x400 * warp, 32, 0, slot2);
+    load_weights(W_PROJ + SHIFT + 0x800 + 0x400 * warp, 32, 32, slot2);
     u32x4 out[2][4];
     for (int ct = 0; ct < 2; ++ct) {
         op8 a[4];
-        for (int kb = 0; kb < 4; ++kb) a[kb] = row_a(my_w, ct * 16 + row16, kb);
+        for (int kb = 0; kb < 4; ++kb) a[kb] = w_a(ct * 16 + row16, kb, slot2);
         for (int tt = 0; tt < 4; ++tt) {
             const int row = tt * 16 + row16;
-            u32x4 acc = scaled_row(lds + LDS_S, 2 * warp + ct, row, scale2);
+            u32x4 acc = resid_tile(ct, tt);
             acc = slice8(acc, a[0], row_b(lds + LDS_TOK, row, 0),
                          a[1], row_b(lds + LDS_TOK, row, 1));
             acc = slice8(acc, a[2], row_b(lds + LDS_TOK, row, 2),
@@ -631,14 +709,14 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
         const size_t plane = (size_t)out_dim_x * out_dim_y * 16;
         const int X = X0 + ox, Y = Y0 + oy;
         for (int g = 0; g < 2; ++g) {
-            load_weights(W_DS + 0x200 * (4 * g + 2 * warp), 32, 0);
-            load_weights(W_DS + 0x1000 + 0x200 * (4 * g + 2 * warp), 32, 32);
+            load_weights(W_DS + 0x200 * (4 * g + 2 * warp), 32, 0, slot1);
+            load_weights(W_DS + 0x1000 + 0x200 * (4 * g + 2 * warp), 32, 32, slot1);
             u32x4 bytes[2];
             for (int ct = 0; ct < 2; ++ct) {
-                u32x4 d = slice8((u32x4){0, 0, 0, 0}, row_a(my_w, ct * 16 + row16, 0), op[0],
-                                 row_a(my_w, ct * 16 + row16, 1), op[1]);
-                d = slice8(d, row_a(my_w, ct * 16 + row16, 2), op[2],
-                           row_a(my_w, ct * 16 + row16, 3), op[3]);
+                u32x4 d = slice8((u32x4){0, 0, 0, 0}, w_a(ct * 16 + row16, 0, slot1), op[0],
+                                 w_a(ct * 16 + row16, 1, slot1), op[1]);
+                d = slice8(d, w_a(ct * 16 + row16, 2, slot1), op[2],
+                           w_a(ct * 16 + row16, 3, slot1), op[3]);
                 bytes[ct] = narrow16(tile_to_operand(d));
             }
             // The whole wave stores: a guard on lane alone would be hoisted
