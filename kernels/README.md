@@ -134,6 +134,17 @@ blocks as at four, but its sixteen thousand instructions a wave, a hundred and s
 of them WMMA, the rest the e4m3 rounding and the layout shuffles around them, with
 spills, are now what holds it.
 
+The 1H blocks then went from 8 KB to 6: the weight rows are staged as e4m3 codes, 32
+bytes a row, and widened as they are read, the probabilities are narrowed in place
+over their own f16 rows, and the pre block's inputs sit in the upper half of the
+tokens' rows. Twenty-one blocks fit in a WGP where sixteen did. Only the pre block
+gains, 7.1 to 6.5 ms at 2560x1440, being the one that waits on textures; the others
+time the same within a per cent. Moving the weights to codes also changed where the
+compiler put the halved output's work: it sank the whole matrix, weight loads
+included, under the store's per-lane guard, so at the image's edge the WMMA ran with
+lanes off that had never loaded their operand. An empty asm on the result, before
+the guard, keeps it computed by every lane.
+
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of
 the weights pointer>` the 64 KB it points to. That is how the new parameter's layout

@@ -98,18 +98,22 @@ constexpr int ROW = 64;                       // an f16 row of 32 halves
 constexpr int PROW = 128;                     // a query's row of 64 keys, f16
 // LDS: the window's tokens as f16 rows (later the probabilities), and the
 // weight matrix in use.
-// The tokens' rows become the probabilities in f16 (32 queries x 64 keys); the
-// narrowed probabilities sit past the weight rows still in use (the output
-// projection's 32), which is free by then.
+// The tokens' rows become the probabilities in f16 (32 queries x 64 keys), and
+// each query's row is narrowed in place, its 64 codes in the first half of it.
 //
-// 8 KB in all, which a block holds for its whole life: the kernels are bound by how
+// 6 KB in all, which a block holds for its whole life: the kernels are bound by how
 // many blocks fit at once (measured: 16 KB a block made the pre block half again as
-// slow), and at 8 KB sixteen fit in a WGP's 128 KB where ten held twelve. So no matrix
-// is staged whole that is wider than 64 rows: q, k and v come in one at a time.
-constexpr int LDS_TOK = 0, LDS_W = 64 * ROW, LDS_BYTES = LDS_W + 64 * ROW;
-constexpr int LDS_P = LDS_W + 32 * ROW;
+// slow, 14 KB twice as slow), and at 6 KB twenty-one fit in a WGP's 128 KB where ten
+// held twelve. So the weights are staged as e4m3 codes, 32 bytes a row, widened as
+// they are read, and no matrix is staged whole that is wider than 64 rows: q, k and v
+// come in one at a time. Past the first 32 rows of codes sits a 1 KB corner: the
+// attention bias's staging, the 16 low tokens of the post and upsampling inputs, and
+// the post head's outputs.
+constexpr int WROW = 32;                      // a weight row of 32 e4m3 codes
+constexpr int LDS_TOK = 0, LDS_W = 64 * ROW, LDS_BYTES = LDS_W + 64 * WROW;
+constexpr int LDS_X = LDS_W + 32 * WROW;
 static_assert(64 * ROW >= 32 * PROW, "the probabilities fit where the tokens were");
-static_assert(LDS_P + 32 * 64 <= LDS_BYTES, "the narrowed probabilities fit too");
+static_assert(LDS_X + 16 * ROW <= LDS_BYTES, "the low tokens fit the corner");
 
 constexpr int W_BRANCH_A = 0x0000, W_BRANCH_B = 0x1000, W_SCALE1 = 0x2010;
 constexpr int W_QKV = 0x2060, W_BIAS = 0x2C60, W_QK_SCALE = 0x4C60, W_PROJ = 0x4C70;
@@ -172,6 +176,24 @@ __device__ inline op8 row_a8(const uint8_t *lds, int row, int k_block) {
 }
 __device__ inline op8 row_b8(const uint8_t *lds, int row, int k_block) {
     return lds_b8<ROW>(lds, row, k_block * 32);
+}
+
+// The same from the weight rows, which hold e4m3 codes, 32 to a row: widened here
+// on RDNA3; on RDNA4 the codes are the operand.
+__device__ inline op8 wrow_b8(const uint8_t *lds, int row, int k_block) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    const int u = (threadIdx.x >> 4) & 1;
+    return *(const u32x2 *)(lds + lds_at<WROW>(row, 16 * k_block) + 8 * u);
+#else
+    return widen16(*(const u32x4 *)(lds + lds_at<WROW>(row, 16 * k_block)));
+#endif
+}
+__device__ inline op8 wrow_a8(const uint8_t *lds, int row, int k_block) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    return wrow_b8(lds, (row & ~15) | sigma16(row & 15), k_block);
+#else
+    return wrow_b8(lds, row, k_block);
+#endif
 }
 
 
@@ -681,7 +703,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
     }
     __builtin_amdgcn_wave_barrier();
 
-    // A weight matrix as f16 rows. A row sits at its output channel's fragment
+    // A weight matrix as rows of codes. A row sits at its output channel's fragment
     // position, so that a result's row is directly the next operand's column.
     auto load_weights = [&](int offset, int rows) {
         for (int piece = 0; piece < rows / 16; ++piece) {
@@ -689,7 +711,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
             for (int w = 0; w < 4; ++w) {
                 const FragWord f = b_fragment_word(lane, w);
                 const int n = piece * 16 + f.row;
-                stage4<ROW>(lds + LDS_W, 32 * (n >> 5) + inv32(n & 31), f.column, v[w]);
+                *(uint32_t *)(lds + LDS_W + lds_at<WROW>(32 * (n >> 5) + inv32(n & 31), f.column)) = v[w];
             }
         }
         __builtin_amdgcn_wave_barrier();
@@ -699,8 +721,12 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
     // The 16 inputs, then one f16 matrix onto the 32 channels: its result is
     // the block's input, unrounded, at each channel's fragment column.
     if (IS_PRE) {
-        uint8_t *rows = lds + LDS_W;                  // 64 tokens x 16 f16
-        uint8_t *mat = lds + LDS_W + 64 * 32;         // 32 outputs x 16 f16
+        // The inputs, 64 tokens x 16 f16, in the upper half of the tokens' rows: the
+        // result of token tile tt goes to rows 16tt.., which only reach the inputs of
+        // the tiles before, or of tt itself, read by then. The matrix, 32 outputs x
+        // 16 f16, where the weights go.
+        uint8_t *rows = lds + LDS_TOK + 32 * ROW;
+        uint8_t *mat = lds + LDS_W;
         pre_fill(*pre, rows, bx, by, lane);
         // The matrix is two 512-byte B fragments of the PTX's m16n8k16: word w
         // of lane (g, t) holds, for output 8 (2 i + (w >> 1)) + g, the inputs
@@ -714,10 +740,10 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
-        for (int ct = 0; ct < 2; ++ct) {
-            const half16 wrow = *(const half16 *)(mat + (ct * 16 + row16) * 32);
-            for (int tt = 0; tt < 4; ++tt) {
-                const half16 tok = *(const half16 *)(rows + (tt * 16 + row16) * 32);
+        for (int tt = 0; tt < 4; ++tt) {
+            const half16 tok = *(const half16 *)(rows + (tt * 16 + row16) * 32);
+            for (int ct = 0; ct < 2; ++ct) {
+                const half16 wrow = *(const half16 *)(mat + (ct * 16 + row16) * 32);
                 const u32x4 d = pack_tile(wmma(wrow, tok, (float8){}));
                 const int row = tt * 16 + row16;
                 for (int j = 0; j < 4; ++j) {
@@ -749,8 +775,8 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
             const u32x4 raw = inside ? *(const u32x4 *)(low + pl * plane + ((size_t)Y * hx + X) * 16)
                                      : (u32x4){0, 0, 0, 0};
             const u32x8 w = __builtin_bit_cast(u32x8, widen16(raw));
-            *(u32x4 *)(lds + LDS_P + lds_at<ROW>(row16, pl * 32)) = (u32x4){w[0], w[1], w[2], w[3]};
-            *(u32x4 *)(lds + LDS_P + lds_at<ROW>(row16, pl * 32 + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
+            *(u32x4 *)(lds + LDS_X + lds_at<ROW>(row16, pl * 32)) = (u32x4){w[0], w[1], w[2], w[3]};
+            *(u32x4 *)(lds + LDS_X + lds_at<ROW>(row16, pl * 32 + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
@@ -769,7 +795,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                 }
                 {
 #pragma clang fp contract(off)
-                    const half16 a = lds_row16<ROW>(lds + LDS_P, lr, kb * 32) * tl;
+                    const half16 a = lds_row16<ROW>(lds + LDS_X, lr, kb * 32) * tl;
                     const half16 b = lds_e4m3_row16<ROW>(lds + LDS_TOK, row, kb * 32) * ti;
                     sum[kb] = a + b;
                 }
@@ -808,15 +834,15 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         for (int c = 0; c < 2; ++c) {
             load_weights(W_UP + 0x400 * c, 32);
             for (int ct = 0; ct < 2; ++ct)
-                acc[ct] = slice8(acc[ct], row_a8(lds + LDS_W, ct * 16 + row16, 0),
+                acc[ct] = slice8(acc[ct], wrow_a8(lds + LDS_W, ct * 16 + row16, 0),
                                  codes_b8(raw[2 * c]),
-                                 row_a8(lds + LDS_W, ct * 16 + row16, 1),
+                                 wrow_a8(lds + LDS_W, ct * 16 + row16, 1),
                                  codes_b8(raw[2 * c + 1]));
         }
         for (int ct = 0; ct < 2; ++ct) {         // the sixteen of them as rows
             const u32x8 w = __builtin_bit_cast(u32x8, tile_to_operand(acc[ct]));
-            *(u32x4 *)(lds + LDS_P + lds_at<ROW>(row16, ct * 32)) = (u32x4){w[0], w[1], w[2], w[3]};
-            *(u32x4 *)(lds + LDS_P + lds_at<ROW>(row16, ct * 32 + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
+            *(u32x4 *)(lds + LDS_X + lds_at<ROW>(row16, ct * 32)) = (u32x4){w[0], w[1], w[2], w[3]};
+            *(u32x4 *)(lds + LDS_X + lds_at<ROW>(row16, ct * 32 + 16)) = (u32x4){w[4], w[5], w[6], w[7]};
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
@@ -841,7 +867,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                 {
 #pragma clang fp contract(off)
                     const half16 scaled = lds_e4m3_row16<ROW>(lds + LDS_TOK, row, kb * 32) * t;
-                    sum[kb] = lds_row16<ROW>(lds + LDS_P, lr, kb * 32) + scaled;
+                    sum[kb] = lds_row16<ROW>(lds + LDS_X, lr, kb * 32) + scaled;
                 }
             }
             // Left unrounded: the residual scale multiplies this sum as it
@@ -921,8 +947,8 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         load_weights(W_BRANCH_A + 0x400 * k, 32);
         op8 top[2][4];
         for (int ct = 0; ct < 2; ++ct) {
-            const op8 a0 = row_a8(lds + LDS_W, ct * 16 + row16, 0);
-            const op8 a1 = row_a8(lds + LDS_W, ct * 16 + row16, 1);
+            const op8 a0 = wrow_a8(lds + LDS_W, ct * 16 + row16, 0);
+            const op8 a1 = wrow_a8(lds + LDS_W, ct * 16 + row16, 1);
             for (int tt = 0; tt < 4; ++tt) {
                 const op8 b0 = row_b8(lds + LDS_TOK, tt * 16 + row16, 0);
                 const op8 b1 = row_b8(lds + LDS_TOK, tt * 16 + row16, 1);
@@ -933,8 +959,8 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         }
         load_weights(W_BRANCH_B + 0x400 * k, 32);
         for (int ct = 0; ct < 2; ++ct) {
-            const op8 a0 = row_a8(lds + LDS_W, ct * 16 + row16, 0);
-            const op8 a1 = row_a8(lds + LDS_W, ct * 16 + row16, 1);
+            const op8 a0 = wrow_a8(lds + LDS_W, ct * 16 + row16, 0);
+            const op8 a1 = wrow_a8(lds + LDS_W, ct * 16 + row16, 1);
             for (int tt = 0; tt < 4; ++tt)
                 S[ct][tt] = slice8(S[ct][tt], a0, top[0][tt], a1, top[1][tt]);
         }
@@ -956,21 +982,21 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
     op8 vop[4][2];                               // [key tile][channel tile]
     load_weights(W_QKV + SHIFT2, 32);
     for (int ct = 0; ct < 2; ++ct) {
-        const op8 aq0 = row_a8(lds + LDS_W, ct * 16 + row16, 0);
-        const op8 aq1 = row_a8(lds + LDS_W, ct * 16 + row16, 1);
+        const op8 aq0 = wrow_a8(lds + LDS_W, ct * 16 + row16, 0);
+        const op8 aq1 = wrow_a8(lds + LDS_W, ct * 16 + row16, 1);
         for (int tt = 0; tt < 4; ++tt) Q[ct][tt] = slice8((u32x4){0, 0, 0, 0}, aq0, sop[0][tt], aq1, sop[1][tt]);
     }
     load_weights(W_QKV + SHIFT2 + 0x400, 32);
     for (int ct = 0; ct < 2; ++ct) {
-        const op8 ak0 = row_a8(lds + LDS_W, ct * 16 + row16, 0);
-        const op8 ak1 = row_a8(lds + LDS_W, ct * 16 + row16, 1);
+        const op8 ak0 = wrow_a8(lds + LDS_W, ct * 16 + row16, 0);
+        const op8 ak1 = wrow_a8(lds + LDS_W, ct * 16 + row16, 1);
         for (int tt = 0; tt < 4; ++tt) K[ct][tt] = slice8((u32x4){0, 0, 0, 0}, ak0, sop[0][tt], ak1, sop[1][tt]);
     }
     load_weights(W_QKV + SHIFT2 + 0x800, 32);
     for (int tt = 0; tt < 4; ++tt)               // v with the token as the row
         for (int ct = 0; ct < 2; ++ct) {
-            const op8 av0 = row_b8(lds + LDS_W, ct * 16 + row16, 0);
-            const op8 av1 = row_b8(lds + LDS_W, ct * 16 + row16, 1);
+            const op8 av0 = wrow_b8(lds + LDS_W, ct * 16 + row16, 0);
+            const op8 av1 = wrow_b8(lds + LDS_W, ct * 16 + row16, 1);
             u32x4 v = slice8((u32x4){0, 0, 0, 0}, b8_to_a8(sop[0][tt]), av0, b8_to_a8(sop[1][tt]), av1);
             for (int j = 0; j < 4; ++j) v[j] = round_e4m3x2(v[j]);
             vop[tt][ct] = frag_order_tile_a8(v);
@@ -1031,9 +1057,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                 // layout: one 16-byte load a lane into a free corner of LDS,
                 // then gathered from there -- eight scattered 2-byte global
                 // loads a lane per tile cost a tenth of the kernel.
-                // Where the narrowed probabilities go: those of the half before are
-                // spent, and this half's come after the scores.
-                uint8_t *stage = lds + LDS_P;
+                uint8_t *stage = lds + LDS_X;
                 const u32x4 piece_words = *(const u32x4 *)(bias + (qt * 4 + kt) * 512 + lane * 16);
                 __builtin_amdgcn_wave_barrier();
                 *(u32x4 *)(stage + lane * 16) = piece_words;
@@ -1087,7 +1111,8 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
                                                              (_Float16)NORM_FLOOR);
             const _Float16 inv = (_Float16)__builtin_amdgcn_rcpf((float)total);
             const half2 f = {inv, inv};
-            uint8_t *dst = lds + LDS_P + lane * 64;
+            // In place: the codes of keys 4i.. land on the halves of keys 2i.., read by then.
+            uint8_t *dst = lds + LDS_TOK + lane * PROW;
             for (int i = 0; i < 16; ++i) {
                 const uint32_t pair0 = round_e4m3x2(as_u32(as_half2(*(const uint32_t *)(src + 4 * i)) * f));
                 const uint32_t pair1 = round_e4m3x2(as_u32(as_half2(*(const uint32_t *)(src + 4 * i + 2)) * f));
@@ -1098,10 +1123,10 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         __builtin_amdgcn_wave_barrier();
 
         // P . V, then the projection with the scaled residual.
-        const op8 a0 = row_a8(lds + LDS_W, 0 * 16 + row16, 0);
-        const op8 a1 = row_a8(lds + LDS_W, 0 * 16 + row16, 1);
-        const op8 b0 = row_a8(lds + LDS_W, 1 * 16 + row16, 0);
-        const op8 b1 = row_a8(lds + LDS_W, 1 * 16 + row16, 1);
+        const op8 a0 = wrow_a8(lds + LDS_W, 0 * 16 + row16, 0);
+        const op8 a1 = wrow_a8(lds + LDS_W, 0 * 16 + row16, 1);
+        const op8 b0 = wrow_a8(lds + LDS_W, 1 * 16 + row16, 0);
+        const op8 b1 = wrow_a8(lds + LDS_W, 1 * 16 + row16, 1);
         // The keys reach the multiply in the order the translation's operand
         // fragments hold them, not in key order: with the accumulation
         // truncating, the order of the sixteen terms is visible in the last
@@ -1110,7 +1135,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         for (int qt = 0; qt < 2; ++qt) {
             op8 pop[4];
             for (int kb = 0; kb < 4; ++kb) {
-                const uint8_t *row = lds + LDS_P + (qt * 16 + row16) * 64 + kb * 16;
+                const uint8_t *row = lds + LDS_TOK + (qt * 16 + row16) * PROW + kb * 16;
                 pop[kb] = frag_order_codes_b8(*(const u32x4 *)row);
             }
             u32x4 attn[2];
@@ -1153,7 +1178,7 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
-        _Float16 *ho = (_Float16 *)(lds + LDS_P);      // 64 tokens x 4 outputs
+        _Float16 *ho = (_Float16 *)(lds + LDS_X);      // 64 tokens x 4 outputs
         const half16 a0 = *(const half16 *)(hw + row16 * 64), a1 = *(const half16 *)(hw + row16 * 64 + 32);
         for (int tt = 0; tt < 4; ++tt) {
             const int row = tt * 16 + row16;
@@ -1292,9 +1317,14 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
         u32x4 bytes[4];
         for (int pl = 0; pl < 4; ++pl) {
             const u32x4 d = slice8((u32x4){0, 0, 0, 0},
-                                   row_a8(lds + LDS_W, pl * 16 + row16, 0), rounded_b8(op[0]),
-                                   row_a8(lds + LDS_W, pl * 16 + row16, 1), rounded_b8(op[1]));
+                                   wrow_a8(lds + LDS_W, pl * 16 + row16, 0), rounded_b8(op[0]),
+                                   wrow_a8(lds + LDS_W, pl * 16 + row16, 1), rounded_b8(op[1]));
             bytes[pl] = narrow16(tile_to_operand(d));
+            // Made real here, by every lane: otherwise the compiler may sink the
+            // whole matrix, the weight rows' loads with it, under the store's
+            // guard below, and at the image's edge the WMMA then runs with lanes
+            // off that never loaded their operand (seen with the weights as codes).
+            asm volatile("" : "+v"(bytes[pl]));
         }
         __builtin_amdgcn_wave_barrier();
         const int X0 = (args.off_x + 8 * bx) >> 1, Y0 = (args.off_y + 8 * by) >> 1;

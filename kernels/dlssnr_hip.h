@@ -765,6 +765,32 @@ __device__ inline op8 unstash_op8(const uint8_t *slot) {
 #endif
 }
 
+// Sixteen e4m3 values kept as codes: written whole by every lane, read back in
+// fragment order as an A operand of row 16n + lane % 16 (what raw_put16 and
+// frag_order_raw_a8 do with f16 on RDNA3, here in half the bytes everywhere).
+__device__ inline void codes_put16(uint8_t *at, half16 rounded) { *(u32x4 *)at = narrow16(rounded); }
+__device__ inline op8 frag_order_codes_a8_at(const uint8_t *base, int row_bytes, int row, int byte) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    row = (row & ~15) | sigma16(row & 15);
+#endif
+    return frag_order_codes_b8(*(const u32x4 *)(base + row * row_bytes + byte));
+}
+// An operand of e4m3 values kept by the lane that made it, as codes in a 16-byte slot.
+__device__ inline void stash_codes(uint8_t *slot, op8 v) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    *(u32x2 *)(slot + 8 * ((threadIdx.x >> 4) & 1)) = v;
+#else
+    *(u32x4 *)slot = narrow16(v);
+#endif
+}
+__device__ inline op8 unstash_codes(const uint8_t *slot) {
+#ifdef DLSSNR_GFX12_LAYOUT
+    return *(const u32x2 *)(slot + 8 * ((threadIdx.x >> 4) & 1));
+#else
+    return widen16(*(const u32x4 *)slot);
+#endif
+}
+
 // ------------------------------------------------------------ attention bias
 //
 // The bias of one 16x16 tile of queries by keys, as the score tile's
