@@ -160,8 +160,11 @@ network the post block from 5.4 to 4.5 ms.
 The 2H block took the same kept k, and its residual is now read where the first
 pass's expansion adds it, through an opaque pointer: loaded at the top, its 64
 halves were held through the whole first pass and were most of the block's 154
-spilled registers. 14 are left; the block is about 8% faster (1.70 -> 1.56 ms on
-swin_bench.py, best of eight).
+spilled registers. The offset is what goes through the asm, not the pointer:
+laundered, the pointer loses its address space and every access through it becomes
+a flat one. 22 spills are left; in the network the four 2H kernels went from 7.6 to
+6.8 ms. The 4H block took the kept q, k and v too (3.5 -> 3.4 ms); in the 8H block
+they gained nothing measurable and it is as it was.
 
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of

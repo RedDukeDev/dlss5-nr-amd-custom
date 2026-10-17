@@ -898,6 +898,13 @@ __device__ inline T *opaque(T *p) {
     asm volatile("" : "+s"(p));
     return p;
 }
+// An offset the compiler cannot see through, for a read of LDS that has to stay
+// where it is written: laundering the pointer instead would lose its address
+// space, and every access through it would become a flat one.
+__device__ inline int opaque_offset(int offset) {
+    asm volatile("" : "+s"(offset));
+    return offset;
+}
 // The same for a pointer the compiler holds in vector registers.
 template <class T>
 __device__ inline T *opaque_v(T *p) {

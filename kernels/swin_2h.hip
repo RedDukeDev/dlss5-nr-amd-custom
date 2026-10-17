@@ -326,8 +326,8 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
 
     // ---------------------------------------------- the state, both passes
     // The tokens, scaled, are only added at the first pass's expansion, and are read
-    // there: loaded at the top, their 64 halves were held, and spilled, through all
-    // of the first pass's branches.
+    // there, through an offset the compiler cannot hoist: loaded at the top, their 64
+    // halves were held, and spilled, through all of the first pass's branches.
     u32x4 S[4][2];                               // 4 channel tiles, this warp's 2 token tiles
 
     auto one_pass = [&](int base_a, int base_b, int expand, bool first) {
@@ -369,7 +369,7 @@ __device__ __forceinline__ void swin_2h_body(const SwinArgs &args, uint8_t *down
             const op8 a0 = w_a(ct * 16 + row16, 0, slot1);
             const op8 a1 = w_a(ct * 16 + row16, 1, slot1);
             for (int tt = 0; tt < 2; ++tt) {
-                if (first) S[ct][tt] = scaled_row(opaque(lds) + LDS_TOK, ct, (warp * 2 + tt) * 16 + row16, scale1);
+                if (first) S[ct][tt] = scaled_row(lds + opaque_offset(LDS_TOK), ct, (warp * 2 + tt) * 16 + row16, scale1);
                 S[ct][tt] = slice8(S[ct][tt], a0, mid[0][tt], a1, mid[1][tt]);
             }
         }

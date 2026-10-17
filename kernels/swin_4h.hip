@@ -415,12 +415,12 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
     }
     // v as the P . V product's A operand, its keys in the order the
     // translation's fragments hold them (fragment_order16, dlssnr_hip.h).
-    op8 vop[4][2];
+    kept8 vop[4][2];
     for (int ct = 0; ct < 2; ++ct)
         for (int tt = 0; tt < 4; ++tt) {
             u32x4 t = V[ct][tt];
             for (int j = 0; j < 4; ++j) t[j] = round_e4m3x2(t[j]);
-            vop[tt][ct] = frag_order_tile_a8(t);
+            vop[tt][ct] = keep_frag_a8(t);
         }
 
     // ---------------------------------------------- cosine normalisation
@@ -429,7 +429,7 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
     // k = 2ct and 2ct+1 of group t = j, blocks 1 and 3 are added before 0 and
     // 2, the four groups follow as (0 + 2) + (1 + 3), and the other parity,
     // which lives in the partner lane, comes last.
-    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, op8 (&op)[2][4]) {
+    auto normalise = [&](u32x4 (&M)[2][4], float scale, bool as_a, kept8 (&op)[2][4]) {
 #pragma clang fp contract(off)
         for (int tt = 0; tt < 4; ++tt) {
             auto sq = [&](int ct, int j) { const half2 h = as_half2(M[ct][tt][j]); return h * h; };
@@ -451,11 +451,11 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
                     if (scale != 1.0f) v = v * s;
                     q[j] = round_e4m3x2(as_u32(v));
                 }
-                op[ct][tt] = as_a ? tile_to_a8(q) : tile_to_b8(q);
+                op[ct][tt] = as_a ? keep_a8(q) : keep_b8(q);
             }
         }
     };
-    op8 qop[2][4], kop[2][4];
+    kept8 qop[2][4], kop[2][4];
     normalise(Q, *(const float *)(args.weights + W_QK_SCALE + SHIFT + 4 * warp), true, qop);
     normalise(K, 1.0f, false, kop);
 
@@ -464,6 +464,7 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
     const uint8_t *bias = args.weights + W_BIAS + SHIFT + 0x2000 * warp;
     u32x4 attn[2][4];
     for (int qt = 0; qt < 4; ++qt) {
+        const op8 q0 = use_a8(qop[0][qt]), q1 = use_a8(qop[1][qt]);
         for (int kt = 0; kt < 4; ++kt) {
             u32x4 c;
             for (int j = 0; j < 4; ++j) {
@@ -479,7 +480,7 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
                 }
                 c[j] = pair;
             }
-            u32x4 sc = slice8(c, qop[0][qt], kop[0][kt], qop[1][qt], kop[1][kt]);
+            u32x4 sc = slice8(c, q0, use_b8(kop[0][kt]), q1, use_b8(kop[1][kt]));
             for (int j = 0; j < 4; ++j) sc[j] = exp2_trick(sc[j]);
             for (int j = 0; j < 4; ++j) {
                 const uint32_t w = sc[j];
@@ -521,8 +522,8 @@ __device__ __forceinline__ void swin_4h_body(const SwinArgs &args, uint8_t *down
         for (int kb = 0; kb < 4; ++kb)
             pop[kb] = frag_order_rounded_b8(*(const half16 *)(my_p + row16 * PROW + kb * 32));
         for (int ct = 0; ct < 2; ++ct) {
-            u32x4 a = slice8((u32x4){0, 0, 0, 0}, vop[0][ct], pop[0], vop[1][ct], pop[1]);
-            a = slice8(a, vop[2][ct], pop[2], vop[3][ct], pop[3]);
+            u32x4 a = slice8((u32x4){0, 0, 0, 0}, use_frag_a8(vop[0][ct]), pop[0], use_frag_a8(vop[1][ct]), pop[1]);
+            a = slice8(a, use_frag_a8(vop[2][ct]), pop[2], use_frag_a8(vop[3][ct]), pop[3]);
             for (int j = 0; j < 4; ++j) a[j] = round_e4m3x2(a[j]);
             attn[ct][qt] = a;
         }
