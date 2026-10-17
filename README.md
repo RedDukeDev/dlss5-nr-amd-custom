@@ -1,6 +1,6 @@
 # DLSS 5 Neural Rendering on AMD - Featuring asyncronous mode (almost no performance loss!) and Linux support
 
-DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12 games on
+DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12 and Direct3D 11 games on
 AMD Radeon GPUs through OptiScaler.
 
 The network is NVIDIA's `nvngx_dlssnr.dll`, included in the release package. Its CUDA code
@@ -43,7 +43,7 @@ Hardware-specific status:
 ## Requirements
 
 - Windows 10/11 or Linux, an AMD Radeon RX 9000 (RDNA4), RX 7000 (RDNA3) or RX 6000 (RDNA2). 
-- A game using DirectX 12
+- A game using DirectX 12 or DirectX 11 (see *Direct3D 11* below)
 - The AMD HIP SDK for Windows, if using Windows.
 - ROCm if using Linux.
 
@@ -97,6 +97,16 @@ just before it is shown. Two things are different then:
 - The game's own interface is part of the image, and is enhanced with it.
 
 An HDR10 image is not supported in this mode; SDR and scRGB are.
+
+## Direct3D 11
+
+A Direct3D 11 game goes through OptiScaler's Direct3D 11 to 12 bridge: the colour, depth and motion
+vectors are copied to textures shared with a Direct3D 12 device, the runtime works there, and the
+result is copied back. It costs the game about 0.2 to 0.3 ms a frame at 1080p. It works with the
+game's upscaler, whichever of OptiScaler's Direct3D 11 backends is selected (the native FSR 2.2 and
+FSR 3.1 ones, or those running on Direct3D 12), before or after it as for Direct3D 12, and without one,
+on the finished image, as above. Tested on Windows with FSR 2.2, native and on Direct3D 12; not yet
+with a Direct3D 11 game under Proton (DXVK), nor with OptiScaler's frame generation.
 
 ## Linux 
 
