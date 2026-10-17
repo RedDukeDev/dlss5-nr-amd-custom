@@ -1,6 +1,6 @@
 # DLSS 5 Neural Rendering on AMD - Featuring asyncronous mode (almost no performance loss!) and Linux support
 
-DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12 and Direct3D 11 games on
+DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12, Direct3D 11 and Vulkan games on
 AMD Radeon GPUs through OptiScaler.
 
 The network is NVIDIA's `nvngx_dlssnr.dll`, included in the release package. Its CUDA code
@@ -43,7 +43,7 @@ Hardware-specific status:
 ## Requirements
 
 - Windows 10/11 or Linux, an AMD Radeon RX 9000 (RDNA4), RX 7000 (RDNA3) or RX 6000 (RDNA2). 
-- A game using DirectX 12 or DirectX 11 (see *Direct3D 11* below)
+- A game using DirectX 12, DirectX 11 or Vulkan (see *Direct3D 11* and *Vulkan* below)
 - The AMD HIP SDK for Windows, if using Windows.
 - ROCm if using Linux.
 
@@ -107,6 +107,19 @@ game's upscaler, whichever of OptiScaler's Direct3D 11 backends is selected (the
 FSR 3.1 ones, or those running on Direct3D 12), before or after it as for Direct3D 12, and without one,
 on the finished image, as above. Tested on Windows with FSR 2.2, native and on Direct3D 12; not yet
 with a Direct3D 11 game under Proton (DXVK), nor with OptiScaler's frame generation.
+
+## Vulkan
+
+A Vulkan game is enhanced at the end of its frame: at `vkQueuePresentKHR`, the swapchain image is
+copied into an image shared with a Direct3D 12 device, the runtime works there, and the result is
+copied back over the swapchain image, with the Direct3D 12 fences imported as timeline semaphores for
+the order between the two. The menu is drawn after it, so it is not enhanced. As without an upscaler in
+Direct3D 12, there are no depth or motion vectors to follow, and the game's interface is part of the
+image: the result trails behind what moves, which *Wait for the network* avoids at a cost in
+frame rate. This is the case whatever upscaler the game uses. Tested on Windows with a small
+Vulkan program (`runtime/tests/dx11/vkapp.cpp`): BGRA8 and RGBA8 swapchains come back byte for byte at
+zero strength. Not tested yet: Vulkan upscalers running on Direct3D 12 (`ffx_12`...), where depth and
+motion vectors could be used, HDR swapchains, DXVK and vkd3d-proton (these go through the DXGI path).
 
 ## Linux 
 
