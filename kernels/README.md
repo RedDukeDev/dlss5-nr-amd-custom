@@ -166,6 +166,17 @@ a flat one. 22 spills are left; in the network the four 2H kernels went from 7.6
 6.8 ms. The 4H block took the kept q, k and v too (3.5 -> 3.4 ms); in the 8H block
 they gained nothing measurable and it is as it was.
 
+The ViT attention (cc_vit_1d_attention_chained_fp8, 3.5 ms of the frame) was bank
+conflicted: its probabilities are stored and read with the lane's query as the row,
+128 bytes apart, so the 16 lanes of a half-wave all hit the same banks. Ablating it
+(960 tokens, 0.37 ms) put 46% of the time in the stores of P to LDS and 19% in the
+sum's reads; K and V's global loads, the barriers and the exponentials cost nothing.
+P's rows now go through lds_at, the XOR of the 16-byte segments the other buffers
+use, and the kernel takes 0.18 ms; in the network 3.5 -> 1.8 ms. The same change on
+the Swin attentions and on qkv_512 gained nothing: their stores have the key as the
+column and were only 2-way conflicted. The ViT GEMMs are matrix bound (the WMMAs alone
+are 54% of the contract kernel) and were left alone.
+
 `DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
 kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of
 the weights pointer>` the 64 KB it points to. That is how the new parameter's layout

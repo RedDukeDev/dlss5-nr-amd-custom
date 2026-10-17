@@ -43,7 +43,7 @@ constexpr int QROW = 64, KROW = 64, VROW = 128, PROW = 128;
 constexpr int LDS_Q = 0;                              // 4 warps x 64 queries x 32 channels
 constexpr int LDS_K = LDS_Q + 4 * 64 * QROW;          // 64 keys x 32 channels
 constexpr int LDS_V = LDS_K + 64 * KROW;              // 32 channels x 64 keys
-constexpr int LDS_P = LDS_V + 32 * VROW;              // 4 warps x 16 queries x 64 keys
+constexpr int LDS_P = LDS_V + 32 * VROW;              // 4 warps x 16 queries x 64 keys, rows swizzled (lds_at)
 constexpr int LDS_BYTES = LDS_P + 4 * 16 * PROW;
 constexpr float NORM_FLOOR = 6.1999999e-05f;
 
@@ -128,18 +128,18 @@ cc_vit_1d_attention_chained_fp8_native(AttnArgs args) {
                     const uint32_t p = exponentials(s[j]);
                     // word j: keys 4j + u (low) and 4j + 2 + u (high) of the tile
                     const int key = 16 * kt + 4 * j + u;
-                    *(uint16_t *)(my_p + row16 * PROW + 2 * key) = (uint16_t)(p & 0xFFFFu);
-                    *(uint16_t *)(my_p + row16 * PROW + 2 * (key + 2)) = (uint16_t)(p >> 16);
+                    *(uint16_t *)(my_p + lds_at<PROW>(row16, 2 * key)) = (uint16_t)(p & 0xFFFFu);
+                    *(uint16_t *)(my_p + lds_at<PROW>(row16, 2 * (key + 2))) = (uint16_t)(p >> 16);
                 }
             }
             __builtin_amdgcn_wave_barrier();
 
             {   // the block's sum for the lane's query
 #pragma clang fp contract(off)
-                const _Float16 *p = (const _Float16 *)(my_p + row16 * PROW);
+                auto p = [&](int key) { return *(const _Float16 *)(my_p + lds_at<PROW>(row16, 2 * key)); };
                 auto T = [&](int o) {
-                    return (((p[o] + p[o + 8]) + (p[o + 16] + p[o + 24])) + (p[o + 32] + p[o + 40])) +
-                           (p[o + 48] + p[o + 56]);
+                    return (((p(o) + p(o + 8)) + (p(o + 16) + p(o + 24))) + (p(o + 32) + p(o + 40))) +
+                           (p(o + 48) + p(o + 56));
                 };
                 auto F = [&](int e) { return ((T(e) + T(2 + e)) + T(4 + e)) + T(6 + e); };
                 sum[i] = sum[i] + (F(0) + F(1));
@@ -149,7 +149,7 @@ cc_vit_1d_attention_chained_fp8_native(AttnArgs args) {
             for (int j = 0; j < 2; ++j) {
                 op8 pop[2];
                 for (int hk = 0; hk < 2; ++hk) {
-                    u32x8 w = __builtin_bit_cast(u32x8, *(const half16 *)(my_p + row16 * PROW + 64 * j + 32 * hk));
+                    u32x8 w = __builtin_bit_cast(u32x8, lds_row16<PROW>(my_p, row16, 64 * j + 32 * hk));
                     for (int m = 0; m < 8; ++m) w[m] = round_e4m3x2(w[m]);
                     pop[hk] = frag_order_rounded_b8(__builtin_bit_cast(half16, w));
                 }
