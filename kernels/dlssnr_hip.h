@@ -141,7 +141,35 @@ __device__ inline half16 widen16(u32x4 v) {
 // at most 0x5F00 after saturation. Infinity and NaN, which ZLUDA turns into the
 // e4m3 NaN, saturate here instead; this network's f16 accumulators do not
 // reach them.
+//
+// It is done by adding and removing a constant whose ulp is the e4m3 step at the
+// value's magnitude, which the f16 adder rounds to nearest even by construction
+// (the idea is DLSSNR-RDNA3's, github.com/mauri870/DLSSNR-RDNA3): M = 1.5 * 2^(E+7)
+// for 2^E <= |x| < 2^(E+1), so the sum's ulp is 2^(E-3) and three of x's mantissa
+// bits survive; below 2^-6 the exponent is held at -6, where e4m3's denormal step
+// 2^-9 is. Half the instructions of the bit-pattern rounding below, which it
+// matches over every one of the 2^32 input pairs (round_check.hip), NaN included.
+// The 32-bit add of the exponent cannot carry between the halves: each is at
+// most 0x5C00 + 0x1E00.
 __device__ inline uint32_t round_e4m3x2(uint32_t h2) {
+    const half2 k448 = {448.0f16, 448.0f16};
+    const half2 a = __builtin_elementwise_min(as_half2(h2 & 0x7FFF7FFFu), k448);
+    typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
+    const u16x2 exponent = __builtin_bit_cast(u16x2, as_u32(a) & 0x7C007C00u);
+    const u16x2 floor_ = {0x2400, 0x2400};
+    const uint32_t magic_bits = __builtin_bit_cast(uint32_t, __builtin_elementwise_max(exponent, floor_)) + 0x1E001E00u;
+    const half2 magic = as_half2(magic_bits);
+    half2 r;
+    {
+#pragma clang fp contract(off)
+        r = (a + magic) - magic;
+    }
+    return as_u32(r) | (h2 & 0x80008000u);
+}
+
+// The same by the bit pattern, as it was first written: kept as the reference the
+// one above is checked against.
+__device__ inline uint32_t round_e4m3x2_bits(uint32_t h2) {
     const uint32_t sign = h2 & 0x80008000u;
     const half2 k448 = {448.0f16, 448.0f16};
     const uint32_t a = as_u32(__builtin_elementwise_min(as_half2(h2 & 0x7FFF7FFFu), k448));
