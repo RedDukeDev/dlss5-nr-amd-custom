@@ -723,7 +723,11 @@ DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context 
     dlss5nr_default_settings(&c->settings);
 
     std::string error;
-    if (!c->passes.init(c->device, error)) {
+    const auto began = std::chrono::steady_clock::now();
+    const bool built = c->passes.init(c->device, error);
+    c->log(2, "compute passes built in %.0f ms",
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+    if (!built) {
         c->log(0, "the compute passes could not be built: %s", error.c_str());
         dlss5nr_destroy(c);
         return -3;

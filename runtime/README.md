@@ -55,6 +55,11 @@ For development, `DLSS5NR_ALLOW_TRANSLATION=1` lets ZLUDA translate as the
 network loads, and skips these checks. The harness needs it unless it is
 pointed at a complete package (`--runtime-dir`).
 
+The compute passes (core/shaders.h) are not compiled at the first frame: their bytecode
+ships in core/shaders_dxbc.h, made by `tools/gen_dxbc.cpp`. Run that again whenever
+shaders.h changes; a stale header is ignored and the shaders are compiled at the first
+frame instead, which takes 15 to 20 seconds of the game's render thread.
+
 ## The harness
 
     dlss5nr_harness.exe --image in.png --out out.png --snippet nvngx_dlssnr.dll

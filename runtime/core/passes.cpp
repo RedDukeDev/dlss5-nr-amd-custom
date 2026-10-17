@@ -122,24 +122,23 @@ bool Passes::init(ID3D12Device *device, std::string &error) {
         return false;
     }
 
+    // The shaders compiled beforehand are used whenever they are of this source: compiling
+    // them here, at the highest optimisation, took 15 to 20 seconds at the game's first frame.
+    const bool shipped = kDxbcSourceHash == shader_hash(kShaderSource);
     for (int i = 0; i < (int)Pass::Count; ++i) {
         ID3DBlob *code = nullptr, *log = nullptr;
         const void *bytes = nullptr;
         size_t size = 0;
-        if (FAILED(D3DCompile(kShaderSource, sizeof kShaderSource - 1, "dlss5nr", nullptr, nullptr, kEntry[i],
-                              "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &log))) {
-            // The system's compiler cannot build these everywhere (Wine's, which is
-            // vkd3d's, has no RWByteAddressBuffer.Load): use the same shaders
-            // compiled beforehand, as long as they are of this source.
-            const std::string failure = std::string("compiling ") + kEntry[i] + ": " +
-                                        (log ? (const char *)log->GetBufferPointer() : "?");
-            release(log);
-            if (kDxbcSourceHash != shader_hash(kShaderSource) || !kDxbc[i].size) {
-                error = failure + " (and the shipped bytecode is not of this source)";
-                return false;
-            }
+        if (shipped && kDxbc[i].size) {
             bytes = kDxbc[i].data;
             size = kDxbc[i].size;
+        } else if (FAILED(D3DCompile(kShaderSource, sizeof kShaderSource - 1, "dlss5nr", nullptr, nullptr, kEntry[i],
+                                     "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &log))) {
+            error = std::string("compiling ") + kEntry[i] + ": " +
+                    (log ? (const char *)log->GetBufferPointer() : "?") +
+                    " (and the shipped bytecode is not of this source)";
+            release(log);
+            return false;
         } else {
             bytes = code->GetBufferPointer();
             size = code->GetBufferSize();

@@ -1,12 +1,12 @@
 // Compiles the compute shaders of core/shaders.h with Microsoft's compiler and
 // writes the bytecode as core/shaders_dxbc.h.
 //
-// Why: the runtime compiles them when it starts, and that compiler is the one in
-// the system. Under Wine it is vkd3d's, which cannot build them
-// (RWByteAddressBuffer.Load is not defined there). core/passes.cpp falls back on
-// this bytecode when compiling fails, so a prefix does not need Microsoft's
-// d3dcompiler_47.dll. Run it again whenever shaders.h changes: the header
-// carries a hash of the source, and a stale one is not used.
+// Why: compiling them when the runtime starts took 15 to 20 seconds, at the game's
+// first frame, and the compiler in the system is not always able to (under Wine it is
+// vkd3d's, which has no RWByteAddressBuffer.Load). core/passes.cpp uses this bytecode
+// whenever it is of the current source, and compiles only when it is not. Run this again
+// whenever shaders.h changes: the header carries a hash of the source, and a stale one
+// is not used -- which is safe, and brings the 15 seconds back.
 //
 //   gen_dxbc.exe <path to d3dcompiler_47.dll> <output header>
 //
