@@ -102,6 +102,7 @@ cc_vit_1d_qkv_chained_fp8_native(QkvArgs args) {
     if (tid == 0 && args.ready_in)
         for (int c = 0; c < 8; ++c) wait_flag(args.ready_in + 8 * ttile + c);
     __syncthreads();
+    acquire_tiles();
 
     // ------------------------------------------------ cooperative loading
     // Per slice of 32 input channels: 8 patches x 32 lanes of activations (two
@@ -236,6 +237,7 @@ cc_vit_1d_qkv_chained_fp8_native(QkvArgs args) {
     }
 
     // Both heads of an output tile count themselves in; the second raises it.
+    release_tiles();
     __syncthreads();
     if (tid == 0) {
         const int index = ttile * 16 + group;

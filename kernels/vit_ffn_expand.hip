@@ -70,6 +70,7 @@ __device__ __forceinline__ void ffn_expand(const ExpandArgs &args) {
         for (int t = first >> 7; t < end; ++t) wait_flag(args.ready_in + 8 * t + 8 * z);
     }
     __syncthreads();
+    acquire_tiles();
 
     // ------------------------------------------------ cooperative loading
     // Per slice: 8 patches x 32 lanes of activations, 8 pieces x 32 lanes of
@@ -161,6 +162,7 @@ __device__ __forceinline__ void ffn_expand(const ExpandArgs &args) {
         }
     }
 
+    release_tiles();
     __syncthreads();
     if (lane == 0 && wave == 0 && args.ready_out) raise_flag(args.ready_out + tile * 32 + nblock);
 }

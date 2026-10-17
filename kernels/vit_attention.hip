@@ -80,6 +80,7 @@ cc_vit_1d_attention_chained_fp8_native(AttnArgs args) {
     if (tid == 0 && args.ready_in)
         for (int t = 0; t < tiles128; ++t) wait_flag(args.ready_in + 16 * t + head / 2);
     __syncthreads();
+    acquire_tiles();
 
     // ------------------------------------------------ this warp's queries
     uint8_t *my_q = lds + LDS_Q + warp * 64 * QROW;
@@ -207,6 +208,7 @@ cc_vit_1d_attention_chained_fp8_native(AttnArgs args) {
                 for (int w = hi; w < 4; w += 2) *(uint32_t *)(chunk + lane * 16 + 4 * w) = 0;
         }
 
+    release_tiles();
     __syncthreads();
     if (tid == 0 && args.ready_out)
         for (int t = 2 * group; t < 2 * group + 2 && t < tiles128; ++t) raise_flag(args.ready_out + 32 * t + head);

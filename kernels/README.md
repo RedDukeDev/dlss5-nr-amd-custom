@@ -86,6 +86,37 @@ So an update costs a census and a diff (`kernel_census.py`,
 do; if a family changed shape, that family loses its native path until it is
 rewritten.
 
+### What 310.9.16 changed
+
+The census above found two kinds of change in the kernels this directory replaces:
+
+  - **The pre block's parameter grew from 264 to 272 bytes**: a mask blend mode at
+    +0x28 and a count of the network's own inputs at +0xC4 shift the rest. The gate
+    kept it on the translation. `PreWire2` and `cc_..._pre_block_..._native2` are for
+    it, and kernels.txt carries a line for each size: the gate tries the next line of
+    a kernel when a size does not match. The fifth texture became a mask: its y and z
+    are inputs 11 and 12, and with flags on, the mask blend mode (1 the mean, 2 the
+    smaller, 3 the larger) says how the mask meets the flags in inputs 13 and 14; a
+    count above 15 moves inputs 13 to 15 up one. Its clearing of the halved surface's
+    edge is two planes, not four. `pre_block_check.py --v2` runs all of this against
+    the translation: 24 variants, three sizes, byte for byte, with the real weights of
+    both networks.
+  - **Fences in the 1d vit kernels**: `fence.acquire.gpu` after the barrier that
+    follows a kernel's waits for the producer's flags, and `membar.gl` before the
+    barrier that precedes raising its own. The native versions had neither, and
+    with the pre block native -- the kernels then overlap differently -- the smaller
+    network's image came out different from the translation's by up to 9 levels. Every
+    native kernel that waits or raises a flag now fences the same way
+    (`acquire_tiles`, `release_tiles` in dlssnr_hip.h). Both networks now match the
+    translation exactly, and the whole network runs about four times faster than the
+    translation (2560x1440: 229 -> 57 ms the smaller network, 391 -> 98 ms the
+    larger).
+
+`DLSS5NR_GATE_DUMP=<kernel name>` makes the gate log the argument buffer of that
+kernel's first three launches in hex, and with `DLSS5NR_GATE_DUMP_WEIGHTS=<offset of
+the weights pointer>` the 64 KB it points to. That is how the new parameter's layout
+and the real weights were read, rather than guessed.
+
 ## The tools
 
     kernel_census.py   every kernel in a DLL or a PTX corpus: name, module,

@@ -11,7 +11,11 @@ compares both outputs byte for byte.
 
 The weights are a captured launch's (capture_pre16).
 
-Usage: pre_block_check.py [variant ...] [--hsaco=PATH]
+--v2 checks version 310.9.16 of the library: its parameter is 272 bytes (a mask blend mode
+and a channel count more), and its PTX is the one in pre_block_32.ptx of the captures
+directory; without it, 310.8.0.0's.
+
+Usage: pre_block_check.py [variant ...] [--hsaco=PATH] [--v2]
 """
 import glob
 import io
@@ -28,6 +32,7 @@ from zluda_run import Zluda  # noqa: E402
 import workspace  # noqa: E402
 
 ENTRY = "cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8"
+V2 = "--v2" in sys.argv
 H, W = 60, 100
 HSACO = os.path.join(os.path.dirname(HERE), "swin_1h.hsaco")   # --hsaco=PATH: another build of it
 for _arg in sys.argv[1:]:
@@ -42,6 +47,34 @@ for _arg in sys.argv[1:]:
     if _arg.startswith("--seed="):
         SEED = int(_arg[7:])
 
+VARIANTS_V2 = {
+    "all":         dict(),
+    "mode1":       dict(mask_mode=1),
+    "mode2":       dict(mask_mode=2),
+    "mode3":       dict(mask_mode=3),
+    "mode1_flags_negative": dict(mask_mode=1, flag_x=-0.5, flag_y=-0.25),
+    "mode2_flags_negative": dict(mask_mode=2, flag_x=-0.5, flag_y=-0.25),
+    "mode3_one_negative":   dict(mask_mode=3, flag_x=-0.5, flag_y=0.75),
+    "channels16":  dict(channels=16),
+    "channels16_mode3": dict(channels=16, mask_mode=3),
+    "channels16_no_extra": dict(channels=16, extra=False),
+    "no_extra":    dict(extra=False),
+    "no_extra_mode2": dict(extra=False, mask_mode=2),
+    "flags_off":   dict(flag_mode=0),
+    "flags_off_mode3": dict(flag_mode=0, mask_mode=3),
+    "no_extra_flags_off": dict(extra=False, flag_mode=0),
+    "flags_negative": dict(extra=False, flag_x=-0.5, flag_y=-0.25),
+    "far":         dict(depth_far=1),
+    "no_depth":    dict(depth=False),
+    "no_history":  dict(history=False),
+    "half_padded": dict(half_pad=8),
+    # what the network's own harness launches: the colour texture alone, flags at one
+    "bare":        dict(history=False, depth=False, extra=False, motion=False, flag_x=1.0, flag_y=1.0),
+    "bare_flags_off": dict(history=False, depth=False, extra=False, motion=False, flag_x=1.0, flag_y=1.0, flag_mode=0),
+    "no_motion":   dict(motion=False),
+    "history_no_motion": dict(motion=False, depth=False),
+}
+
 VARIANTS = {
     "all":        dict(),
     "far":        dict(depth_far=1),
@@ -52,6 +85,34 @@ VARIANTS = {
     "flags_negative": dict(extra=False, flag_x=-0.5, flag_y=-0.25),
     "half_padded": dict(half_pad=8),
 }
+
+
+def build_params2(tex, out, weights, half, depth_far=0, flag_mode=1, flag_x=0.3, flag_y=-0.2, half_pad=0,
+                  mask_mode=0, channels=15):
+    def trio(off):
+        return [off[0], off[1], float(W), float(H), 1.0 / W, 1.0 / H]
+    p = struct.pack("<5Q", tex["color"], tex["history"], tex["motion"], tex["depth"], tex["extra"])
+    p += struct.pack("<i", mask_mode)
+    p += struct.pack("<6f", *trio((0.25, -0.125)))          # history
+    p += struct.pack("<6f", *trio((0.0, 0.0)))              # motion
+    p += struct.pack("<6f", *trio((0.0, 0.0)))              # depth
+    p += struct.pack("<6f", *trio((0.5, 0.0)))              # extra
+    p += struct.pack("<6f", *trio((0.0, 0.0)))              # colour
+    p += struct.pack("<2f", 1.0, 1.0)                       # motion vector scale
+    p += struct.pack("<i", depth_far)
+    p += struct.pack("<f", 1.0)                             # extra y scale
+    p += struct.pack("<2f", 0.5, 0.25)                      # extra z scale, constant 10
+    p += struct.pack("<2f", flag_x, flag_y)
+    p += struct.pack("<2i", channels, flag_mode)
+    p += struct.pack("<f", 0.0625)
+    p += struct.pack("<2i", 12345 + SEED, 0)
+    p += struct.pack("<2i", H, W)
+    p += struct.pack("<3Q", out, weights, 0)
+    p += struct.pack("<2i", TOK_Y, TOK_X)
+    p += struct.pack("<Q", half)
+    p += struct.pack("<2i", HALF_Y + half_pad, HALF_X + half_pad)
+    assert len(p) == 272, len(p)
+    return p
 
 
 def build_params(tex, out, weights, half, depth_far=0, flag_mode=1, flag_x=0.3, flag_y=-0.2, half_pad=0):
@@ -79,7 +140,8 @@ def build_params(tex, out, weights, half, depth_far=0, flag_mode=1, flag_x=0.3, 
 
 
 def main():
-    wanted = [a for a in sys.argv[1:] if not a.startswith('--')] or list(VARIANTS)
+    variants = VARIANTS_V2 if V2 else VARIANTS
+    wanted = [a for a in sys.argv[1:] if not a.startswith('--')] or list(variants)
     rng = np.random.default_rng(SEED)
     z = Zluda()
     h = Hip()
@@ -97,22 +159,22 @@ def main():
     text = ".version 9.4\n.target sm_120\n.address_size 64\n" + io.open(
         os.path.join(workspace.captures(), "pre_block_32.ptx"), encoding="utf-8").read()
     translated = z.module(text, ENTRY)
-    native = h.module(HSACO, ENTRY + "_native")
+    native = h.module(HSACO, ENTRY + ("_native2" if V2 else "_native"))
     out_bytes = TOK_Y * TOK_X * 32
     half_bytes = 4 * (HALF_Y + 8) * (HALF_X + 8) * 16
     grid, block = (TOK_X // 8, TOK_Y // 8, 1), (32, 1, 1)
 
     for name in wanted:
-        cfg = dict(VARIANTS[name])
+        cfg = dict(variants[name])
         tex = dict(textures)
-        for t in ("history", "depth", "extra"):
+        for t in ("history", "motion", "depth", "extra"):
             if cfg.pop(t, True) is False:
                 tex[t] = 0
         results = []
         for run in ("translated", "native"):
             out = z.upload(np.full(out_bytes, 0x77, np.uint8))
             half = z.upload(np.full(half_bytes, 0x77, np.uint8))
-            params = build_params(tex, out, weights, half, **cfg)
+            params = (build_params2 if V2 else build_params)(tex, out, weights, half, **cfg)
             if run == "translated":
                 z.launch(translated, grid, block, params)
             else:

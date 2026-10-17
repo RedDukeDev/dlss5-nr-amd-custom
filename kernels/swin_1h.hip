@@ -193,8 +193,18 @@ __device__ inline op8 row_b8(const uint8_t *lds, int row, int k_block) {
 //   15     0
 // Every operation is the PTX's own, in its order, with the approximate ones
 // done as ZLUDA does them (approx_check.py).
+//
+// Version 310.9.16 of the library passes 272 bytes, not 264: an int at +0x28, the
+// mask blend mode, pushes everything after it by four bytes, and another at +0xC4
+// (15 so far: how many of the 16 inputs are the network's own, one more and the
+// last three move up a place) by four more. PreWire1 and PreWire2 are the two
+// parameters as the kernels receive them, PreArgs what both are read into; v2
+// says which logic builds inputs 11 to 15.
 struct PreArgs {
     uint64_t color, history, motion, depth, extra;   // +0x00  texture objects, 0 = absent
+    bool v2;
+    int mask_mode;                                   // v2: 0 flags alone, 1 mean with the mask, 2 smaller, 3 larger
+    int channels;                                    // v2: above 15, the last three inputs move up one
     float hist_off[2], hist_scale[2], hist_inv[2];   // +0x28  normalised -> texture coordinates
     float mot_off[2], mot_scale[2], mot_inv[2];      // +0x40
     float dep_off[2], dep_scale[2], dep_inv[2];      // +0x58
@@ -216,7 +226,81 @@ struct PreArgs {
     uint8_t *half;                                   // +0xF8  the halved surface, two planes
     int half_y, half_x;                              // +0x100
 };
-static_assert(sizeof(PreArgs) == 264, "the parameter is 264 bytes, by value");
+
+struct PreWire1 {
+    uint64_t color, history, motion, depth, extra;
+    float hist_off[2], hist_scale[2], hist_inv[2];
+    float mot_off[2], mot_scale[2], mot_inv[2];
+    float dep_off[2], dep_scale[2], dep_inv[2];
+    float ext_off[2], ext_scale[2], ext_inv[2];
+    float col_off[2], col_scale[2], col_inv[2];
+    float mv_scale[2];
+    int depth_far;
+    float extra_y_scale;
+    float extra_z_scale, constant10;
+    float flag_x, flag_y;
+    int flag_mode;
+    float colour_half_range;
+    int seed, pad0;
+    int height, width;
+    uint8_t *output;
+    const uint8_t *weights;
+    const void *unused;
+    int tok_y, tok_x;
+    uint8_t *half;
+    int half_y, half_x;
+};
+static_assert(sizeof(PreWire1) == 264, "310.8.0.0 passes 264 bytes, by value");
+
+struct PreWire2 {
+    uint64_t color, history, motion, depth, extra;   // +0x00
+    int mask_mode;                                   // +0x28
+    float hist_off[2], hist_scale[2], hist_inv[2];   // +0x2C
+    float mot_off[2], mot_scale[2], mot_inv[2];      // +0x44
+    float dep_off[2], dep_scale[2], dep_inv[2];      // +0x5C
+    float ext_off[2], ext_scale[2], ext_inv[2];      // +0x74
+    float col_off[2], col_scale[2], col_inv[2];      // +0x8C
+    float mv_scale[2];                               // +0xA4
+    int depth_far;                                   // +0xAC
+    float extra_y_scale;                             // +0xB0
+    float extra_z_scale, constant10;                 // +0xB4
+    float flag_x, flag_y;                            // +0xBC
+    int channels;                                    // +0xC4
+    int flag_mode;                                   // +0xC8
+    float colour_half_range;                         // +0xCC
+    int seed, pad0;                                  // +0xD0
+    int height, width;                               // +0xD8
+    uint8_t *output;                                 // +0xE0
+    const uint8_t *weights;                          // +0xE8
+    const void *unused;                              // +0xF0
+    int tok_y, tok_x;                                // +0xF8
+    uint8_t *half;                                   // +0x100
+    int half_y, half_x;                              // +0x108
+};
+static_assert(sizeof(PreWire2) == 272, "310.9.16 passes 272 bytes, by value");
+
+template <typename W>
+__device__ inline PreArgs pre_args_of(const W &w, bool v2, int mask_mode, int channels) {
+    PreArgs a{};
+    a.color = w.color; a.history = w.history; a.motion = w.motion; a.depth = w.depth; a.extra = w.extra;
+    a.v2 = v2; a.mask_mode = mask_mode; a.channels = channels;
+    for (int i = 0; i < 2; ++i) {
+        a.hist_off[i] = w.hist_off[i]; a.hist_scale[i] = w.hist_scale[i]; a.hist_inv[i] = w.hist_inv[i];
+        a.mot_off[i] = w.mot_off[i]; a.mot_scale[i] = w.mot_scale[i]; a.mot_inv[i] = w.mot_inv[i];
+        a.dep_off[i] = w.dep_off[i]; a.dep_scale[i] = w.dep_scale[i]; a.dep_inv[i] = w.dep_inv[i];
+        a.ext_off[i] = w.ext_off[i]; a.ext_scale[i] = w.ext_scale[i]; a.ext_inv[i] = w.ext_inv[i];
+        a.col_off[i] = w.col_off[i]; a.col_scale[i] = w.col_scale[i]; a.col_inv[i] = w.col_inv[i];
+        a.mv_scale[i] = w.mv_scale[i];
+    }
+    a.depth_far = w.depth_far;
+    a.extra_y_scale = w.extra_y_scale; a.extra_z_scale = w.extra_z_scale; a.constant10 = w.constant10;
+    a.flag_x = w.flag_x; a.flag_y = w.flag_y; a.flag_mode = w.flag_mode;
+    a.colour_half_range = w.colour_half_range; a.seed = w.seed; a.pad0 = w.pad0;
+    a.height = w.height; a.width = w.width;
+    a.output = w.output; a.weights = w.weights; a.unused = w.unused;
+    a.tok_y = w.tok_y; a.tok_x = w.tok_x; a.half = w.half; a.half_y = w.half_y; a.half_x = w.half_x;
+    return a;
+}
 
 constexpr int PRE_W_IN = 0x2010, PRE_SHIFT = 0x400;
 
@@ -345,26 +429,74 @@ __device__ inline void pre_fill(const PreArgs &a, uint8_t *rows, int bx, int by,
         }
 
         ch[10] = to_f16(a.constant10);
-        if (!extra_off) {
-            float e1 = a.extra_y_scale, e2 = a.extra_z_scale;
+        if (!a.v2) {
+            if (!extra_off) {
+                float e1 = a.extra_y_scale, e2 = a.extra_z_scale;
+                if (a.extra != 0) {
+                    const float ev = __builtin_fmaf(v, a.ext_scale[1], a.ext_off[1]) * a.ext_inv[1];
+                    const float4v t = sample2d(a.extra, eu, ev);
+                    e1 = t[1] * a.extra_y_scale;
+                    e2 = t[2] * a.extra_z_scale;
+                }
+                ch[11] = to_f16(e1);
+                ch[12] = to_f16(e2);
+                ch[13] = ch[14] = (_Float16)(a.flag_mode != 0 ? -1.0f : 0.0f);
+            } else {
+                const float fx = !(a.flag_x >= 0.0f) ? a.extra_z_scale : a.flag_x;
+                const float fy = !(a.flag_y >= 0.0f) ? a.extra_z_scale : a.flag_y;
+                ch[11] = (_Float16)a.extra_y_scale;
+                ch[12] = (_Float16)(flags_on ? 1.0f : a.extra_z_scale);
+                ch[13] = (_Float16)(flags_on ? fx : -1.0f);
+                ch[14] = (_Float16)(flags_on ? fy : -1.0f);
+            }
+            ch[15] = (_Float16)0.0f;
+        } else {
+            // 310.9.16. The fifth texture is a mask: its y and z, scaled, are inputs 11 and
+            // 12 (1 where it is absent, so the scales alone). With flags, they are inputs 13
+            // and 14, and where the mask and the flags are both there the mask blend mode
+            // says how they meet: the mean, the smaller or the larger.
+            float ty = 1.0f, tz = 1.0f;
             if (a.extra != 0) {
                 const float ev = __builtin_fmaf(v, a.ext_scale[1], a.ext_off[1]) * a.ext_inv[1];
                 const float4v t = sample2d(a.extra, eu, ev);
-                e1 = t[1] * a.extra_y_scale;
-                e2 = t[2] * a.extra_z_scale;
+                ty = t[1];
+                tz = t[2];
             }
-            ch[11] = to_f16(e1);
-            ch[12] = to_f16(e2);
-            ch[13] = ch[14] = (_Float16)(a.flag_mode != 0 ? -1.0f : 0.0f);
-        } else {
-            const float fx = !(a.flag_x >= 0.0f) ? a.extra_z_scale : a.flag_x;
-            const float fy = !(a.flag_y >= 0.0f) ? a.extra_z_scale : a.flag_y;
-            ch[11] = (_Float16)a.extra_y_scale;
-            ch[12] = (_Float16)(flags_on ? 1.0f : a.extra_z_scale);
-            ch[13] = (_Float16)(flags_on ? fx : -1.0f);
-            ch[14] = (_Float16)(flags_on ? fy : -1.0f);
+            _Float16 f13 = (_Float16)0.0f, f14 = (_Float16)0.0f;
+            if (a.flag_mode == 0) {
+                ch[11] = to_f16(ty * a.extra_y_scale);
+                ch[12] = to_f16(tz * a.extra_z_scale);
+            } else {
+                const float mask = tz * a.extra_z_scale;
+                float fx = flags_on ? (!(a.flag_x >= 0.0f) ? a.extra_z_scale : a.flag_x) : -1.0f;
+                float fy = flags_on ? (!(a.flag_y >= 0.0f) ? a.extra_z_scale : a.flag_y) : -1.0f;
+                if (a.extra != 0 && a.mask_mode != 0 && flags_on) {
+                    if (a.mask_mode == 3) {
+                        fx = mask > fx ? mask : fx;
+                        fy = mask > fy ? mask : fy;
+                    } else if (a.mask_mode == 2) {
+                        fx = mask < fx ? mask : fx;
+                        fy = mask < fy ? mask : fy;
+                    } else {
+                        fx = (mask + fx) * 0.5f;
+                        fy = (mask + fy) * 0.5f;
+                    }
+                }
+                ch[11] = to_f16(ty * a.extra_y_scale);
+                ch[12] = to_f16(flags_on ? 1.0f : mask);
+                f13 = to_f16(fx);
+                f14 = to_f16(fy);
+            }
+            if (a.channels > 15) {
+                ch[13] = (_Float16)0.0f;
+                ch[14] = f13;
+                ch[15] = f14;
+            } else {
+                ch[13] = f13;
+                ch[14] = f14;
+                ch[15] = (_Float16)0.0f;
+            }
         }
-        ch[15] = (_Float16)0.0f;
 
         const int x = i & 7, y = i >> 3;
         const int row = ((y >> 2) * 2 + (x >> 2)) * 16 + (y & 3) * 4 + (x & 3);
@@ -1123,16 +1255,18 @@ __device__ __forceinline__ void swin_1h_body(const SwinArgs &args, uint8_t *down
             // by the declared size: each block its 4x4, the last row and column
             // of blocks out to the declared edge. With the token surface a
             // multiple of 32, as the network sizes it, the two are the same
-            // and nothing is cleared.
+            // and nothing is cleared. (310.9.16 clears two planes, the two it writes;
+            // 310.8.0.0 cleared four.)
             const int valid_y = (args.dim_y + 1) / 2, valid_x = (args.dim_x + 1) / 2;
             if (out_dim_y > valid_y || out_dim_x > valid_x) {
                 __builtin_amdgcn_s_waitcnt(0);
                 const int y1 = by == (int)gridDim.y - 1 ? out_dim_y : min(4 * by + 4, out_dim_y);
                 const int x1 = bx == (int)gridDim.x - 1 ? out_dim_x : min(4 * bx + 4, out_dim_x);
                 const size_t dplane = (size_t)out_dim_x * out_dim_y * 16;
-                const int w = x1 - 4 * bx, items = (y1 - 4 * by) * w * 4;
+                const int planes = pre && pre->v2 ? 2 : 4;
+                const int w = x1 - 4 * bx, items = (y1 - 4 * by) * w * planes;
                 for (int i = lane; i < items; i += 32) {
-                    const int pl = i & 3, cell = i >> 2;
+                    const int pl = i % planes, cell = i / planes;
                     const int y = 4 * by + cell / w, x = 4 * bx + cell % w;
                     if (y >= valid_y || x >= valid_x)
                         *(u32x4 *)(down + pl * dplane + ((size_t)y * out_dim_x + x) * 16) = (u32x4){0, 0, 0, 0};
@@ -1205,12 +1339,26 @@ cc_tinlayout_fused_swin_1h_32_1_outview_wait_fp8_native(SwinArgs args) {
     swin_1h_body<false, false, VIEW_OUT>(args, nullptr, 0, 0, nullptr, lds);
 }
 
-extern "C" __global__ __launch_bounds__(32) void
-cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native(PreArgs a) {
-    __shared__ __attribute__((aligned(32))) uint8_t lds[LDS_BYTES];
+__device__ __forceinline__ void pre_block_native(const PreArgs &a, uint8_t *lds) {
     SwinArgs args = {nullptr, a.output, a.weights, a.tok_y, a.tok_x, 0, 0,
                      nullptr, 0, 0, nullptr, nullptr, 0, 0, {}};
     swin_1h_body<true, false, PATCHES, true>(args, a.half, a.half_y, a.half_x, nullptr, lds, &a);
+}
+
+// 310.8.0.0: 264 bytes.
+extern "C" __global__ __launch_bounds__(32) void
+cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native(PreWire1 w) {
+    __shared__ __attribute__((aligned(32))) uint8_t lds[LDS_BYTES];
+    const PreArgs a = pre_args_of(w, false, 0, 15);
+    pre_block_native(a, lds);
+}
+
+// 310.9.16: 272 bytes.
+extern "C" __global__ __launch_bounds__(32) void
+cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native2(PreWire2 w) {
+    __shared__ __attribute__((aligned(32))) uint8_t lds[LDS_BYTES];
+    const PreArgs a = pre_args_of(w, true, w.mask_mode, w.channels);
+    pre_block_native(a, lds);
 }
 
 extern "C" __global__ __launch_bounds__(32) void

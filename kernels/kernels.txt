@@ -191,6 +191,8 @@ cc_vit_1d_attention_chained_fp8  vit_attention.hsaco  block=32,4,1  args=64  ent
 # synthetic textures, translated and native run on the same texture objects,
 # seven branch combinations on several sizes -- every output byte identical.
 cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8  swin_1h.hsaco  block=32,1,1  args=264  entry=cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native
+# 310.9.16 passes 272 bytes: a mask blend mode at +0x28 and a channel count at +0xC4 (see PreWire2).
+cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8  swin_1h.hsaco  block=32,1,1  args=272  entry=cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8_native2
 
 # The post block: the network's last layer, a fourth entry in swin_1h.hsaco.
 # The 1H block on the halved surface (nearest) and the full-resolution

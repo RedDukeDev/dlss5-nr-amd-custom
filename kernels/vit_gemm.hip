@@ -74,6 +74,7 @@ __device__ void vit_gemm(const VitArgs &args) {
             for (int z = 0; z < 4; ++z) wait_flag(args.ready_in + 32 * t + 8 * z);
     }
     __syncthreads();
+    acquire_tiles();
 
     // ------------------------------------------------ cooperative loading
     // Per slice of 32 input channels: 8 patches x 32 lanes of activations (two
@@ -196,6 +197,7 @@ __device__ void vit_gemm(const VitArgs &args) {
     // The four quarters of an output tile count themselves in; the last one
     // raises the tile's flag, as the PTX's fourth z slice does. The counter
     // starts at -1 and ends at 3 either way.
+    release_tiles();
     __syncthreads();
     if (lane == 0 && wave == 0) {
         const int index = ttile * 8 + nblock;

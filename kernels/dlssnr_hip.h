@@ -896,4 +896,13 @@ __device__ inline void raise_flag(int *flag) {
     __hip_atomic_store(flag, 0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// The two fences version 310.9.16 of the library added around the protocol, in the 1d vit
+// kernels: every thread of the consumer fences after the barrier that follows the waits
+// (`fence.acquire.gpu`), so what the producer wrote is what it reads; every thread of the
+// producer fences before the barrier that precedes the flag (`membar.gl`), so what the
+// block wrote is out before the one thread that raises the flag does. Without them the flag
+// orders only that thread's own writes and the waiting thread's own reads.
+__device__ inline void acquire_tiles() { __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); }
+__device__ inline void release_tiles() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); }
+
 }  // namespace dlssnr

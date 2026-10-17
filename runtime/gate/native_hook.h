@@ -206,6 +206,55 @@ inline bool bind(Entry &e) {
 inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                        unsigned by, unsigned bz, unsigned shared, void *stream, void **extra) {
     load_manifest();
+    // DLSS5NR_GATE_DUMP=<kernel name>: the argument buffer of its first three launches, in hex, to
+    // the log. What a new version of the library passes, when a kernel's parameter size
+    // changes, is what the native kernel's layout has to be made from.
+    {
+        static const char *dump = getenv("DLSS5NR_GATE_DUMP");
+        static int dumped = 0;
+        if (dump && name && extra && dumped < 3 && strcmp(dump, name) == 0) {
+            const unsigned char *buffer = nullptr;
+            size_t size = 0;
+            for (int k = 0; extra[k] && k < 16; k += 2) {
+                if ((size_t)extra[k] == 1) buffer = (const unsigned char *)extra[k + 1];
+                if ((size_t)extra[k] == 2) size = *(const size_t *)extra[k + 1];
+            }
+            if (buffer) {
+                ++dumped;
+                logf("[native] %s launch %d: grid %u,%u,%u block %u,%u,%u, %zu bytes of arguments\n", name, dumped, gx, gy,
+                     gz, bx, by, bz, size);
+                for (size_t at = 0; at < size; at += 16) {
+                    char line[160];
+                    int n = snprintf(line, sizeof line, "[native]   +0x%03zx", at);
+                    for (size_t i = at; i < at + 16 && i < size; ++i) n += snprintf(line + n, sizeof line - n, " %02x", buffer[i]);
+                    logf("%s\n", line);
+                }
+                // DLSS5NR_GATE_DUMP_WEIGHTS=<offset of the pointer in the arguments>: and the
+                // 64 KB it points at, to <kernel name>_weights<n>.bin in the working directory.
+                if (const char *where = getenv("DLSS5NR_GATE_DUMP_WEIGHTS")) {
+                    const size_t at = (size_t)atoi(where);
+                    typedef int (*copy_fn)(void *, const void *, size_t);
+                    typedef int (*sync_fn)();
+                    HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+                    copy_fn copy = hip ? (copy_fn)GetProcAddress(hip, "hipMemcpyDtoH") : nullptr;
+                    sync_fn sync = hip ? (sync_fn)GetProcAddress(hip, "hipDeviceSynchronize") : nullptr;
+                    if (copy && at + 8 <= size) {
+                        if (sync) sync();
+                        const void *device = *(const void *const *)(buffer + at);
+                        static unsigned char blob[1 << 16];
+                        const int status = copy(blob, device, sizeof blob);
+                        char file[256];
+                        snprintf(file, sizeof file, "%s_weights%d.bin", name, dumped);
+                        if (FILE *out = fopen(file, "wb")) {
+                            fwrite(blob, 1, sizeof blob, out);
+                            fclose(out);
+                        }
+                        logf("[native] weights at %p -> %s (%d)\n", device, file, status);
+                    }
+                }
+            }
+        }
+    }
     if (!g_entry_count || !name || !extra) return false;
 
     for (unsigned i = 0; i < g_entry_count; ++i) {
@@ -224,13 +273,13 @@ inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, 
             logf("[native] %s: %zu bytes of arguments, the kernel wants %u -> translation\n", name,
                  size, e.args);
             e.dead = true;
-            return false;
+            continue;   // another line of the manifest may be for this version's size
         }
         if (bx != e.bx || by != e.by || bz != e.bz) {
             logf("[native] %s: block %ux%ux%u against %ux%ux%u expected -> translation\n", name, bx,
                  by, bz, e.bx, e.by, e.bz);
             e.dead = true;
-            return false;
+            continue;
         }
         if (!bind(e)) return false;
 
