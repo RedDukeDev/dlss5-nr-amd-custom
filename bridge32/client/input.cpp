@@ -160,16 +160,45 @@ HRESULT WINAPI hk_create(HINSTANCE instance, DWORD version, REFIID riid, LPVOID 
 
 } // namespace
 
-// Windows' own system DLLs leave a two-byte no-op in front of every function and five bytes of
-// padding before it, for exactly this: a short jump back into the padding, which holds a jump to the
-// hook, and the function itself runs again from past the no-op.
+// Hooking DirectInput8Create, whatever is there already. A game's overlays (Steam's, Uplay's) and a second
+// copy of this client may have hooked it before: a jump at its entry, or the jump in the padding before
+// it that Windows' hot-patch slot is for. Their jump is followed, not replaced: the displacement of that
+// jump is pointed at the hook here, which goes on to wherever it pointed.
 bool install() {
     HMODULE dll = LoadLibraryW(L"dinput8.dll");
     if (!dll) return false;
     uint8_t *f = (uint8_t *)GetProcAddress(dll, "DirectInput8Create");
     if (!f) return false;
+    DWORD old;
+
+    // A jump at the entry already: somebody's hook.
+    if (f[0] == 0xE9) {
+        uint8_t *target = f + 5 + *(int32_t *)(f + 1);
+        if (!VirtualProtect(f, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+        g_create = (Create_t)target;
+        *(int32_t *)(f + 1) = (int32_t)((uint8_t *)hk_create - (f + 5));
+        VirtualProtect(f, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), f, 5);
+        bridge_log("input: DirectInput8Create hooked, after another hook (a jump at its entry)");
+        return true;
+    }
+    // The hot-patch slot, already used: a short jump back into the padding, which holds a jump.
+    if (f[0] == 0xEB && f[1] == 0xF9 && f[-5] == 0xE9) {
+        uint8_t *slot = f - 5;
+        uint8_t *target = slot + 5 + *(int32_t *)(slot + 1);
+        if (!VirtualProtect(slot, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+        g_create = (Create_t)target;
+        *(int32_t *)(slot + 1) = (int32_t)((uint8_t *)hk_create - (slot + 5));
+        VirtualProtect(slot, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), slot, 5);
+        bridge_log("input: DirectInput8Create hooked, after another hook (in the hot-patch slot)");
+        return true;
+    }
+    // The free hot-patch slot: Windows' own system DLLs leave a two-byte no-op in front of every function
+    // and five bytes of padding before it, for exactly this: a short jump back into the padding, which
+    // holds a jump to the hook, and the function itself runs again from past the no-op.
     if (f[0] != 0x8B || f[1] != 0xFF) {
-        bridge_log("input: DirectInput8Create has no hot-patch slot (%02x %02x), the menu will not get the mouse", f[0], f[1]);
+        bridge_log("input: DirectInput8Create starts with %02x %02x: not a place this can hook, the menu will not get the mouse", f[0], f[1]);
         return false;
     }
     for (int i = 1; i <= 5; ++i)
@@ -177,7 +206,6 @@ bool install() {
             bridge_log("input: DirectInput8Create has no padding before it");
             return false;
         }
-    DWORD old;
     if (!VirtualProtect(f - 5, 7, PAGE_EXECUTE_READWRITE, &old)) return false;
     g_create = (Create_t)(f + 2);
     f[-5] = 0xE9;

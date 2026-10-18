@@ -108,21 +108,23 @@ def package_dxvk(out):
 
 
 def package_bridge(out):
-    """The 32-bit bridge: its client goes to bridge32\\ (setup_windows.bat copies it beside a 32-bit game
-    as d3d9.dll), its host beside the runtime, where the client looks for it. Built with
-    bridge32\\build.py."""
+    """The 32-bit bridge: its two clients go to bridge32\\ (setup_windows.bat copies them beside a 32-bit
+    game as d3d9.dll, for Direct3D 9, and dxgi.dll, for Direct3D 10 and 11), its host beside the runtime,
+    where the clients look for it. Built with bridge32\\build.py."""
     bridge = os.path.join(ROOT, "bridge32")
     client = os.path.join(bridge, "build", "x86", "d3d9.dll")
+    client_dxgi = os.path.join(bridge, "build", "x86_dxgi", "dxgi.dll")
     host = os.path.join(bridge, "build", "x64", "dlss5nr_host.exe")
-    missing = [b for b in (client, host) if not os.path.isfile(b)]
+    missing = [b for b in (client, client_dxgi, host) if not os.path.isfile(b)]
     if missing:
         print("warning: the 32-bit bridge is not built (python bridge32/build.py), so it is left out: missing %s"
               % ", ".join(os.path.basename(m) for m in missing))
         return
     sources = max(newest(os.path.join(bridge, "client")), newest(os.path.join(bridge, "host")), newest(os.path.join(bridge, "common")))
-    if any(os.path.getmtime(b) < sources for b in (client, host)):
+    if any(os.path.getmtime(b) < sources for b in (client, client_dxgi, host)):
         print("warning: the bridge's sources changed after it was built: run python bridge32/build.py again")
     copy(client, os.path.join(out, "bridge32", "d3d9.dll"))
+    copy(client_dxgi, os.path.join(out, "bridge32", "dxgi.dll"))
     copy(os.path.join(bridge, "README.txt"), os.path.join(out, "bridge32", "README.txt"))
     copy(host, os.path.join(out, "OptiScaler", "dlss5nr", "dlss5nr_host.exe"))
     print("packaged the 32-bit bridge into %s" % os.path.join(out, "bridge32"))

@@ -4,6 +4,7 @@ r"""Builds the bridge for 32-bit games with MSVC.
     python build.py
 
 Output:
+    build\x86_dxgi\dxgi.dll   the client for Direct3D 10 and 11 games
     build\x86\d3d9.dll            the client, for a 32-bit game's folder
     build\x64\dlss5nr_host.exe    the host, which goes beside dlss5nr_runtime.dll
 
@@ -44,7 +45,8 @@ def compile_shaders():
     for name, profile, variable in (("gain_plain", "ps_2_0", "kGainPlain"), ("gain_mc", "ps_2_0", "kGainMc"),
                                     ("down", "ps_2_0", "kDown"), ("me_coarse", "ps_3_0", "kMeCoarse"),
                                     ("me_refine", "ps_3_0", "kMeRefine"), ("me_median", "ps_3_0", "kMeMedian"),
-                                    ("quad_vs", "vs_3_0", "kQuadVs")):
+                                    ("quad_vs", "vs_3_0", "kQuadVs"), ("dx11_vs", "vs_4_0", "kDx11Vs"),
+                                    ("dx11_down_ps", "ps_4_0", "kDx11DownPs"), ("dx11_apply_ps", "ps_4_0", "kDx11ApplyPs")):
         result = subprocess.run([found[-1], "-nologo", "-T", profile, "-E", "main", "-Fh", name + ".h", "-Vn", variable, name + ".hlsl"],
                                 cwd=folder, capture_output=True, text=True)
         if result.returncode != 0:
@@ -54,11 +56,15 @@ def compile_shaders():
 
 compile_shaders()
 imgui = os.path.join(ROOT, "third_party", "imgui")
-client = [os.path.join(ROOT, "client", name) for name in ("d3d9_client.cpp", "menu.cpp", "motion.cpp", "input.cpp")]
+client = [os.path.join(ROOT, "client", name) for name in ("d3d9_client.cpp", "core.cpp", "menu.cpp", "menu_dx9.cpp", "motion.cpp", "input.cpp")]
 client += [os.path.join(imgui, name) for name in (
     "imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "imgui_impl_dx9.cpp")]
 run("x86", "x86", 'cl %s /I"%s" /LD %s /Fe:d3d9.dll /link /OPT:REF kernel32.lib user32.lib gdi32.lib imm32.lib dwmapi.lib' %
     (common, imgui, " ".join('"%s"' % f for f in client)))
+dxgi = [os.path.join(ROOT, "client", name) for name in ("dxgi_client.cpp", "dx11_overlay.cpp", "core.cpp", "menu.cpp", "menu_dx11.cpp", "input.cpp")]
+dxgi += [os.path.join(imgui, name) for name in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "imgui_impl_dx11.cpp")]
+run("x86", "x86_dxgi", 'cl %s /I"%s" /LD %s /Fe:dxgi.dll /link /OPT:REF kernel32.lib user32.lib gdi32.lib d3dcompiler.lib dxguid.lib' %
+    (common, imgui, " ".join('"%s"' % f for f in dxgi)))
 run("x86", "x86_test", 'cl %s /Fe:me_test.exe "%s" "%s" /link /OPT:REF d3d9.lib user32.lib' %
     (common, os.path.join(ROOT, "tests", "me_test.cpp"), os.path.join(ROOT, "client", "motion.cpp")))
 run("x64", "x64", 'cl %s "%s" /Fe:dlss5nr_host.exe /link /OPT:REF d3d12.lib dxgi.lib' %

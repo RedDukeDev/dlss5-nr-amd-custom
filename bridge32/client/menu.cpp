@@ -3,7 +3,6 @@
 #include <string.h>
 #include <algorithm>
 #include "imgui.h"
-#include "imgui_impl_dx9.h"
 #include <windowsx.h>
 
 namespace menu {
@@ -13,7 +12,6 @@ bool g_inited = false;
 bool g_open = false;
 HWND g_window = nullptr;
 WNDPROC g_original = nullptr;
-IDirect3DDevice9 *g_device = nullptr;
 // The menu's own mouse. Games that read the mouse through DirectInput send no mouse messages and
 // keep the cursor of Windows still, so the cursor here is a virtual one: DirectInput moves it
 // (feed_mouse), or else, for a game that does send messages, the window does.
@@ -151,6 +149,7 @@ void draw(const Status &status, float scale) {
 
     {
         BridgeOptions &options = bridge_options();
+        if (status.mask_available) {
         if (ImGui::Checkbox("Reduce trailing##nr", &options.reduceTrailing))
             put(L"BridgeReduceTrailing", options.reduceTrailing ? L"true" : L"false", true);
         tooltip("A result is a few frames old when it arrives. Applied to a scene that has moved since,\n"
@@ -173,6 +172,7 @@ void draw(const Status &status, float scale) {
                     "trail, but also the effect on slow movement; higher keeps more of both");
         }
         ImGui::EndDisabled();
+        }
         slider("Temporal smoothing##nr", L"BridgeSmoothing", user.smoothing, eff.smoothing, 0.0f, 1.0f);
         tooltip("The network decides some of its detail and tone anew with every picture, which shows as a\n"
                 "flicker. Where the game's picture has not changed since the last one, this holds back that\n"
@@ -268,23 +268,17 @@ void draw(const Status &status, float scale) {
 
 } // namespace
 
-void init(IDirect3DDevice9 *device, HWND window) {
-    if (!g_inited) {
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO &io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.LogFilename = nullptr;
-        ImGui::StyleColorsDark();
-        g_window = window;
-        g_original = (WNDPROC)SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)window_proc);
-        g_inited = true;
-    }
-    if (g_device != device) {
-        if (g_device) ImGui_ImplDX9_Shutdown();
-        ImGui_ImplDX9_Init(device);
-        g_device = device;
-    }
+void attach(HWND window) {
+    if (g_inited) return;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    ImGui::StyleColorsDark();
+    g_window = window;
+    g_original = (WNDPROC)SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)window_proc);
+    g_inited = true;
 }
 
 bool visible() { return g_open; }
@@ -302,17 +296,9 @@ void open() {
     if (!g_open) toggle();
 }
 
-void device_lost() {
-    if (g_inited && g_device) ImGui_ImplDX9_InvalidateDeviceObjects();
-}
-
-void device_restored() {
-    if (g_inited && g_device) ImGui_ImplDX9_CreateDeviceObjects();
-}
-
-void frame(IDirect3DDevice9 *device, unsigned width, unsigned height, const Status &status) {
-    if (!g_inited || !g_open) return;
-    ImGui_ImplDX9_NewFrame();
+bool begin(unsigned width, unsigned height, const Status &status, void (*new_frame)()) {
+    if (!g_inited || !g_open) return false;
+    new_frame();
     ImGuiIO &io = ImGui::GetIO();
     g_width = width;
     g_height = height;
@@ -354,18 +340,12 @@ void frame(IDirect3DDevice9 *device, unsigned width, unsigned height, const Stat
 
     ImGui::NewFrame();
     draw(status, scale);
-    ImGui::Render();
+    return true;
+}
 
-    IDirect3DSurface9 *back = nullptr, *target = nullptr;
-    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) return;
-    device->GetRenderTarget(0, &target);
-    if (target != back) device->SetRenderTarget(0, back);
-    device->BeginScene();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
-    device->EndScene();
-    if (target != back) device->SetRenderTarget(0, target);
-    if (target) target->Release();
-    back->Release();
+void *end() {
+    ImGui::Render();
+    return ImGui::GetDrawData();
 }
 
 } // namespace menu

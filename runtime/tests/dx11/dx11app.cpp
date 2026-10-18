@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
     DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferDesc.Width = W; sd.BufferDesc.Height = H; sd.BufferDesc.Format = format;
     sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT; sd.BufferCount = 2;
     sd.OutputWindow = hwnd; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    // An sRGB swap chain is not allowed in the flip model: the bit-block one stands in for it.
+    if (!strcmp(fmt, "srgb")) { sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; sd.BufferCount = 1; }
     IDXGISwapChain *sc; if (FAILED(factory->CreateSwapChain(dev, &sd, &sc))) return 3;
     ID3D11Texture2D *bb; sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **) &bb);
     D3D11_RENDER_TARGET_VIEW_DESC rd = {}; rd.Format = format; rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
