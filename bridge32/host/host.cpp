@@ -242,6 +242,23 @@ void apply_settings(const bridge::Settings &user, dlss5nr_settings &s) {
     i(user.preset, s.network_preset);
 }
 
+// What the runtime is running with, for the client's menu to show where the user chose nothing.
+void fill_effective(const dlss5nr_settings &s, bridge::Settings &e) {
+    e.enabled = 1;
+    e.resolutionScale = s.resolution_scale;
+    e.style = s.style;
+    e.intensity = s.intensity;
+    e.localTone = s.local_tone;
+    e.localStructure = s.local_structure;
+    e.skinStructure = s.skin_structure;
+    e.detailStrength = s.detail_strength;
+    e.colourStrength = s.colour_strength;
+    e.maxRatio = s.max_ratio;
+    e.passes = s.passes;
+    e.keepLocalTone = s.keep_local_tone;
+    e.preset = s.network_preset;
+}
+
 // What the host needs of the runtime, whatever the user chose: the frame waits for the
 // network and carries nothing along (there are no motion vectors), because the result is
 // turned into a gain and applied by the client to a later frame.
@@ -354,6 +371,7 @@ int wmain(int argc, wchar_t **argv) {
         apply_settings(h->settings, settings);
         force_settings(settings);
         rt.set_settings(nr, &settings);
+        fill_effective(settings, h->effective);
         seen_settings = h->settingsSeq;
         log("settings: scale %.2f, detail %.2f, colour %.2f, preset %d", settings.resolution_scale,
             settings.detail_strength, settings.colour_strength, settings.network_preset);
@@ -476,6 +494,10 @@ int wmain(int argc, wchar_t **argv) {
         h->resultWidth = w;
         h->resultHeight = hh;
         h->evaluationMs = status.evaluation_ms;
+        h->evaluationsPerSecond = status.evaluations_per_second;
+        h->networkWidth = status.network_width;
+        h->networkHeight = status.network_height;
+        h->nativeKernels = status.native_kernels;
         InterlockedIncrement(&h->resultSeq);
         ++cycles;
         if (cycles <= 3 || cycles % 20 == 0)

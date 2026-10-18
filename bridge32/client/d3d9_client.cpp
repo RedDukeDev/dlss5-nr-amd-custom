@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include "../common/protocol.h"
+#include "menu.h"
 
 namespace {
 
@@ -95,6 +96,7 @@ bool load_real() {
 struct Config {
     bool enabled = false;
     std::wstring host;       // the host's path
+    bool open_menu = false;  // BridgeDebugOpenMenu: the menu starts open
     int dump_frame = 0;      // DebugDumpFrame: write the frame before and after the gain to bmp files
     bridge::Settings settings{};
     FILETIME stamp{};
@@ -144,6 +146,7 @@ bool read_config() {
     GetPrivateProfileStringW(L"NeuralRendering", L"BridgeHost", L"", host, MAX_PATH, g_config.ini.c_str());
     g_config.host = host;
     g_config.dump_frame = read_int(L"BridgeDebugDumpFrame", 0);
+    g_config.open_menu = read_int(L"BridgeDebugOpenMenu", 0) != 0;
     return true;
 }
 
@@ -304,6 +307,8 @@ struct Overlay {
     IDirect3DStateBlock9 *state = nullptr;
     bool have_gain = false;
     bool broken = false;
+    HWND window = nullptr;
+    bool menu_ready = false;
     unsigned frames = 0;
     unsigned sent = 0, applied = 0;
     DWORD last_report = 0;
@@ -526,16 +531,9 @@ void dump_backbuffer(IDirect3DDevice9 *device, const wchar_t *name) {
     back->Release();
 }
 
-void on_present(IDirect3DDevice9 *device) {
+void run_bridge(IDirect3DDevice9 *device) {
     Overlay &o = g_overlay;
     if (o.broken) return;
-    if (read_config() && g_bridge.header) {
-        g_bridge.header->settings = g_config.settings;
-        InterlockedIncrement(&g_bridge.header->settingsSeq);
-    }
-    if (!g_config.enabled) return;
-    if (o.device && o.device != device) return;   // one device is enhanced: the first
-    if (!o.device) o.device = device;
     if (!o.system) {
         if (!setup(device)) return;
     }
@@ -589,6 +587,46 @@ void on_present(IDirect3DDevice9 *device) {
     }
 }
 
+void on_present(IDirect3DDevice9 *device) {
+    Overlay &o = g_overlay;
+    // While the menu is open its edits are the truth, not the file.
+    if (!menu::visible() && read_config() && g_bridge.header) {
+        g_bridge.header->settings = g_config.settings;
+        InterlockedIncrement(&g_bridge.header->settingsSeq);
+    }
+    if (o.device && o.device != device) return;   // one device is enhanced: the first
+    if (!o.device) {
+        o.device = device;
+        D3DDEVICE_CREATION_PARAMETERS cp;
+        if (SUCCEEDED(device->GetCreationParameters(&cp))) o.window = cp.hFocusWindow;
+    }
+    // The menu is there whether or not the effect is on: it is how it gets turned on.
+    if (!o.menu_ready && o.window) {
+        menu::init(device, o.window);
+        o.menu_ready = true;
+        if (g_config.open_menu) menu::open();
+    }
+    if (g_config.enabled) run_bridge(device);
+
+    if (menu::visible()) {
+        IDirect3DSurface9 *back = nullptr;
+        D3DSURFACE_DESC desc = {};
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) {
+            back->GetDesc(&desc);
+            back->Release();
+            menu::Status status = {};
+            status.enabled = g_config.enabled;
+            status.header = g_bridge.started && !g_bridge.failed ? g_bridge.header : nullptr;
+            status.frames = o.frames;
+            status.sent = o.sent;
+            status.applied = o.applied;
+            status.problem = o.broken && !status.header ? "The bridge cannot run here: see dlss5nr_bridge.log" : nullptr;
+            menu::frame(device, desc.Width, desc.Height, status);
+            if (g_config.dump_frame > 0 && o.frames == (unsigned)g_config.dump_frame && o.system) dump_backbuffer(device, L"dump_menu.bmp");
+        }
+    }
+}
+
 HRESULT STDMETHODCALLTYPE hk_present(IDirect3DDevice9 *device, const RECT *a, const RECT *b, HWND w, const RGNDATA *c) {
     Originals *o = find_device(device);
     on_present(device);
@@ -603,14 +641,24 @@ HRESULT STDMETHODCALLTYPE hk_present_ex(IDirect3DDevice9Ex *device, const RECT *
 
 HRESULT STDMETHODCALLTYPE hk_reset(IDirect3DDevice9 *device, D3DPRESENT_PARAMETERS *p) {
     Originals *o = find_device(device);
-    if (g_overlay.device == device) g_overlay.release();
-    return o->reset(device, p);
+    if (g_overlay.device == device) {
+        g_overlay.release();
+        menu::device_lost();
+    }
+    const HRESULT hr = o->reset(device, p);
+    if (SUCCEEDED(hr) && g_overlay.device == device) menu::device_restored();
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_reset_ex(IDirect3DDevice9Ex *device, D3DPRESENT_PARAMETERS *p, D3DDISPLAYMODEEX *m) {
     Originals *o = find_device(device);
-    if (g_overlay.device == device) g_overlay.release();
-    return o->reset_ex(device, p, m);
+    if (g_overlay.device == device) {
+        g_overlay.release();
+        menu::device_lost();
+    }
+    const HRESULT hr = o->reset_ex(device, p, m);
+    if (SUCCEEDED(hr) && g_overlay.device == device) menu::device_restored();
+    return hr;
 }
 
 void hook_device(IDirect3DDevice9 *device, bool ex) {
@@ -676,6 +724,18 @@ void start_logging() {
 }
 
 } // namespace
+
+// What the menu changes goes to the host at once and, when it is final, to OptiScaler.ini.
+bridge::Settings &bridge_user_settings() { return g_config.settings; }
+
+void bridge_setting_changed(const wchar_t *key, const wchar_t *text, bool save) {
+    g_config.enabled = g_config.settings.enabled != 0;
+    if (g_bridge.header) {
+        g_bridge.header->settings = g_config.settings;
+        InterlockedIncrement(&g_bridge.header->settingsSeq);
+    }
+    if (save) WritePrivateProfileStringW(L"NeuralRendering", key, text, g_config.ini.c_str());
+}
 
 // ------------------------------------------------------------------ the exports
 

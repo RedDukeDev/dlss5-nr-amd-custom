@@ -31,9 +31,13 @@ def run(arch, out_dir, command):
         sys.exit("build failed: %s" % out_dir)
 
 
-common = "/nologo /O2 /MT /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
-run("x86", "x86", 'cl %s /LD "%s" /Fe:d3d9.dll /link /OPT:REF kernel32.lib user32.lib' %
-    (common, os.path.join(ROOT, "client", "d3d9_client.cpp")))
+common = "/nologo /O2 /MT /EHsc /std:c++17 /utf-8 /W3 /DUNICODE /D_UNICODE /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
+imgui = os.path.join(ROOT, "third_party", "imgui")
+client = [os.path.join(ROOT, "client", "d3d9_client.cpp"), os.path.join(ROOT, "client", "menu.cpp")]
+client += [os.path.join(imgui, name) for name in (
+    "imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "imgui_impl_dx9.cpp", "imgui_impl_win32.cpp")]
+run("x86", "x86", 'cl %s /I"%s" /LD %s /Fe:d3d9.dll /link /OPT:REF kernel32.lib user32.lib gdi32.lib imm32.lib dwmapi.lib' %
+    (common, imgui, " ".join('"%s"' % f for f in client)))
 run("x64", "x64", 'cl %s "%s" /Fe:dlss5nr_host.exe /link /OPT:REF d3d12.lib dxgi.lib' %
     (common, os.path.join(ROOT, "host", "host.cpp")))
 print("built")

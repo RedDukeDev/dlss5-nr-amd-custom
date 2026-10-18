@@ -27,3 +27,9 @@ The OkLab conversion uses the matrices published by Bjorn Ottosson
 (https://github.com/doitsujin/dxvk, zlib licence, in `dxvk/LICENSE`), unmodified, as released.
 They are shipped so that Direct3D 9 and 10 games can run on Vulkan and use the neural rendering;
 `dxvk/README.txt` says where they come from and how to check them.
+
+## Dear ImGui
+
+`bridge32/third_party/imgui` is Dear ImGui 1.92.0 by Omar Cornut (https://github.com/ocornut/imgui,
+tag v1.92.0, MIT licence in `LICENSE.txt` there), with its DirectX 9 and Win32 backends, unmodified.
+It draws the menu of the 32-bit bridge, the same library OptiScaler's menu uses.

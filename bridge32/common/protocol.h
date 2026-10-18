@@ -15,7 +15,7 @@
 namespace bridge {
 
 constexpr uint32_t kMagic = 0x42524E44; // 'DNRB'
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr uint32_t kHeaderBytes = 4096;
 constexpr uint32_t kMaxWidth = 4096, kMaxHeight = 2304;
 constexpr uint32_t kAlign = 65536;
@@ -55,7 +55,11 @@ struct Header {
     volatile long shutdown;    // the client is going away
 
     float evaluationMs;           // the network's last run, from the host
-    Settings settings;
+    float evaluationsPerSecond;
+    uint32_t networkWidth, networkHeight;
+    uint32_t nativeKernels;
+    Settings settings;            // what the user set: kAuto where nothing was
+    Settings effective;           // what the host runs with, the defaults filled in
     char message[256];
 };
 
