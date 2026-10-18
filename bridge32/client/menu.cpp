@@ -4,9 +4,7 @@
 #include <algorithm>
 #include "imgui.h"
 #include "imgui_impl_dx9.h"
-#include "imgui_impl_win32.h"
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#include <windowsx.h>
 
 namespace menu {
 namespace {
@@ -16,24 +14,26 @@ bool g_open = false;
 HWND g_window = nullptr;
 WNDPROC g_original = nullptr;
 IDirect3DDevice9 *g_device = nullptr;
-int g_cursor_shown = 0;
+// The menu's own mouse. Games that read the mouse through DirectInput send no mouse messages and
+// keep the cursor of Windows still, so the cursor here is a virtual one: DirectInput moves it
+// (feed_mouse), or else, for a game that does send messages, the window does.
 float g_scale = 0.0f;
+float g_mx = 0.0f, g_my = 0.0f;
+unsigned g_buttons = 0, g_buttons_seen = 0;
+float g_wheel = 0.0f;
+bool g_directinput = false;
+bool g_message_mouse = false;
+float g_message_x = 0.0f, g_message_y = 0.0f;
+unsigned g_width = 0, g_height = 0;
+LARGE_INTEGER g_last_time = {};
 
 void toggle() {
     g_open = !g_open;
-    if (g_open) {
-        // The game may have hidden the cursor and confined it to its window.
-        ClipCursor(nullptr);
-        int count;
-        do {
-            count = ShowCursor(TRUE);
-            ++g_cursor_shown;
-        } while (count < 0 && g_cursor_shown < 32);
-    } else {
-        while (g_cursor_shown > 0) {
-            ShowCursor(FALSE);
-            --g_cursor_shown;
-        }
+    g_buttons = 0;
+    g_wheel = 0.0f;
+    if (g_open && g_width) {
+        g_mx = g_width / 2.0f;
+        g_my = g_height / 2.0f;
     }
 }
 
@@ -45,20 +45,29 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     if (message == WM_KEYUP && wparam == VK_INSERT) return 0;
     if (g_open) {
-        const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
         switch (message) {
         case WM_SETCURSOR:
-            if (handled) return handled;
-            break;
+            SetCursor(nullptr);
+            return TRUE;
         case WM_INPUT:
             return DefWindowProcW(window, message, wparam, lparam);
         case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
-        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
-        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
-        case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
+            g_message_mouse = true;
+            g_message_x = (float)GET_X_LPARAM(lparam);
+            g_message_y = (float)GET_Y_LPARAM(lparam);
+            return 0;
+        case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: g_buttons |= 1; return 0;
+        case WM_LBUTTONUP: g_buttons &= ~1u; return 0;
+        case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: g_buttons |= 2; return 0;
+        case WM_RBUTTONUP: g_buttons &= ~2u; return 0;
+        case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: g_buttons |= 4; return 0;
+        case WM_MBUTTONUP: g_buttons &= ~4u; return 0;
+        case WM_MOUSEWHEEL: g_wheel += (float)GET_WHEEL_DELTA_WPARAM(wparam) / 120.0f; return 0;
+        case WM_KEYDOWN: case WM_KEYUP: return 0;
+        case WM_CHAR:
+            if (wparam > 0 && wparam < 0x10000) ImGui::GetIO().AddInputCharacter((unsigned int)wparam);
+            return 0;
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK: case WM_MOUSEHWHEEL:
             return 0;
         }
     }
@@ -263,7 +272,6 @@ void init(IDirect3DDevice9 *device, HWND window) {
         io.LogFilename = nullptr;
         ImGui::StyleColorsDark();
         g_window = window;
-        ImGui_ImplWin32_Init(window);
         g_original = (WNDPROC)SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)window_proc);
         g_inited = true;
     }
@@ -275,6 +283,15 @@ void init(IDirect3DDevice9 *device, HWND window) {
 }
 
 bool visible() { return g_open; }
+
+void feed_mouse(long dx, long dy, long wheel, unsigned buttons, bool from_directinput) {
+    if (!g_open) return;
+    if (from_directinput) g_directinput = true;
+    g_mx += (float)dx;
+    g_my += (float)dy;
+    g_wheel += (float)wheel / 120.0f;
+    g_buttons = buttons;
+}
 
 void open() {
     if (!g_open) toggle();
@@ -291,16 +308,35 @@ void device_restored() {
 void frame(IDirect3DDevice9 *device, unsigned width, unsigned height, const Status &status) {
     if (!g_inited || !g_open) return;
     ImGui_ImplDX9_NewFrame();
-    ImGui_ImplWin32_NewFrame();
     ImGuiIO &io = ImGui::GetIO();
+    g_width = width;
+    g_height = height;
+    io.DisplaySize = ImVec2((float)width, (float)height);
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    io.DeltaTime = g_last_time.QuadPart ? std::max(1.0f / 1000.0f, (float)((double)(now.QuadPart - g_last_time.QuadPart) / (double)frequency.QuadPart)) : 1.0f / 60.0f;
+    g_last_time = now;
 
-    // The window's client area and the backbuffer need not be the same size: the mouse is in the
-    // first and the drawing in the second.
-    RECT client = {};
-    GetClientRect(g_window, &client);
-    const float cw = (float)std::max<LONG>(client.right, 1), ch = (float)std::max<LONG>(client.bottom, 1);
-    io.DisplayFramebufferScale = ImVec2((float)width / cw, (float)height / ch);
-
+    // Messages, for a game that sends them: the window's size and the backbuffer's need not be the same.
+    if (!g_directinput && g_message_mouse) {
+        RECT client = {};
+        GetClientRect(g_window, &client);
+        g_mx = g_message_x * (float)width / (float)std::max<LONG>(client.right, 1);
+        g_my = g_message_y * (float)height / (float)std::max<LONG>(client.bottom, 1);
+    }
+    g_mx = std::clamp(g_mx, 0.0f, (float)width - 1.0f);
+    g_my = std::clamp(g_my, 0.0f, (float)height - 1.0f);
+    io.MouseDrawCursor = true;
+    io.AddMousePosEvent(g_mx, g_my);
+    for (int i = 0; i < 3; ++i)
+        if (((g_buttons ^ g_buttons_seen) >> i) & 1) io.AddMouseButtonEvent(i, (g_buttons >> i) & 1);
+    g_buttons_seen = g_buttons;
+    if (g_wheel != 0.0f) {
+        io.AddMouseWheelEvent(0.0f, g_wheel);
+        g_wheel = 0.0f;
+    }
+    const float ch = (float)height;
     const float scale = std::clamp(ch / 1080.0f, 1.0f, 3.0f);
     if (scale != g_scale) {
         ImGuiStyle fresh;

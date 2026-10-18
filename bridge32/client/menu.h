@@ -39,4 +39,8 @@ void frame(IDirect3DDevice9 *device, unsigned width, unsigned height, const Stat
 void device_lost();
 void device_restored();
 
+// The mouse, from DirectInput (relative movement, the wheel, the buttons as a bit mask: 1 left, 2 right,
+// 4 middle): while the menu is open it is the menu's cursor that moves.
+void feed_mouse(long dx, long dy, long wheel, unsigned buttons, bool from_directinput);
+
 } // namespace menu

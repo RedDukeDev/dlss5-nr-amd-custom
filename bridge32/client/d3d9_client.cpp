@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <math.h>
 #include "../common/protocol.h"
+#include "input.h"
 #include "menu.h"
 #include "motion.h"
 #include "shaders/gain_mc.h"
@@ -942,6 +943,17 @@ void start_logging() {
 
 } // namespace
 
+// For the other parts of the client.
+void bridge_log(const char *format, ...) {
+    if (!g_log) return;
+    char text[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    log("%s", text);
+}
+
 // What the menu changes goes to the host at once and, when it is final, to OptiScaler.ini.
 bridge::Settings &bridge_user_settings() { return g_config.settings; }
 BridgeOptions &bridge_options() { return g_config.options; }
@@ -1000,6 +1012,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         g_self = instance;
         DisableThreadLibraryCalls(instance);
         start_logging();
+        input::install();
     } else if (reason == DLL_PROCESS_DETACH) {
         g_bridge.stop();
     }

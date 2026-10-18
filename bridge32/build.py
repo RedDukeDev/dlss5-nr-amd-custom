@@ -54,9 +54,9 @@ def compile_shaders():
 
 compile_shaders()
 imgui = os.path.join(ROOT, "third_party", "imgui")
-client = [os.path.join(ROOT, "client", name) for name in ("d3d9_client.cpp", "menu.cpp", "motion.cpp")]
+client = [os.path.join(ROOT, "client", name) for name in ("d3d9_client.cpp", "menu.cpp", "motion.cpp", "input.cpp")]
 client += [os.path.join(imgui, name) for name in (
-    "imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "imgui_impl_dx9.cpp", "imgui_impl_win32.cpp")]
+    "imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "imgui_impl_dx9.cpp")]
 run("x86", "x86", 'cl %s /I"%s" /LD %s /Fe:d3d9.dll /link /OPT:REF kernel32.lib user32.lib gdi32.lib imm32.lib dwmapi.lib' %
     (common, imgui, " ".join('"%s"' % f for f in client)))
 run("x86", "x86_test", 'cl %s /Fe:me_test.exe "%s" "%s" /link /OPT:REF d3d9.lib user32.lib' %
