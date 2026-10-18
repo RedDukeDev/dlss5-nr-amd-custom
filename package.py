@@ -11,9 +11,9 @@ the runtime there.
 --zluda      a ZLUDA build: its nvcuda.dll becomes zluda\\zluda_real.dll, and
              its nvapi64.dll comes along
 --optiscaler the OptiScaler fork's build output (OptiScaler.dll and its files),
-             copied to the top of the package. Its setup_linux.sh is then replaced
-             by the one in optiscaler\\, the version this repository points to: the
-             build output keeps the copy it was last built with.
+             copied to the top of the package. Its setup_linux.sh and setup_windows.bat
+             are then replaced by the ones in optiscaler\\, the version this repository
+             points to: the build output keeps the copies it was last built with.
 --runtime    where dlss5nr_runtime.dll, zluda\\nvcuda.dll (the gate) and zluda\\nvngx.dll
              come from: runtime\\build\\bin, the Visual Studio build, unless it is
              runtime\\build-mingw\\bin, the mingw-w64 one (runtime/build.sh). The cache
@@ -30,6 +30,9 @@ The Linux side (amdhip64_7.dll and libdlss5nr_hip_bridge.so from linux\\build, b
 with linux/build.sh, plus launch.sh and README.txt) goes into linux\\ beside
 OptiScaler.dll, where setup_linux.sh finds it. It is left out, with a warning, when
 it has not been built or its sources are newer than what was built.
+
+DXVK (dxvk\\, 64-bit) goes into dxvk\\ beside OptiScaler.dll, for setup_windows.bat to copy
+beside a Direct3D 9 or 10 game.
 
 The runtime (runtime\\build\\bin) and the native kernels (kernels\\, built with
 build_kernels.py) must be built first. Only the kernels the manifest names are
@@ -85,6 +88,20 @@ def package_linux(out):
     os.chmod(os.path.join(target, "launch.sh"), 0o755)
     os.chmod(os.path.join(target, "libdlss5nr_hip_bridge.so"), 0o755)
     print("packaged the Linux side into %s" % target)
+
+
+def package_dxvk(out):
+    """dist\\dxvk: DXVK, which lets Direct3D 9 and 10 games use the neural rendering (OptiScaler
+    has no support for those of its own). setup_windows.bat copies what a game needs from here
+    beside its executable, and Remove_OptiScaler.bat takes it away again. 64-bit only: so is
+    OptiScaler."""
+    dxvk = os.path.join(ROOT, "dxvk")
+    target = os.path.join(out, "dxvk")
+    for name in ("d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"):
+        copy(os.path.join(dxvk, "x64", name), os.path.join(target, "x64", name))
+    for name in ("LICENSE", "README.txt"):
+        copy(os.path.join(dxvk, name), os.path.join(target, name))
+    print("packaged DXVK into %s" % target)
 
 
 def make_scripts_executable(out):
@@ -169,13 +186,17 @@ def main():
                 shutil.copytree(source, os.path.join(args.out, name), dirs_exist_ok=True)
             else:
                 shutil.copy2(source, os.path.join(args.out, name))
-        setup = os.path.join(ROOT, "optiscaler", "setup_linux.sh")
-        if os.path.isfile(setup):
-            shutil.copy2(setup, os.path.join(args.out, "setup_linux.sh"))
+        # The setup scripts come from optiscaler\\, the version this repository points to: the
+        # build output keeps the copies it was last linked with.
+        for script in ("setup_linux.sh", "setup_windows.bat"):
+            setup = os.path.join(ROOT, "optiscaler", script)
+            if os.path.isfile(setup):
+                shutil.copy2(setup, os.path.join(args.out, script))
 
     for name in ("LICENSE", "THIRD_PARTY.md", "README.md"):
         copy(os.path.join(ROOT, name), os.path.join(target, name))
     package_linux(args.out)
+    package_dxvk(args.out)
     make_scripts_executable(args.out)
     print("packaged %d native kernels%s into %s"
           % (len(objects), "" if args.no_cache else " and the translation cache", args.out))

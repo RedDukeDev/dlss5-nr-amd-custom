@@ -17,6 +17,8 @@ dist/
 *.pdb
 *.ilk
 *.dll
+# DXVK, as released: shipped in the package (see dxvk/README.txt)
+!dxvk/x64/*.dll
 *.exe
 *.cso
 kernels/gfx12_emulated/

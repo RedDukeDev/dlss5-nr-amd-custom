@@ -43,7 +43,9 @@ Hardware-specific status:
 ## Requirements
 
 - Windows 10/11 or Linux, an AMD Radeon RX 9000 (RDNA4), RX 7000 (RDNA3) or RX 6000 (RDNA2). 
-- A game using DirectX 12, DirectX 11 or Vulkan (see *Direct3D 11* and *Vulkan* below)
+- A game using DirectX 12, DirectX 11 or Vulkan (see *Direct3D 11* and *Vulkan* below), or DirectX 9 or 10 through
+  DXVK, which is included (see *Older Direct3D* below)
+- A **64-bit** game. For now 32-bit games are not supported: OptiScaler and the network are 64-bit only.
 - The AMD HIP SDK for Windows, if using Windows.
 - ROCm if using Linux.
 
@@ -106,7 +108,7 @@ result is copied back. It costs the game about 0.2 to 0.3 ms a frame at 1080p. I
 game's upscaler, whichever of OptiScaler's Direct3D 11 backends is selected (the native FSR 2.2 and
 FSR 3.1 ones, or those running on Direct3D 12), before or after it as for Direct3D 12, and without one,
 on the finished image, as above. Tested on Windows with FSR 2.2, native and on Direct3D 12; not yet
-with a Direct3D 11 game under Proton (DXVK), nor with OptiScaler's frame generation.
+with OptiScaler's frame generation.
 
 ## Vulkan
 
@@ -130,8 +132,7 @@ output, and is what `auto` chooses. Set a native one, `fsr22` for instance, to g
 
 Tested on Windows with two small Vulkan programs (`runtime/tests/dx11/vkapp.cpp` and `vkngx.cpp`):
 BGRA8 and RGBA8 swapchains come back byte for byte at zero strength, and `ffx_12` and the default
-upscaler both hold 60 fps. Not tested yet: HDR swapchains, window resizing, DXVK and vkd3d-proton (these
-go through the DXGI path).
+upscaler both hold 60 fps. Not tested yet: HDR swapchains and window resizing.
 
 ## Older Direct3D (9 and 10)
 
@@ -141,15 +142,38 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
 
 - **Direct3D 9 with DXVK** works: with DXVK's `d3d9.dll` beside the game, the game is a Vulkan one, and
   the Vulkan way above enhances its image. OptiScaler goes in under a name the game loads that DXVK does
-  not use (`version.dll`, `winmm.dll`...). Tested on Windows with `runtime/tests/dx11/dx9app.cpp`: at zero
+  not use (`version.dll`). Tested on Windows with `runtime/tests/dx11/dx9app.cpp`: at zero
   strength the picture comes back byte for byte.
 - **Direct3D 10 with DXVK** (the files DXVK needs beside the game are `d3d10core.dll`, `d3d11.dll` and
   `dxgi.dll`) works too, on Windows, the same way: DXVK runs it as Direct3D 11, whose bridge cannot be used
   with it (the textures DXVK shares cannot be opened by the native Direct3D 12, and the driver crashes in
   it), so OptiScaler enhances its image at the Vulkan present instead. The same goes for a Direct3D 11 game
   running on DXVK on Windows. Tested with `runtime/tests/dx11/dx10app.cpp`. Under Wine (Proton) DXVK and
-  vkd3d-proton do share, and nothing is changed there; that is untested.
+  vkd3d-proton do share, so nothing is changed there.
 - Direct3D 9 and 10 **without DXVK** are not supported.
+- **Only 64-bit games**: OptiScaler is 64-bit, and so are the DXVK files in the package. A 32-bit game
+  cannot load either.
+
+### DXVK comes with the package
+
+DXVK 3.1.1 (zlib licence; the exact files and their hashes are listed in `dxvk/README.txt`) is in the
+`dxvk` folder of the package, so there is nothing to download. `setup_windows.bat` takes care of it:
+
+1. Run it in the game's folder as usual. It asks whether the game is Direct3D 9 or Direct3D 10 (answer 1,
+   the default, for Direct3D 11, 12 and Vulkan games, which do not need it).
+2. For 2 (Direct3D 9) it copies `d3d9.dll` beside the executable; for 3 (Direct3D 10), `dxgi.dll`,
+   `d3d10core.dll` and `d3d11.dll`. A different file of the same name that is already there is left alone,
+   with a warning.
+3. It installs OptiScaler as `version.dll` unless you choose another name; `dxgi.dll` is DXVK's, so that
+   one is refused.
+4. Turn on *Neural Rendering* in OptiScaler's menu (Insert) or in `OptiScaler.ini` as for any other game.
+
+`Remove_OptiScaler.bat` removes DXVK again, the files identical to those in the package only. On Linux
+(Proton) none of this applies: Proton already runs Direct3D 9 to 11 on DXVK.
+
+Tested on Windows end to end with `runtime/tests/dx11/dx9app.cpp` and `dx10app.cpp`: package, setup,
+a run with the neural rendering off and on (the image changes, the runtime is only loaded when it is on)
+and the removal, which leaves the folder as it was.
 
 ## Linux 
 
