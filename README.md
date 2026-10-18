@@ -133,6 +133,22 @@ BGRA8 and RGBA8 swapchains come back byte for byte at zero strength, and `ffx_12
 upscaler both hold 60 fps. Not tested yet: HDR swapchains, window resizing, DXVK and vkd3d-proton (these
 go through the DXGI path).
 
+## Older Direct3D (9 and 10)
+
+OptiScaler has no Direct3D 9 or 10 support of its own, and those games give no motion vectors (nor a
+depth that can be read) in any case: all there is is the finished image, so the result trails behind what
+moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that at a cost in frame rate).
+
+- **Direct3D 9 with DXVK** works: with DXVK's `d3d9.dll` beside the game, the game is a Vulkan one, and
+  the Vulkan way above enhances its image. OptiScaler goes in under a name the game loads that DXVK does
+  not use (`version.dll`, `winmm.dll`...). Tested on Windows with `runtime/tests/dx11/dx9app.cpp`: at zero
+  strength the picture comes back byte for byte.
+- **Direct3D 10 with DXVK** does not, on Windows: DXVK runs it as Direct3D 11, and the textures it shares
+  cannot be opened by the native Direct3D 12 the bridge needs (the driver crashes in it), so the neural
+  rendering stays off for it, with a line in the log. Under Wine (Proton) DXVK and vkd3d-proton do share;
+  that is untested.
+- Direct3D 9 and 10 **without DXVK** are not supported.
+
 ## Linux 
 
 The project also supports DX12 games running on Linux using Proton. 
