@@ -20,10 +20,9 @@ OptiScaler has no Direct3D 9 or Direct3D 10 support, so the neural rendering has
 those games. DXVK turns them into Vulkan (Direct3D 9) and Direct3D 11 (Direct3D 10) games, and OptiScaler
 then enhances their image at the Vulkan present.
 
-You do not copy these by hand: setup_windows.bat asks whether the game is Direct3D 9 or 10, copies
-the files that kind needs beside the game's executable (d3d9.dll for Direct3D 9; dxgi.dll,
-d3d10core.dll and d3d11.dll for Direct3D 10) and installs OptiScaler as version.dll, since dxgi.dll is
-DXVK's. Remove_OptiScaler.bat takes them away again, the ones identical to these only.
+You do not copy these by hand: setup_windows.bat asks whether the game is an old one, Direct3D 9 or
+10, copies all four beside the game's executable (the game loads the ones it uses) and installs
+OptiScaler as version.dll, since dxgi.dll is DXVK's. Remove_OptiScaler.bat takes them away again, the ones identical to these only.
 
 On Linux (Proton) none of this is needed: Proton already runs Direct3D 9 to 11 on DXVK.
 Only 64-bit games work: OptiScaler is 64-bit, and these are the 64-bit files.

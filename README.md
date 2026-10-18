@@ -159,11 +159,11 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
 DXVK 3.1.1 (zlib licence; the exact files and their hashes are listed in `dxvk/README.txt`) is in the
 `dxvk` folder of the package, so there is nothing to download. `setup_windows.bat` takes care of it:
 
-1. Run it in the game's folder as usual. It asks whether the game is Direct3D 9 or Direct3D 10 (answer 1,
+1. Run it in the game's folder as usual. It asks whether the game is an old one, Direct3D 9 or 10 (answer 1,
    the default, for Direct3D 11, 12 and Vulkan games, which do not need it).
-2. For 2 (Direct3D 9) it copies `d3d9.dll` beside the executable; for 3 (Direct3D 10), `dxgi.dll`,
-   `d3d10core.dll` and `d3d11.dll`. A different file of the same name that is already there is left alone,
-   with a warning.
+2. For 2 it copies `d3d9.dll`, `dxgi.dll`, `d3d10core.dll` and `d3d11.dll` beside the executable: the game
+   loads the ones it uses, so there is no need to know which of the two it is. A different file of the same
+   name that is already there is left alone, with a warning.
 3. It installs OptiScaler as `version.dll` unless you choose another name; `dxgi.dll` is DXVK's, so that
    one is refused.
 4. Turn on *Neural Rendering* in OptiScaler's menu (Insert) or in `OptiScaler.ini` as for any other game.
