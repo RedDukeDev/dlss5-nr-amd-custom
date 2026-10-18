@@ -217,6 +217,11 @@ Example:
 
 Make sure that the launch.sh script is executable.
 
+For 32-bit games (see *32-bit games* above) setup_linux.sh notices the executable is 32-bit and offers to install
+the bridge instead: `d3d9.dll` and `dxgi.dll` go beside the game (a DLL that was there is kept as `*_chain.dll`)
+and the launch option becomes `WINEDLLOVERRIDES="d3d9=n,b;dxgi=n,b" /path/to/linux/launch.sh %command%`, which the
+script prints. `--bridge=y|n` answers the question from the command line, and `remove_optiscaler.sh` takes it away.
+
 Note: some games, like for example Hogwarts Legacy, may need OverlayMenu=false in OptiScaler.ini to work on Linux
 
 ## Settings

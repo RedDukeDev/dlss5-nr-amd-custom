@@ -47,6 +47,18 @@ Installing
    dxgi if it is another.
 4. Start the game, open OptiScaler's menu (Insert) and turn on Neural Rendering.
 
+32-bit games
+------------
+OptiScaler is 64-bit and cannot run in a 32-bit game. When the executable is 32-bit, ./setup_linux.sh offers to
+install the 32-bit bridge instead (bridge32/README.txt says what it is): d3d9.dll and dxgi.dll are copied beside
+the executable (a DLL that was there is kept as d3d9_chain.dll or dxgi_chain.dll), and the launch option it
+prints is
+
+       WINEDLLOVERRIDES="d3d9=n,b;dxgi=n,b" "/path/to/the/game/folder/linux/launch.sh" %command%
+
+The bridge's helper (a 64-bit process, started with the game) finds the HIP bridge beside itself, in
+OptiScaler/dlss5nr. In the game, Insert opens the bridge's own menu. ./remove_optiscaler.sh takes it all away.
+
 launch.sh does the following, so none of it has to be set by hand:
 
 - preloads libdlss5nr_hip_bridge.so;
