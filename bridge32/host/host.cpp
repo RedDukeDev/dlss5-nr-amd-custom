@@ -265,6 +265,9 @@ void fill_effective(const dlss5nr_settings &s, bridge::Settings &e) {
 // turned into a gain and applied by the client to a later frame.
 void force_settings(dlss5nr_settings &s) {
     s.enabled = 1;
+    // The client sends the picture at the network's resolution already, and the gain it gets back is
+    // stretched over the frame: the runtime works at the size it is given.
+    s.resolution_scale = 1.0f;
     s.composition = DLSS5NR_COMPOSITION_RATIO;
     s.encoding = DLSS5NR_ENCODING_DISPLAY;
     s.wait_for_network = 1;
@@ -399,6 +402,7 @@ int wmain(int argc, wchar_t **argv) {
         force_settings(settings);
         rt.set_settings(nr, &settings);
         fill_effective(settings, h->effective);
+        h->effective.resolutionScale = h->settings.resolutionScale > bridge::kAutoFloat / 2 ? h->settings.resolutionScale : 1.0f;
         seen_settings = h->settingsSeq;
         log("settings: scale %.2f, detail %.2f, colour %.2f, preset %d", settings.resolution_scale,
             settings.detail_strength, settings.colour_strength, settings.network_preset);
@@ -462,6 +466,8 @@ int wmain(int argc, wchar_t **argv) {
         });
         frame.upload->Unmap(0, nullptr);
 
+        const auto t_swizzled = std::chrono::steady_clock::now();
+        int frames_run = 0;
         // The same picture until the network has answered for it: the first frame hands it
         // over, the ones after compose what comes back.
         rt.get_status(nr, &status);
@@ -495,6 +501,7 @@ int wmain(int argc, wchar_t **argv) {
             rt.present(nr, gpu.queue);
             rt.get_status(nr, &status);
             if (status.state == DLSS5NR_STATE_FAILED) return fail(status.message);
+            ++frames_run;
             composed = status.results > before;
             if (!composed) std::this_thread::sleep_for(std::chrono::milliseconds(2));
             if (h->shutdown || WaitForSingleObject(client, 0) == WAIT_OBJECT_0) return 0;
@@ -504,6 +511,7 @@ int wmain(int argc, wchar_t **argv) {
             continue;
         }
 
+        const auto t_network = std::chrono::steady_clock::now();
         // The last frame's output, back to the CPU.
         gpu.begin();
         barrier(gpu.cmd, frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -525,6 +533,7 @@ int wmain(int argc, wchar_t **argv) {
         // For testing: a slower network, to see what the client does with an old result.
         static const int delay_ms = GetEnvironmentVariableW(L"DLSS5NR_HOST_DELAY_MS", nullptr, 0) ? _wtoi(_wgetenv(L"DLSS5NR_HOST_DELAY_MS")) : 0;
         if (delay_ms > 0) Sleep(delay_ms);
+        const auto t_gain = std::chrono::steady_clock::now();
         memcpy(view + bridge::result_offset(w, hh), gain.data(), (size_t)w * hh * 8);
         h->resultWidth = w;
         h->resultHeight = hh;
@@ -536,9 +545,15 @@ int wmain(int argc, wchar_t **argv) {
         InterlockedIncrement(&h->resultSeq);
         SetEvent(result_event);
         ++cycles;
-        if (cycles <= 3 || cycles % 20 == 0)
-            log("cycle %u: %.0f ms (network %.0f ms), the gain reproduces the network's picture to %.2f steps rms", cycles,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), status.evaluation_ms, error);
+        if (cycles <= 3 || cycles % 20 == 0) {
+            const auto t_end = std::chrono::steady_clock::now();
+            auto ms = [](std::chrono::steady_clock::time_point x, std::chrono::steady_clock::time_point y) {
+                return std::chrono::duration<double, std::milli>(y - x).count();
+            };
+            log("cycle %u: %.0f ms = swizzle+upload %.0f, runtime (%d frames) %.0f, readback+gain %.0f, write %.0f; network %.0f ms; gain error %.2f steps rms",
+                cycles, ms(t0, t_end), ms(t0, t_swizzled), frames_run, ms(t_swizzled, t_network), ms(t_network, t_gain), ms(t_gain, t_end),
+                status.evaluation_ms, error);
+        }
     }
     log("the game ended; stopping");
     rt.destroy(nr);

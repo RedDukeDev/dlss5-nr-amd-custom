@@ -3,6 +3,7 @@
 // something that has moved, shows as a copy of the moving thing trailing behind it.
 //
 //   s0  the game's frame now
+//   s4  the same, at the size of the network's picture, for the comparison
 //   s1  the frame the network saw
 //   s2  the gain, as value / 2 (0.5 is a gain of 1)
 //   c0  xy: two texels in texture coordinates; z: the difference where the gain starts to fade;
@@ -10,10 +11,11 @@
 sampler2D frame_now : register(s0);
 sampler2D frame_seen : register(s1);
 sampler2D gain_map : register(s2);
+sampler2D frame_small : register(s4);
 float4 k : register(c0);
 
 float diff(float2 uv) {
-    float3 d = abs(tex2D(frame_now, uv).rgb - tex2D(frame_seen, uv).rgb);
+    float3 d = abs(tex2D(frame_small, uv).rgb - tex2D(frame_seen, uv).rgb);
     return max(max(d.r, d.g), d.b);
 }
 
