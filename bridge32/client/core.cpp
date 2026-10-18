@@ -42,6 +42,11 @@ void bridge_log(const char *format, ...) {
 
 void core_init(HMODULE self, const wchar_t *log_name) {
     g_self = self;
+    // This DLL is never unloaded. It patches the method tables of objects of the real DLL it loads (and of
+    // DirectInput's), and those stay patched: a game component that loads d3d9.dll, makes an object, and
+    // frees the library again would leave them pointing at code that is gone, and the next call would crash.
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&core_init, &pinned);
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(g_self, path, MAX_PATH);
     g_dir = path;
