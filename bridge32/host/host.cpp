@@ -17,6 +17,7 @@
 #include <string.h>
 #include <math.h>
 #include <algorithm>
+#include <stdlib.h>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -224,6 +225,8 @@ struct Frame {
 
 // ------------------------------------------------------------------ the settings
 
+float g_smoothing = bridge::kDefaultSmoothing;   // how much of a result's change is held back where the picture is still
+
 void apply_settings(const bridge::Settings &user, dlss5nr_settings &s) {
     dlss5nr_settings defaults = s;
     (void)defaults;
@@ -241,6 +244,7 @@ void apply_settings(const bridge::Settings &user, dlss5nr_settings &s) {
     i(user.passes, s.passes);
     i(user.keepLocalTone, s.keep_local_tone);
     i(user.preset, s.network_preset);
+    g_smoothing = user.smoothing > bridge::kAutoFloat / 2 ? std::min(1.0f, std::max(0.0f, user.smoothing)) : bridge::kDefaultSmoothing;
 }
 
 // What the runtime is running with, for the client's menu to show where the user chose nothing.
@@ -258,6 +262,7 @@ void fill_effective(const dlss5nr_settings &s, bridge::Settings &e) {
     e.passes = s.passes;
     e.keepLocalTone = s.keep_local_tone;
     e.preset = s.network_preset;
+    e.smoothing = g_smoothing;
 }
 
 // What the host needs of the runtime, whatever the user chose: the frame waits for the
@@ -302,9 +307,17 @@ template <class F> void parallel_rows(UINT rows, F fn) {
 // What the network did to each pixel, as a gain on the capture: out = in * gain. A small offset
 // keeps dark pixels, where one step of the 8-bit image is a large fraction, from producing wild
 // gains.
-// Returns the rms error, in 8-bit steps, between in * gain and the network's own output: what the
-// gain loses by being a gain (its clamp at kGainRange, its 16 bits, the offset).
-double compute_gain(const uint8_t *in, const uint8_t *out, UINT w, UINT h, UINT out_pitch, uint16_t *gain) {
+//
+// The gain is also steadied over time. The network decides some of its detail and tone anew with every
+// picture, so a picture that has hardly changed can still get a gain that has: that is the flicker.
+// `gain` holds the result of the last call, and where the picture is within a few steps of what it
+// was then (`previous`), the new gain moves it only part of the way; where the picture has changed,
+// all the way. `hold` is how much is held back in the pixels that have not changed at all.
+//
+// Returns the rms error, in 8-bit steps, between in * gain and the network's own output, before the
+// steadying: what the gain loses by being a gain (its clamp at kGainRange, its 16 bits, the offset).
+double compute_gain(const uint8_t *in, const uint8_t *previous, const uint8_t *out, UINT w, UINT h, UINT out_pitch, uint16_t *gain,
+                    float hold) {
     constexpr float kOffset = 2.0f;
     static float inverse[256];
     static bool ready = false;
@@ -312,23 +325,38 @@ double compute_gain(const uint8_t *in, const uint8_t *out, UINT w, UINT h, UINT 
         for (int v = 0; v < 256; ++v) inverse[v] = 1.0f / ((float)v + kOffset);
         ready = true;
     }
+    // How much of the new gain to take, by how much the pixel has changed: held back below kStill
+    // steps, taken whole from kMoved steps on.
+    constexpr int kStill = 2, kMoved = 12;
+    float take[256];
+    for (int d = 0; d < 256; ++d) {
+        const float t = d <= kStill ? 0.0f : d >= kMoved ? 1.0f : (float)(d - kStill) / (float)(kMoved - kStill);
+        take[d] = (1.0f - hold) + hold * t;
+    }
     const float scale = 65535.0f / bridge::kGainRange;
     double errors[8] = {};
     parallel_rows(h, [&](UINT first, UINT end, unsigned slot) {
         double error = 0.0;
         for (UINT y = first; y < end; ++y) {
             const uint8_t *a = in + (size_t)y * w * 4;
+            const uint8_t *p = previous ? previous + (size_t)y * w * 4 : nullptr;
             const uint8_t *b = out + (size_t)y * out_pitch;
             uint16_t *g = gain + (size_t)y * w * 4;
             for (UINT x = 0; x < w; ++x) {
+                float keep = 1.0f;   // how much of the new gain is taken
+                if (p) {
+                    int change = 0;
+                    for (int c = 0; c < 3; ++c) change = std::max(change, std::abs((int)a[4 * x + c] - (int)p[4 * x + c]));
+                    keep = take[change];
+                }
                 for (int c = 0; c < 3; ++c) {
                     float r = ((float)b[4 * x + c] + kOffset) * inverse[a[4 * x + c]];
                     if (r > bridge::kGainRange) r = bridge::kGainRange;
                     const uint16_t q = (uint16_t)(r * scale + 0.5f);
-                    g[4 * x + c] = q;
                     const float back = (float)a[4 * x + c] * (float)q / scale;
                     const float d = back - (float)b[4 * x + c];
                     error += (double)d * d;
+                    g[4 * x + c] = keep >= 1.0f ? q : (uint16_t)((float)g[4 * x + c] + ((float)q - (float)g[4 * x + c]) * keep + 0.5f);
                 }
                 g[4 * x + 3] = 65535;
             }
@@ -402,7 +430,7 @@ int wmain(int argc, wchar_t **argv) {
         force_settings(settings);
         rt.set_settings(nr, &settings);
         fill_effective(settings, h->effective);
-        h->effective.resolutionScale = h->settings.resolutionScale > bridge::kAutoFloat / 2 ? h->settings.resolutionScale : 1.0f;
+        h->effective.resolutionScale = h->settings.resolutionScale > bridge::kAutoFloat / 2 ? h->settings.resolutionScale : bridge::kDefaultScale;
         seen_settings = h->settingsSeq;
         log("settings: scale %.2f, detail %.2f, colour %.2f, preset %d", settings.resolution_scale,
             settings.detail_strength, settings.colour_strength, settings.network_preset);
@@ -428,6 +456,9 @@ int wmain(int argc, wchar_t **argv) {
 
     Frame frame;
     std::vector<uint16_t> gain;
+    std::vector<uint8_t> previous;    // the picture the last result was made from
+    bool previous_valid = false;
+    std::chrono::steady_clock::time_point previous_at;
     unsigned cycles = 0;
     for (;;) {
         InterlockedExchange(&h->hostReady, 1);
@@ -443,6 +474,7 @@ int wmain(int argc, wchar_t **argv) {
         if (w != frame.w || hh != frame.h) {
             if (!frame.make(gpu, w, hh)) return fail("could not create the frame's buffers");
             gain.assign((size_t)w * hh * 4, 0);
+            previous_valid = false;
             log("frame size %ux%u", w, hh);
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -526,8 +558,14 @@ int wmain(int argc, wchar_t **argv) {
         gpu.submit_and_wait();
         uint8_t *out = nullptr;
         frame.readback->Map(0, nullptr, (void **)&out);
-        const double error = compute_gain(frame.rgba.data(), out + frame.footprint.Offset, w, hh,
-                                          frame.footprint.Footprint.RowPitch, gain.data());
+        // The steadying needs the picture of the last result, close enough in time: not after a pause.
+        const bool have_previous = previous_valid && previous.size() == frame.rgba.size() &&
+                                   std::chrono::duration<double, std::milli>(t_swizzled - previous_at).count() < 600.0;
+        const double error = compute_gain(frame.rgba.data(), have_previous ? previous.data() : nullptr, out + frame.footprint.Offset, w, hh,
+                                          frame.footprint.Footprint.RowPitch, gain.data(), g_smoothing);
+        previous = frame.rgba;
+        previous_valid = true;
+        previous_at = t_swizzled;
         frame.readback->Unmap(0, nullptr);
 
         // For testing: a slower network, to see what the client does with an old result.

@@ -15,13 +15,21 @@
 namespace bridge {
 
 constexpr uint32_t kMagic = 0x42524E44; // 'DNRB'
-constexpr uint32_t kVersion = 5;
+constexpr uint32_t kVersion = 6;
 constexpr uint32_t kHeaderBytes = 4096;
 constexpr uint32_t kMaxWidth = 4096, kMaxHeight = 2304;
 constexpr uint32_t kAlign = 65536;
 
 // Gains are stored as value / kGainRange of the channel's range: 0.5 is a gain of 1.
 constexpr float kGainRange = 2.0f;
+
+// The network's resolution, as a fraction of the frame, when the user has not chosen one. The network's
+// cost follows its pixels, and so does what the bridge moves between the game and the host.
+constexpr float kDefaultScale = 0.5f;
+
+// How much of a result's change from the one before is held back where the picture has not changed
+// (0 none, 1 most), when the user has not chosen.
+constexpr float kDefaultSmoothing = 0.75f;
 
 // A setting the user left at "auto", for the host to leave at the runtime's default.
 constexpr float kAutoFloat = -1.0e9f;
@@ -36,6 +44,7 @@ struct Settings {
     float intensity, localTone, localStructure, skinStructure;
     float detailStrength, colourStrength, maxRatio;
     int32_t passes, keepLocalTone, preset;
+    float smoothing;
 };
 
 struct Header {

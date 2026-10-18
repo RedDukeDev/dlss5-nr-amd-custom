@@ -102,9 +102,10 @@ bool load_real() {
 struct Config {
     bool enabled = false;
     std::wstring host;       // the host's path
-    BridgeOptions options = {true, 0.025f, false, false};
+    BridgeOptions options = {true, 0.025f, true, false};
     bool open_menu = false;  // BridgeDebugOpenMenu: the menu starts open
-    int dump_frame = 0;      // DebugDumpFrame: write the frame before and after the gain to bmp files
+    int dump_frame = 0;
+    int dump_series = 0;     // BridgeDebugDumpSeries: this many frames in a row from dump_frame, as dump_s_NNN.bmp      // DebugDumpFrame: write the frame before and after the gain to bmp files
     bridge::Settings settings{};
     FILETIME stamp{};
     std::wstring ini;
@@ -148,15 +149,17 @@ bool read_config() {
     s.passes = read_int(L"Passes", bridge::kAutoInt);
     s.keepLocalTone = read_int(L"KeepLocalTone", bridge::kAutoInt);
     s.preset = read_int(L"Preset", bridge::kAutoInt);
+    s.smoothing = read_float(L"BridgeSmoothing", bridge::kAutoFloat);
     g_config.enabled = s.enabled != 0;
     wchar_t host[MAX_PATH] = {};
     GetPrivateProfileStringW(L"NeuralRendering", L"BridgeHost", L"", host, MAX_PATH, g_config.ini.c_str());
     g_config.host = host;
     g_config.dump_frame = read_int(L"BridgeDebugDumpFrame", 0);
+    g_config.dump_series = read_int(L"BridgeDebugDumpSeries", 0);
     g_config.open_menu = read_int(L"BridgeDebugOpenMenu", 0) != 0;
     g_config.options.reduceTrailing = read_int(L"BridgeReduceTrailing", 1) != 0;
     g_config.options.tolerance = read_float(L"BridgeTrailingTolerance", 0.025f);
-    g_config.options.wait = read_int(L"BridgeWaitForNetwork", 0) != 0;
+    g_config.options.wait = read_int(L"BridgeWaitForNetwork", 1) != 0;
     g_config.options.follow = read_int(L"BridgeFollowMotion", 0) != 0;
     return true;
 }
@@ -374,7 +377,7 @@ Overlay g_overlay;
 
 // The size the network works at: the user's resolution scale of the frame, in multiples of 8.
 void network_size(UINT w, UINT h, UINT &cw, UINT &ch) {
-    float scale = g_config.settings.resolutionScale > bridge::kAutoFloat / 2 ? g_config.settings.resolutionScale : 1.0f;
+    float scale = g_config.settings.resolutionScale > bridge::kAutoFloat / 2 ? g_config.settings.resolutionScale : bridge::kDefaultScale;
     scale = scale < 0.25f ? 0.25f : scale > 1.0f ? 1.0f : scale;
     if (scale >= 0.999f) {
         cw = w;
@@ -822,10 +825,22 @@ void run_bridge(IDirect3DDevice9 *device) {
     }
 
     const bool dump = g_config.dump_frame > 0 && o.frames == (unsigned)g_config.dump_frame;
+    const bool in_series = g_config.dump_series > 0 && g_config.dump_frame > 0 && o.frames >= (unsigned)g_config.dump_frame &&
+                           o.frames < (unsigned)(g_config.dump_frame + g_config.dump_series);
+    if (in_series) {
+        wchar_t name[64];
+        swprintf(name, 64, L"dump_p_%03u.bmp", o.frames - (unsigned)g_config.dump_frame);
+        dump_backbuffer(device, name);
+    }
     if (dump) dump_backbuffer(device, L"dump_plain.bmp");
     if (o.have_gain) {
         if (masked) draw_masked(device);
         else draw_gain(device);
+    }
+    if (in_series) {
+        wchar_t name[64];
+        swprintf(name, 64, L"dump_s_%03u.bmp", o.frames - (unsigned)g_config.dump_frame);
+        dump_backbuffer(device, name);
     }
     if (dump) {
         log_motion(device);

@@ -173,6 +173,11 @@ void draw(const Status &status, float scale) {
                     "trail, but also the effect on slow movement; higher keeps more of both");
         }
         ImGui::EndDisabled();
+        slider("Temporal smoothing##nr", L"BridgeSmoothing", user.smoothing, eff.smoothing, 0.0f, 1.0f);
+        tooltip("The network decides some of its detail and tone anew with every picture, which shows as a\n"
+                "flicker. Where the game's picture has not changed since the last one, this holds back that\n"
+                "much of the result's change from the one before; where it has, nothing is held back.\n"
+                "Higher is steadier, and slower to follow a slow fade");
         if (ImGui::Checkbox("Wait for the network##nr", &options.wait))
             put(L"BridgeWaitForNetwork", options.wait ? L"true" : L"false", true);
         tooltip("The game waits for the network on every frame and its answer is applied to that very\n"
