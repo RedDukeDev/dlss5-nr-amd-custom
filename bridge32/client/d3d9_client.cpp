@@ -15,6 +15,7 @@
 #include <vector>
 #include "../common/protocol.h"
 #include "menu.h"
+#include "gain_ps.h"
 
 namespace {
 
@@ -96,6 +97,7 @@ bool load_real() {
 struct Config {
     bool enabled = false;
     std::wstring host;       // the host's path
+    BridgeOptions options = {true, 0.025f, false};
     bool open_menu = false;  // BridgeDebugOpenMenu: the menu starts open
     int dump_frame = 0;      // DebugDumpFrame: write the frame before and after the gain to bmp files
     bridge::Settings settings{};
@@ -147,6 +149,9 @@ bool read_config() {
     g_config.host = host;
     g_config.dump_frame = read_int(L"BridgeDebugDumpFrame", 0);
     g_config.open_menu = read_int(L"BridgeDebugOpenMenu", 0) != 0;
+    g_config.options.reduceTrailing = read_int(L"BridgeReduceTrailing", 1) != 0;
+    g_config.options.tolerance = read_float(L"BridgeTrailingTolerance", 0.025f);
+    g_config.options.wait = read_int(L"BridgeWaitForNetwork", 0) != 0;
     return true;
 }
 
@@ -155,6 +160,7 @@ bool read_config() {
 struct Bridge {
     HANDLE mapping = nullptr;
     HANDLE capture_event = nullptr;
+    HANDLE result_event = nullptr;
     HANDLE job = nullptr;
     HANDLE process = nullptr;
     bridge::Header *header = nullptr;
@@ -175,7 +181,9 @@ struct Bridge {
         mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)(bytes >> 32), (DWORD)bytes, name);
         swprintf(name, 96, L"Local\\dlss5nr_bridge_capture_%lu", pid);
         capture_event = CreateEventW(nullptr, FALSE, FALSE, name);
-        if (!mapping || !capture_event) return fail("could not create the shared memory");
+        swprintf(name, 96, L"Local\\dlss5nr_bridge_result_%lu", pid);
+        result_event = CreateEventW(nullptr, FALSE, FALSE, name);
+        if (!mapping || !capture_event || !result_event) return fail("could not create the shared memory");
         header = (bridge::Header *)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, bridge::kHeaderBytes);
         if (!header) return fail("could not map the header");
         memset(header, 0, sizeof *header);
@@ -304,6 +312,11 @@ struct Overlay {
     IDirect3DSurface9 *system = nullptr;    // the capture lands here
     IDirect3DSurface9 *resolved = nullptr;  // the backbuffer resolved, when it is multisampled
     IDirect3DTexture9 *gain = nullptr;
+    IDirect3DTexture9 *copy_tex = nullptr;      // the frame now, for the masked pass to read
+    IDirect3DSurface9 *copy_surf = nullptr;
+    IDirect3DTexture9 *seen_tex = nullptr;      // the frame the network saw
+    IDirect3DPixelShader9 *mask_ps = nullptr;
+    bool mask_ok = false;
     IDirect3DStateBlock9 *state = nullptr;
     bool have_gain = false;
     bool broken = false;
@@ -317,8 +330,16 @@ struct Overlay {
         if (system) system->Release();
         if (resolved) resolved->Release();
         if (gain) gain->Release();
+        if (copy_surf) copy_surf->Release();
+        if (copy_tex) copy_tex->Release();
+        if (seen_tex) seen_tex->Release();
+        if (mask_ps) mask_ps->Release();
         if (state) state->Release();
         system = resolved = nullptr;
+        copy_surf = nullptr;
+        copy_tex = seen_tex = nullptr;
+        mask_ps = nullptr;
+        mask_ok = false;
         gain = nullptr;
         state = nullptr;
         have_gain = false;
@@ -370,6 +391,12 @@ bool setup(IDirect3DDevice9 *device) {
         o.broken = true;
         return false;
     }
+    // The masked pass: the frame now (a copy it can read), the frame the network saw, the shader.
+    o.mask_ok = SUCCEEDED(device->CreateTexture(o.w, o.h, 1, D3DUSAGE_RENDERTARGET, o.format, D3DPOOL_DEFAULT, &o.copy_tex, nullptr)) &&
+                SUCCEEDED(o.copy_tex->GetSurfaceLevel(0, &o.copy_surf)) &&
+                SUCCEEDED(device->CreateTexture(o.w, o.h, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &o.seen_tex, nullptr)) &&
+                SUCCEEDED(device->CreatePixelShader((const DWORD *)kGainPs, &o.mask_ps));
+    if (!o.mask_ok) log("overlay: the masked pass is not available here, trailing cannot be reduced");
     if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &o.state))) {
         log("overlay: no state block");
         o.broken = true;
@@ -381,12 +408,14 @@ bool setup(IDirect3DDevice9 *device) {
 }
 
 // The backbuffer into the shared memory.
-bool capture(IDirect3DDevice9 *device, uint8_t *to) {
+bool capture(IDirect3DDevice9 *device, uint8_t *to, bool from_copy) {
     Overlay &o = g_overlay;
     IDirect3DSurface9 *back = nullptr;
     if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) return false;
     IDirect3DSurface9 *source = back;
-    if (o.multisampled) {
+    if (from_copy) {
+        source = o.copy_surf;   // the frame was copied there, resolved, earlier in this frame
+    } else if (o.multisampled) {
         if (FAILED(device->StretchRect(back, nullptr, o.resolved, nullptr, D3DTEXF_NONE))) {
             back->Release();
             return false;
@@ -425,6 +454,79 @@ bool upload_gain(const uint8_t *from) {
     }
     o.gain->UnlockRect(0);
     return true;
+}
+
+// The frame the network saw, from the capture buffer, as the gain's partner.
+bool upload_seen(const uint8_t *from) {
+    Overlay &o = g_overlay;
+    D3DLOCKED_RECT rect;
+    if (FAILED(o.seen_tex->LockRect(0, &rect, nullptr, D3DLOCK_DISCARD))) return false;
+    for (UINT y = 0; y < o.h; ++y) memcpy((uint8_t *)rect.pBits + (size_t)y * rect.Pitch, from + (size_t)y * o.w * 4, (size_t)o.w * 4);
+    o.seen_tex->UnlockRect(0);
+    return true;
+}
+
+// The frame now times the gain, but only where it still looks as it did when the network saw it
+// (gain.hlsl).
+void draw_masked(IDirect3DDevice9 *device) {
+    Overlay &o = g_overlay;
+    IDirect3DSurface9 *back = nullptr, *target = nullptr, *depth = nullptr;
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) return;
+    device->GetRenderTarget(0, &target);
+    device->GetDepthStencilSurface(&depth);
+    o.state->Capture();
+    if (target != back) device->SetRenderTarget(0, back);
+    device->SetDepthStencilSurface(nullptr);
+
+    D3DVIEWPORT9 vp = {0, 0, o.w, o.h, 0.0f, 1.0f};
+    device->SetViewport(&vp);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(o.mask_ps);
+    device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
+    IDirect3DBaseTexture9 *textures[3] = {o.copy_tex, o.seen_tex, o.gain};
+    for (DWORD i = 0; i < 3; ++i) {
+        device->SetTexture(i, textures[i]);
+        device->SetSamplerState(i, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(i, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(i, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(i, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(i, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(i, D3DSAMP_SRGBTEXTURE, FALSE);
+    }
+    // The fade runs from the tolerance to a few times it.
+    const float low = g_config.options.tolerance, high = low * 4.0f + 0.04f;
+    const float k[4] = {2.0f / (float)o.w, 2.0f / (float)o.h, low, 1.0f / (high - low)};
+    device->SetPixelShaderConstantF(0, k, 1);
+
+    struct Vertex {
+        float x, y, z, rhw, u, v;
+    };
+    const float l = -0.5f, t = -0.5f, r = (float)o.w - 0.5f, b = (float)o.h - 0.5f;
+    const Vertex quad[4] = {{l, t, 0.0f, 1.0f, 0.0f, 0.0f},
+                            {r, t, 0.0f, 1.0f, 1.0f, 0.0f},
+                            {l, b, 0.0f, 1.0f, 0.0f, 1.0f},
+                            {r, b, 0.0f, 1.0f, 1.0f, 1.0f}};
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    device->BeginScene();
+    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
+    device->EndScene();
+
+    o.state->Apply();
+    if (target != back) device->SetRenderTarget(0, target);
+    device->SetDepthStencilSurface(depth);
+    if (depth) depth->Release();
+    if (target) target->Release();
+    back->Release();
 }
 
 // dest = dest * gain: the blend factors give src * dest + dest * src, which is twice the
@@ -551,30 +653,57 @@ void run_bridge(IDirect3DDevice9 *device) {
     if (h->hostState != bridge::kRunning) return;
     if (!g_bridge.map(o.w, o.h)) return;
 
-    // The network's answer, if there is a new one.
-    if (h->resultSeq != g_bridge.seen_result && h->resultWidth == o.w && h->resultHeight == o.h) {
-        const uint8_t *from = g_bridge.view + bridge::result_offset(o.w, o.h);
-        if (upload_gain(from)) {
+    // The network's answer, if there is a new one, with the frame it was made from: the capture
+    // buffer still holds it, nothing is written there until the result has been taken.
+    auto consume = [&]() {
+        if (h->resultSeq == g_bridge.seen_result || h->resultWidth != o.w || h->resultHeight != o.h) return;
+        if (upload_gain(g_bridge.view + bridge::result_offset(o.w, o.h))) {
+            if (o.mask_ok) upload_seen(g_bridge.view + bridge::capture_offset());
             o.have_gain = true;
             ++o.applied;
         }
         g_bridge.seen_result = h->resultSeq;
+    };
+    consume();
+
+    // The masked pass reads a copy of the frame; the capture is taken from it too.
+    bool masked = g_config.options.reduceTrailing && o.mask_ok;
+    if (masked) {
+        IDirect3DSurface9 *back = nullptr;
+        masked = SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back));
+        if (back) {
+            masked = masked && SUCCEEDED(device->StretchRect(back, nullptr, o.copy_surf, nullptr, D3DTEXF_NONE));
+            back->Release();
+        }
     }
+
     // A new capture, when the host wants one.
+    bool sent = false;
     if (InterlockedCompareExchange(&h->hostReady, 0, 1) == 1) {
         h->width = o.w;
         h->height = o.h;
-        if (capture(device, g_bridge.view + bridge::capture_offset())) {
+        ResetEvent(g_bridge.result_event);   // whatever it was signalled for is old
+        if (capture(device, g_bridge.view + bridge::capture_offset(), masked)) {
             InterlockedIncrement(&h->captureSeq);
             SetEvent(g_bridge.capture_event);
             ++o.sent;
+            sent = true;
         } else {
             InterlockedExchange(&h->hostReady, 1);
         }
     }
+    // Waiting: the answer to this very frame is applied to it.
+    if (sent && g_config.options.wait) {
+        if (WaitForSingleObject(g_bridge.result_event, 500) == WAIT_OBJECT_0) consume();
+        else log("bridge: the network did not answer within 500 ms");
+    }
+
     const bool dump = g_config.dump_frame > 0 && o.frames == (unsigned)g_config.dump_frame;
     if (dump) dump_backbuffer(device, L"dump_plain.bmp");
-    if (o.have_gain) draw_gain(device);
+    if (o.have_gain) {
+        if (masked) draw_masked(device);
+        else draw_gain(device);
+    }
     if (dump) {
         dump_backbuffer(device, L"dump_final.bmp");
         log("dumped frame %u (gain applied: %d)", o.frames, (int)o.have_gain);
@@ -727,6 +856,7 @@ void start_logging() {
 
 // What the menu changes goes to the host at once and, when it is final, to OptiScaler.ini.
 bridge::Settings &bridge_user_settings() { return g_config.settings; }
+BridgeOptions &bridge_options() { return g_config.options; }
 
 void bridge_setting_changed(const wchar_t *key, const wchar_t *text, bool save) {
     g_config.enabled = g_config.settings.enabled != 0;

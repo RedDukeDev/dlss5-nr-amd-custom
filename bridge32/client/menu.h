@@ -9,6 +9,13 @@
 // Implemented by the client: a setting the menu changed. `key` is the [NeuralRendering] key and
 // `text` its value; `save` is false while a slider is still being dragged (the value goes to the
 // host at once, the file is written when the drag ends).
+// Options of the client itself, not of the network: how a result is applied.
+struct BridgeOptions {
+    bool reduceTrailing;   // fade the gain where the scene has changed since the network saw it
+    float tolerance;       // how much a pixel may change before that starts, 0..1
+    bool wait;             // the game waits for the network, so a result is never old
+};
+BridgeOptions &bridge_options();
 void bridge_setting_changed(const wchar_t *key, const wchar_t *text, bool save);
 bridge::Settings &bridge_user_settings();
 

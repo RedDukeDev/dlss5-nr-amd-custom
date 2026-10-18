@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -277,6 +278,24 @@ void force_settings(dlss5nr_settings &s) {
 
 // ------------------------------------------------------------------ the gain
 
+// Runs fn(first_row, end_row) over the rows on several threads: at 1440p the loops over pixels
+// below take longer than the network does.
+template <class F> void parallel_rows(UINT rows, F fn) {
+    const unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    if (threads == 1 || rows < 64) {
+        fn(0u, rows, 0u);
+        return;
+    }
+    const UINT per = (rows + threads - 1) / threads;
+    std::vector<std::thread> pool;
+    for (unsigned i = 1; i < threads; ++i) {
+        const UINT a = i * per, b = std::min(rows, a + per);
+        if (a < b) pool.emplace_back([=, &fn] { fn(a, b, i); });
+    }
+    fn(0u, std::min(rows, per), 0u);
+    for (std::thread &t : pool) t.join();
+}
+
 // What the network did to each pixel, as a gain on the capture: out = in * gain. A small offset
 // keeps dark pixels, where one step of the 8-bit image is a large fraction, from producing wild
 // gains.
@@ -291,25 +310,31 @@ double compute_gain(const uint8_t *in, const uint8_t *out, UINT w, UINT h, UINT 
         ready = true;
     }
     const float scale = 65535.0f / bridge::kGainRange;
-    double error = 0.0;
-    for (UINT y = 0; y < h; ++y) {
-        const uint8_t *a = in + (size_t)y * w * 4;
-        const uint8_t *b = out + (size_t)y * out_pitch;
-        uint16_t *g = gain + (size_t)y * w * 4;
-        for (UINT x = 0; x < w; ++x) {
-            for (int c = 0; c < 3; ++c) {
-                float r = ((float)b[4 * x + c] + kOffset) * inverse[a[4 * x + c]];
-                if (r > bridge::kGainRange) r = bridge::kGainRange;
-                const uint16_t q = (uint16_t)(r * scale + 0.5f);
-                g[4 * x + c] = q;
-                const float back = (float)a[4 * x + c] * (float)q / scale;
-                const float d = back - (float)b[4 * x + c];
-                error += (double)d * d;
+    double errors[8] = {};
+    parallel_rows(h, [&](UINT first, UINT end, unsigned slot) {
+        double error = 0.0;
+        for (UINT y = first; y < end; ++y) {
+            const uint8_t *a = in + (size_t)y * w * 4;
+            const uint8_t *b = out + (size_t)y * out_pitch;
+            uint16_t *g = gain + (size_t)y * w * 4;
+            for (UINT x = 0; x < w; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    float r = ((float)b[4 * x + c] + kOffset) * inverse[a[4 * x + c]];
+                    if (r > bridge::kGainRange) r = bridge::kGainRange;
+                    const uint16_t q = (uint16_t)(r * scale + 0.5f);
+                    g[4 * x + c] = q;
+                    const float back = (float)a[4 * x + c] * (float)q / scale;
+                    const float d = back - (float)b[4 * x + c];
+                    error += (double)d * d;
+                }
+                g[4 * x + 3] = 65535;
             }
-            g[4 * x + 3] = 65535;
         }
-    }
-    return sqrt(error / ((double)w * h * 3));
+        errors[slot] += error;
+    });
+    double total = 0.0;
+    for (double e : errors) total += e;
+    return sqrt(total / ((double)w * h * 3));
 }
 
 } // namespace
@@ -333,7 +358,9 @@ int wmain(int argc, wchar_t **argv) {
     HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
     swprintf(name, 96, L"Local\\dlss5nr_bridge_capture_%lu", client_pid);
     HANDLE capture_event = OpenEventW(SYNCHRONIZE, FALSE, name);
-    if (!client || !mapping || !capture_event) {
+    swprintf(name, 96, L"Local\\dlss5nr_bridge_result_%lu", client_pid);
+    HANDLE result_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    if (!client || !mapping || !capture_event || !result_event) {
         log("could not open the client's objects (error %lu)", GetLastError());
         return 3;
     }
@@ -416,18 +443,23 @@ int wmain(int argc, wchar_t **argv) {
         }
         const auto t0 = std::chrono::steady_clock::now();
 
-        // BGRA to RGBA.
+        // BGRA to RGBA, into the picture the gain is measured against and into the upload buffer.
         const uint8_t *capture = view + bridge::capture_offset();
-        for (size_t p = 0; p < (size_t)w * hh; ++p) {
-            frame.rgba[4 * p + 0] = capture[4 * p + 2];
-            frame.rgba[4 * p + 1] = capture[4 * p + 1];
-            frame.rgba[4 * p + 2] = capture[4 * p + 0];
-            frame.rgba[4 * p + 3] = 255;
-        }
         uint8_t *mapped = nullptr;
         frame.upload->Map(0, nullptr, (void **)&mapped);
-        for (UINT y = 0; y < hh; ++y)
-            memcpy(mapped + frame.footprint.Offset + (size_t)y * frame.footprint.Footprint.RowPitch, &frame.rgba[(size_t)y * w * 4], (size_t)w * 4);
+        parallel_rows(hh, [&](UINT first, UINT end, unsigned) {
+            for (UINT y = first; y < end; ++y) {
+                const uint8_t *src = capture + (size_t)y * w * 4;
+                uint8_t *rgba = &frame.rgba[(size_t)y * w * 4];
+                uint8_t *row = mapped + frame.footprint.Offset + (size_t)y * frame.footprint.Footprint.RowPitch;
+                for (UINT x = 0; x < w; ++x) {
+                    rgba[4 * x + 0] = row[4 * x + 0] = src[4 * x + 2];
+                    rgba[4 * x + 1] = row[4 * x + 1] = src[4 * x + 1];
+                    rgba[4 * x + 2] = row[4 * x + 2] = src[4 * x + 0];
+                    rgba[4 * x + 3] = row[4 * x + 3] = 255;
+                }
+            }
+        });
         frame.upload->Unmap(0, nullptr);
 
         // The same picture until the network has answered for it: the first frame hands it
@@ -490,6 +522,9 @@ int wmain(int argc, wchar_t **argv) {
                                           frame.footprint.Footprint.RowPitch, gain.data());
         frame.readback->Unmap(0, nullptr);
 
+        // For testing: a slower network, to see what the client does with an old result.
+        static const int delay_ms = GetEnvironmentVariableW(L"DLSS5NR_HOST_DELAY_MS", nullptr, 0) ? _wtoi(_wgetenv(L"DLSS5NR_HOST_DELAY_MS")) : 0;
+        if (delay_ms > 0) Sleep(delay_ms);
         memcpy(view + bridge::result_offset(w, hh), gain.data(), (size_t)w * hh * 8);
         h->resultWidth = w;
         h->resultHeight = hh;
@@ -499,6 +534,7 @@ int wmain(int argc, wchar_t **argv) {
         h->networkHeight = status.network_height;
         h->nativeKernels = status.native_kernels;
         InterlockedIncrement(&h->resultSeq);
+        SetEvent(result_event);
         ++cycles;
         if (cycles <= 3 || cycles % 20 == 0)
             log("cycle %u: %.0f ms (network %.0f ms), the gain reproduces the network's picture to %.2f steps rms", cycles,

@@ -140,6 +140,30 @@ void draw(const Status &status, float scale) {
 
     ImGui::BeginDisabled(!status.enabled || !running);
 
+    {
+        BridgeOptions &options = bridge_options();
+        if (ImGui::Checkbox("Reduce trailing##nr", &options.reduceTrailing))
+            put(L"BridgeReduceTrailing", options.reduceTrailing ? L"true" : L"false", true);
+        tooltip("A result is a few frames old when it arrives. Applied to a scene that has moved since,\n"
+                "it shows as a trail behind whatever moves. This takes it away wherever the picture has\n"
+                "changed since the network saw it: what moves is left as the game drew it");
+        ImGui::BeginDisabled(!options.reduceTrailing);
+        {
+            float tolerance = options.tolerance;
+            const bool changed = ImGui::SliderFloat("Tolerance##nr", &tolerance, 0.01f, 0.2f, "%.3f");
+            const bool done = ImGui::IsItemDeactivatedAfterEdit();
+            if (changed) options.tolerance = tolerance;
+            if (changed || done) put_float(L"BridgeTrailingTolerance", tolerance, done);
+            tooltip("How much a pixel may change before the effect fades there. Lower removes more of the\n"
+                    "trail, but also the effect on slow movement; higher keeps more of both");
+        }
+        ImGui::EndDisabled();
+        if (ImGui::Checkbox("Wait for the network##nr", &options.wait))
+            put(L"BridgeWaitForNetwork", options.wait ? L"true" : L"false", true);
+        tooltip("The game waits for the network on every frame and its answer is applied to that very\n"
+                "frame: no trail at all, but the frame rate becomes the network's");
+    }
+
     slider("Network resolution", L"ResolutionScale", user.resolutionScale, eff.resolutionScale, 0.25f, 1.0f);
     tooltip("The network's resolution as a fraction of the game's.\nIts cost follows its pixels");
 

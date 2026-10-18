@@ -15,7 +15,7 @@
 namespace bridge {
 
 constexpr uint32_t kMagic = 0x42524E44; // 'DNRB'
-constexpr uint32_t kVersion = 4;
+constexpr uint32_t kVersion = 5;
 constexpr uint32_t kHeaderBytes = 4096;
 constexpr uint32_t kMaxWidth = 4096, kMaxHeight = 2304;
 constexpr uint32_t kAlign = 65536;
