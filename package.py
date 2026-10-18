@@ -31,6 +31,9 @@ with linux/build.sh, plus launch.sh and README.txt) goes into linux\\ beside
 OptiScaler.dll, where setup_linux.sh finds it. It is left out, with a warning, when
 it has not been built or its sources are newer than what was built.
 
+The 32-bit bridge (bridge32\\, built with bridge32\\build.py): its client goes into bridge32\\ and its host
+beside the runtime in OptiScaler\\dlss5nr\\.
+
 DXVK (dxvk\\, 64-bit) goes into dxvk\\ beside OptiScaler.dll, for setup_windows.bat to copy
 beside a Direct3D 9 or 10 game.
 
@@ -102,6 +105,27 @@ def package_dxvk(out):
     for name in ("LICENSE", "README.txt"):
         copy(os.path.join(dxvk, name), os.path.join(target, name))
     print("packaged DXVK into %s" % target)
+
+
+def package_bridge(out):
+    """The 32-bit bridge: its client goes to bridge32\\ (setup_windows.bat copies it beside a 32-bit game
+    as d3d9.dll), its host beside the runtime, where the client looks for it. Built with
+    bridge32\\build.py."""
+    bridge = os.path.join(ROOT, "bridge32")
+    client = os.path.join(bridge, "build", "x86", "d3d9.dll")
+    host = os.path.join(bridge, "build", "x64", "dlss5nr_host.exe")
+    missing = [b for b in (client, host) if not os.path.isfile(b)]
+    if missing:
+        print("warning: the 32-bit bridge is not built (python bridge32/build.py), so it is left out: missing %s"
+              % ", ".join(os.path.basename(m) for m in missing))
+        return
+    sources = max(newest(os.path.join(bridge, "client")), newest(os.path.join(bridge, "host")), newest(os.path.join(bridge, "common")))
+    if any(os.path.getmtime(b) < sources for b in (client, host)):
+        print("warning: the bridge's sources changed after it was built: run python bridge32/build.py again")
+    copy(client, os.path.join(out, "bridge32", "d3d9.dll"))
+    copy(os.path.join(bridge, "README.txt"), os.path.join(out, "bridge32", "README.txt"))
+    copy(host, os.path.join(out, "OptiScaler", "dlss5nr", "dlss5nr_host.exe"))
+    print("packaged the 32-bit bridge into %s" % os.path.join(out, "bridge32"))
 
 
 def make_scripts_executable(out):
@@ -197,6 +221,7 @@ def main():
         copy(os.path.join(ROOT, name), os.path.join(target, name))
     package_linux(args.out)
     package_dxvk(args.out)
+    package_bridge(args.out)
     make_scripts_executable(args.out)
     print("packaged %d native kernels%s into %s"
           % (len(objects), "" if args.no_cache else " and the translation cache", args.out))

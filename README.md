@@ -45,7 +45,7 @@ Hardware-specific status:
 - Windows 10/11 or Linux, an AMD Radeon RX 9000 (RDNA4), RX 7000 (RDNA3) or RX 6000 (RDNA2). 
 - A game using DirectX 12, DirectX 11 or Vulkan (see *Direct3D 11* and *Vulkan* below), or DirectX 9 or 10 through
   DXVK, which is included (see *Older Direct3D* below)
-- A **64-bit** game. For now 32-bit games are not supported: OptiScaler and the network are 64-bit only.
+- A 64-bit game, or a 32-bit Direct3D 9 one through the bridge (see *32-bit games* below)
 - The AMD HIP SDK for Windows, if using Windows.
 - ROCm if using Linux.
 
@@ -151,8 +151,8 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
   running on DXVK on Windows. Tested with `runtime/tests/dx11/dx10app.cpp`. Under Wine (Proton) DXVK and
   vkd3d-proton do share, so nothing is changed there.
 - Direct3D 9 and 10 **without DXVK** are not supported.
-- **Only 64-bit games**: OptiScaler is 64-bit, and so are the DXVK files in the package. A 32-bit game
-  cannot load either.
+- **Only 64-bit games through DXVK**: OptiScaler is 64-bit, and so are the DXVK files in the package.
+  32-bit games have the bridge, below.
 
 ### DXVK comes with the package
 
@@ -174,6 +174,33 @@ DXVK 3.1.1 (zlib licence; the exact files and their hashes are listed in `dxvk/R
 Tested on Windows end to end with `runtime/tests/dx11/dx9app.cpp` and `dx10app.cpp`: package, setup,
 a run with the neural rendering off and on (the image changes, the runtime is only loaded when it is on)
 and the removal, which leaves the folder as it was.
+
+## 32-bit games
+
+OptiScaler and the network are 64-bit, and a 32-bit game cannot load them. For 32-bit Direct3D 9 games (most
+of the older ones) the package carries a bridge: a 32-bit `d3d9.dll` that hooks the game's `Present` and
+sends the finished frame to a 64-bit helper, `dlss5nr_host.exe`, which runs the network through the same
+runtime and returns what it did to each pixel as a gain, which is applied to the frame the game is
+showing. The helper starts with the game and ends with it.
+
+`setup_windows.bat` notices that the game is 32-bit and offers to install it: `d3d9.dll` goes beside the
+executable (a `d3d9.dll` that was there is kept as `d3d9_chain.dll`, and the bridge loads it), and the
+neural rendering is switched on. `Remove_OptiScaler.bat` takes it away and puts the old one back.
+
+There is no OptiScaler menu in such a game, so the bridge has one of its own: Insert opens it, with the
+neural rendering part of OptiScaler's menu; the settings are kept in the same `OptiScaler.ini`. A game that
+reads its mouse through DirectInput gets that input hidden while the menu is open.
+
+There are no motion vectors, so what the network adds is a few frames old when it arrives and trails behind
+what moves. What helps, and is the default: *Wait for the network* (the answer is applied to the very frame it
+was made from, and the frame rate is the network's), with the network at half resolution (the result is
+stretched over the whole frame, so the detail stays) and *Temporal smoothing* against the flicker the
+network's own decisions show from picture to picture. At 1440p that is roughly 35-40 frames a second with
+vsync on, on a Radeon RX 7900 XT. *Reduce trailing* (fade the result where the picture has changed) and
+*Follow motion* (motion estimated from the pictures, experimental) are for using it without waiting.
+
+Only Direct3D 9, and only 32 bits a pixel in the backbuffer. Its sources are in `bridge32/`: `python
+bridge32/build.py` builds the client and the helper; `bridge32/README.txt` is the user's version of this.
 
 ## Linux 
 
