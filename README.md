@@ -143,10 +143,12 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
   the Vulkan way above enhances its image. OptiScaler goes in under a name the game loads that DXVK does
   not use (`version.dll`, `winmm.dll`...). Tested on Windows with `runtime/tests/dx11/dx9app.cpp`: at zero
   strength the picture comes back byte for byte.
-- **Direct3D 10 with DXVK** does not, on Windows: DXVK runs it as Direct3D 11, and the textures it shares
-  cannot be opened by the native Direct3D 12 the bridge needs (the driver crashes in it), so the neural
-  rendering stays off for it, with a line in the log. Under Wine (Proton) DXVK and vkd3d-proton do share;
-  that is untested.
+- **Direct3D 10 with DXVK** (the files DXVK needs beside the game are `d3d10core.dll`, `d3d11.dll` and
+  `dxgi.dll`) works too, on Windows, the same way: DXVK runs it as Direct3D 11, whose bridge cannot be used
+  with it (the textures DXVK shares cannot be opened by the native Direct3D 12, and the driver crashes in
+  it), so OptiScaler enhances its image at the Vulkan present instead. The same goes for a Direct3D 11 game
+  running on DXVK on Windows. Tested with `runtime/tests/dx11/dx10app.cpp`. Under Wine (Proton) DXVK and
+  vkd3d-proton do share, and nothing is changed there; that is untested.
 - Direct3D 9 and 10 **without DXVK** are not supported.
 
 ## Linux 
