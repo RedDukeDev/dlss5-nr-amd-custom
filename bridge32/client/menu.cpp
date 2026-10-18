@@ -147,6 +147,12 @@ void draw(const Status &status, float scale) {
         tooltip("A result is a few frames old when it arrives. Applied to a scene that has moved since,\n"
                 "it shows as a trail behind whatever moves. This takes it away wherever the picture has\n"
                 "changed since the network saw it: what moves is left as the game drew it");
+        if (ImGui::Checkbox("Follow motion (experimental)##nr", &options.follow))
+            put(L"BridgeFollowMotion", options.follow ? L"true" : L"false", true);
+        tooltip("There are no motion vectors in this game, so they are estimated from the pictures: where each\n"
+                "block of the picture now was in the one the network saw. The result is carried along them,\n"
+                "which keeps the effect on what moves, as long as it moves by less than a few tens of pixels\n"
+                "between the network seeing the picture and the result arriving. Needs Reduce trailing");
         ImGui::BeginDisabled(!options.reduceTrailing);
         {
             float tolerance = options.tolerance;

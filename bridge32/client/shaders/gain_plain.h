@@ -87,7 +87,7 @@
 // approximately 56 instruction slots used (11 texture, 45 arithmetic)
 #endif
 
-const BYTE kGainPs[] =
+const BYTE kGainPlain[] =
 {
       0,   2, 255, 255, 254, 255, 
      66,   0,  67,  84,  65,  66, 

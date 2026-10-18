@@ -14,6 +14,7 @@ struct BridgeOptions {
     bool reduceTrailing;   // fade the gain where the scene has changed since the network saw it
     float tolerance;       // how much a pixel may change before that starts, 0..1
     bool wait;             // the game waits for the network, so a result is never old
+    bool follow;           // carry the result along the motion estimated from the pictures
 };
 BridgeOptions &bridge_options();
 void bridge_setting_changed(const wchar_t *key, const wchar_t *text, bool save);

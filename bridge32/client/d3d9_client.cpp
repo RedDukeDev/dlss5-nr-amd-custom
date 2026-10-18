@@ -13,9 +13,13 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <math.h>
 #include "../common/protocol.h"
 #include "menu.h"
-#include "gain_ps.h"
+#include "motion.h"
+#include "shaders/gain_mc.h"
+#include "shaders/gain_plain.h"
 
 namespace {
 
@@ -97,7 +101,7 @@ bool load_real() {
 struct Config {
     bool enabled = false;
     std::wstring host;       // the host's path
-    BridgeOptions options = {true, 0.025f, false};
+    BridgeOptions options = {true, 0.025f, false, false};
     bool open_menu = false;  // BridgeDebugOpenMenu: the menu starts open
     int dump_frame = 0;      // DebugDumpFrame: write the frame before and after the gain to bmp files
     bridge::Settings settings{};
@@ -152,6 +156,7 @@ bool read_config() {
     g_config.options.reduceTrailing = read_int(L"BridgeReduceTrailing", 1) != 0;
     g_config.options.tolerance = read_float(L"BridgeTrailingTolerance", 0.025f);
     g_config.options.wait = read_int(L"BridgeWaitForNetwork", 0) != 0;
+    g_config.options.follow = read_int(L"BridgeFollowMotion", 0) != 0;
     return true;
 }
 
@@ -317,6 +322,11 @@ struct Overlay {
     IDirect3DTexture9 *seen_tex = nullptr;      // the frame the network saw
     IDirect3DPixelShader9 *mask_ps = nullptr;
     bool mask_ok = false;
+    // Motion estimation, and the shader that applies the gain along it.
+    Motion motion;
+    IDirect3DPixelShader9 *mc_ps = nullptr;
+    bool me_ok = false;
+    bool seen_dirty = false;    // the frame the network saw was replaced since the pyramid was built
     IDirect3DStateBlock9 *state = nullptr;
     bool have_gain = false;
     bool broken = false;
@@ -334,6 +344,10 @@ struct Overlay {
         if (copy_tex) copy_tex->Release();
         if (seen_tex) seen_tex->Release();
         if (mask_ps) mask_ps->Release();
+        motion.release();
+        if (mc_ps) mc_ps->Release();
+        mc_ps = nullptr;
+        me_ok = false;
         if (state) state->Release();
         system = resolved = nullptr;
         copy_surf = nullptr;
@@ -395,8 +409,12 @@ bool setup(IDirect3DDevice9 *device) {
     o.mask_ok = SUCCEEDED(device->CreateTexture(o.w, o.h, 1, D3DUSAGE_RENDERTARGET, o.format, D3DPOOL_DEFAULT, &o.copy_tex, nullptr)) &&
                 SUCCEEDED(o.copy_tex->GetSurfaceLevel(0, &o.copy_surf)) &&
                 SUCCEEDED(device->CreateTexture(o.w, o.h, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &o.seen_tex, nullptr)) &&
-                SUCCEEDED(device->CreatePixelShader((const DWORD *)kGainPs, &o.mask_ps));
+                SUCCEEDED(device->CreatePixelShader((const DWORD *)kGainPlain, &o.mask_ps));
     if (!o.mask_ok) log("overlay: the masked pass is not available here, trailing cannot be reduced");
+
+    // The motion search wants Shader Model 3 and half-float render targets.
+    o.me_ok = o.mask_ok && o.motion.create(device, o.w, o.h) && SUCCEEDED(device->CreatePixelShader((const DWORD *)kGainMc, &o.mc_ps));
+    log("overlay: motion search %s", o.me_ok ? "available" : "NOT available");
     if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &o.state))) {
         log("overlay: no state block");
         o.broken = true;
@@ -467,7 +485,8 @@ bool upload_seen(const uint8_t *from) {
 }
 
 // The frame now times the gain, but only where it still looks as it did when the network saw it
-// (gain.hlsl).
+// (gain_plain.hlsl), or, with the motion search, as it did there once the motion is allowed for
+// (gain_mc.hlsl).
 void draw_masked(IDirect3DDevice9 *device) {
     Overlay &o = g_overlay;
     IDirect3DSurface9 *back = nullptr, *target = nullptr, *depth = nullptr;
@@ -475,13 +494,8 @@ void draw_masked(IDirect3DDevice9 *device) {
     device->GetRenderTarget(0, &target);
     device->GetDepthStencilSurface(&depth);
     o.state->Capture();
-    if (target != back) device->SetRenderTarget(0, back);
     device->SetDepthStencilSurface(nullptr);
 
-    D3DVIEWPORT9 vp = {0, 0, o.w, o.h, 0.0f, 1.0f};
-    device->SetViewport(&vp);
-    device->SetVertexShader(nullptr);
-    device->SetPixelShader(o.mask_ps);
     device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
     device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
@@ -492,10 +506,8 @@ void draw_masked(IDirect3DDevice9 *device) {
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
-    IDirect3DBaseTexture9 *textures[3] = {o.copy_tex, o.seen_tex, o.gain};
-    for (DWORD i = 0; i < 3; ++i) {
-        device->SetTexture(i, textures[i]);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+    for (DWORD i = 0; i < 4; ++i) {
         device->SetSamplerState(i, D3DSAMP_MINFILTER, D3DTEXF_POINT);
         device->SetSamplerState(i, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
         device->SetSamplerState(i, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
@@ -503,26 +515,42 @@ void draw_masked(IDirect3DDevice9 *device) {
         device->SetSamplerState(i, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
         device->SetSamplerState(i, D3DSAMP_SRGBTEXTURE, FALSE);
     }
+
+    const bool follow = g_config.options.follow && o.me_ok;
+    if (follow) {
+        o.motion.coarse_penalty = 0.001f;
+        o.motion.fine_penalty = 0.0005f;
+        o.motion.update(device, o.copy_tex, o.seen_tex, o.seen_dirty);
+        o.seen_dirty = false;
+    }
+
+    // The result: into the backbuffer.
+    device->SetRenderTarget(0, back);
+    D3DVIEWPORT9 vp = {0, 0, o.w, o.h, 0.0f, 1.0f};
+    device->SetViewport(&vp);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(follow ? o.mc_ps : o.mask_ps);
+    device->SetTexture(0, o.copy_tex);
+    device->SetTexture(1, o.seen_tex);
+    device->SetTexture(2, o.gain);
+    device->SetTexture(3, follow ? o.motion.field() : nullptr);
+    if (follow && o.motion.filterable()) {
+        device->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    }
     // The fade runs from the tolerance to a few times it.
     const float low = g_config.options.tolerance, high = low * 4.0f + 0.04f;
     const float k[4] = {2.0f / (float)o.w, 2.0f / (float)o.h, low, 1.0f / (high - low)};
+    const float trust_low = 0.2f, trust_high = 0.7f;
+    const float pixel[4] = {1.0f / (float)o.w, 1.0f / (float)o.h, trust_low, 1.0f / (trust_high - trust_low)};
     device->SetPixelShaderConstantF(0, k, 1);
-
-    struct Vertex {
-        float x, y, z, rhw, u, v;
-    };
-    const float l = -0.5f, t = -0.5f, r = (float)o.w - 0.5f, b = (float)o.h - 0.5f;
-    const Vertex quad[4] = {{l, t, 0.0f, 1.0f, 0.0f, 0.0f},
-                            {r, t, 0.0f, 1.0f, 1.0f, 0.0f},
-                            {l, b, 0.0f, 1.0f, 0.0f, 1.0f},
-                            {r, b, 0.0f, 1.0f, 1.0f, 1.0f}};
-    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    device->SetPixelShaderConstantF(1, pixel, 1);
     device->BeginScene();
-    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
+    draw_fullscreen_quad(device, o.w, o.h, false);
     device->EndScene();
 
     o.state->Apply();
-    if (target != back) device->SetRenderTarget(0, target);
+    if (target) device->SetRenderTarget(0, target);   // the passes above changed it, even when it was the backbuffer
     device->SetDepthStencilSurface(depth);
     if (depth) depth->Release();
     if (target) target->Release();
@@ -597,6 +625,65 @@ void draw_gain(IDirect3DDevice9 *device) {
     back->Release();
 }
 
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    const int e = (h >> 10) & 31;
+    const uint32_t m = h & 0x3FF;
+    if (e == 0) {
+        const float v = m / 16777216.0f;
+        return (h & 0x8000) ? -v : v;
+    }
+    uint32_t x = e == 31 ? (sign | 0x7F800000 | (m << 13)) : (sign | ((uint32_t)(e - 15 + 127) << 23) | (m << 13));
+    float f;
+    memcpy(&f, &x, 4);
+    return f;
+}
+
+// For testing: what the motion search found, summed up in the log.
+void log_motion(IDirect3DDevice9 *device) {
+    Overlay &o = g_overlay;
+    if (!o.me_ok) return;
+    IDirect3DSurface9 *system = nullptr;
+    if (FAILED(device->CreateOffscreenPlainSurface(o.motion.grid_width(), o.motion.grid_height(), D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &system, nullptr))) return;
+    if (SUCCEEDED(device->GetRenderTargetData(o.motion.field_surface(), system))) {
+        D3DLOCKED_RECT rect;
+        if (SUCCEEDED(system->LockRect(&rect, nullptr, D3DLOCK_READONLY))) {
+            std::vector<float> xs, ys;
+            unsigned moving = 0;
+            for (UINT y = 0; y < o.motion.grid_height(); ++y) {
+                const uint16_t *row = (const uint16_t *)((const uint8_t *)rect.pBits + (size_t)y * rect.Pitch);
+                for (UINT x = 0; x < o.motion.grid_width(); ++x) {
+                    const float mx = half_to_float(row[4 * x]), my = half_to_float(row[4 * x + 1]);
+                    xs.push_back(mx);
+                    ys.push_back(my);
+                    if (fabsf(mx) > 2.0f || fabsf(my) > 2.0f) ++moving;
+                }
+            }
+            // The field itself, for looking at: width, height, then x, y and cost of every block.
+            if (FILE *f = _wfsopen((g_dir + L"dump_motion.bin").c_str(), L"wb", _SH_DENYNO)) {
+                const uint32_t dims[2] = {o.motion.grid_width(), o.motion.grid_height()};
+                fwrite(dims, 4, 2, f);
+                for (UINT y = 0; y < o.motion.grid_height(); ++y) {
+                    const uint16_t *row = (const uint16_t *)((const uint8_t *)rect.pBits + (size_t)y * rect.Pitch);
+                    for (UINT x = 0; x < o.motion.grid_width(); ++x) {
+                        const float v[3] = {half_to_float(row[4 * x]), half_to_float(row[4 * x + 1]), half_to_float(row[4 * x + 2])};
+                        fwrite(v, 4, 3, f);
+                    }
+                }
+                fclose(f);
+            }
+            std::vector<float> sx = xs, sy = ys;
+            std::sort(sx.begin(), sx.end());
+            std::sort(sy.begin(), sy.end());
+            const size_t n = sx.size();
+            log("motion: median %.1f,%.1f px; 10%% %.1f,%.1f; 90%% %.1f,%.1f; %u of %u blocks move by more than 2 px", sx[n / 2], sy[n / 2],
+                sx[n / 10], sy[n / 10], sx[n * 9 / 10], sy[n * 9 / 10], moving, (unsigned)n);
+            system->UnlockRect();
+        }
+    }
+    system->Release();
+}
+
 // For testing: the backbuffer as a 32-bit BMP, read from the device itself rather than from the screen.
 void dump_backbuffer(IDirect3DDevice9 *device, const wchar_t *name) {
     Overlay &o = g_overlay;
@@ -658,7 +745,7 @@ void run_bridge(IDirect3DDevice9 *device) {
     auto consume = [&]() {
         if (h->resultSeq == g_bridge.seen_result || h->resultWidth != o.w || h->resultHeight != o.h) return;
         if (upload_gain(g_bridge.view + bridge::result_offset(o.w, o.h))) {
-            if (o.mask_ok) upload_seen(g_bridge.view + bridge::capture_offset());
+            if (o.mask_ok && upload_seen(g_bridge.view + bridge::capture_offset())) o.seen_dirty = true;
             o.have_gain = true;
             ++o.applied;
         }
@@ -705,6 +792,7 @@ void run_bridge(IDirect3DDevice9 *device) {
         else draw_gain(device);
     }
     if (dump) {
+        log_motion(device);
         dump_backbuffer(device, L"dump_final.bmp");
         log("dumped frame %u (gain applied: %d)", o.frames, (int)o.have_gain);
     }
