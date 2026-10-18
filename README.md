@@ -110,7 +110,9 @@ with a Direct3D 11 game under Proton (DXVK), nor with OptiScaler's frame generat
 
 ## Vulkan
 
-Two ways, by the upscaler OptiScaler uses in the game (`VulkanUpscaler` in OptiScaler.ini):
+Two ways, by the upscaler OptiScaler uses in the game (`VulkanUpscaler` in OptiScaler.ini). While
+neural rendering is enabled and `VulkanUpscaler` is left on `auto`, OptiScaler picks `ffx_12`, the first
+way; any value set there is respected.
 
 - **A Vulkan upscaler running on Direct3D 12** (`ffx_12`, `fsr21_12`): the upscaler's inputs already
   go to Direct3D 12 for it, so the neural rendering works there as in a Direct3D 12 game, before
@@ -123,8 +125,8 @@ Two ways, by the upscaler OptiScaler uses in the game (`VulkanUpscaler` in OptiS
   depth or motion vectors to follow, and the game's interface is part of the image: the result trails
   behind what moves, which *Wait for the network* avoids at a cost in frame rate.
 
-So for a Vulkan game that has an upscaler, `VulkanUpscaler=ffx_12` gives the better picture, at the
-cost of OptiScaler's copies of the upscaler's inputs and output.
+The first gives the better picture, at the cost of OptiScaler's copies of the upscaler's inputs and
+output, and is what `auto` chooses. Set a native one, `fsr22` for instance, to get the second.
 
 Tested on Windows with two small Vulkan programs (`runtime/tests/dx11/vkapp.cpp` and `vkngx.cpp`):
 BGRA8 and RGBA8 swapchains come back byte for byte at zero strength, and `ffx_12` and the default
