@@ -3,7 +3,11 @@
 DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12, Direct3D 11 and Vulkan games on
 AMD Radeon GPUs through OptiScaler.
 
-The network is NVIDIA's `nvngx_dlssnr.dll`, included in the release package. Its CUDA code
+The network is NVIDIA's `nvngx_dlssnr.dll`, included in the release package. The same pieces run
+NVIDIA's DLSS upscalers (`nvngx_dlss.dll`, super resolution; `nvngx_dlssd.dll`, ray reconstruction),
+which OptiScaler's fork offers as the DLSS upscaler on a GPU that is not NVIDIA's, to be used the way
+FSR is: with frame generation, ray reconstruction and the neural rendering (see
+[runtime/README.md](runtime/README.md)). Their CUDA code
 runs on AMD through [a fork of ZLUDA](https://github.com/RedDukeDev/ZLUDA), and the hottest of its kernels are
 replaced by hand-written HIP kernels that produce the same bytes. A runtime
 drives it beside the game, and a fork of OptiScaler hands the runtime the
@@ -293,12 +297,15 @@ problem.
   `kernels\kernels.txt` names, in parallel (the AMD HIP SDK and Visual Studio).
 - **ZLUDA:** see `third_party/ZLUDA`.
 - **OptiScaler:** `optiscaler\OptiScaler.sln`.
-- **NVIDIA's network:** `nvngx_dlssnr.dll` is too large for the repository and
-  is only shipped in the release package. To build from source, take version
-  310.9.16.0 from the release package, or from a game that ships DLSS 5, and put
-  it in `third_party\`. (310.8.0.0, the version before, still runs, but the
-  translation cache of the package is made for 310.9.16.0.) It has to be the original signed file: builds patched
-  to run on older NVIDIA cards cannot be translated.
+- **NVIDIA's libraries:** they are too large for the repository and are only shipped in the
+  release package; `third_party\` keeps a copy for building and packaging, which `.gitignore`
+  leaves out. Put there `nvngx_dlssnr.dll` (neural rendering, version 310.9.16.0), `nvngx_dlss.dll`
+  (super resolution) and `nvngx_dlssd.dll` (ray reconstruction), both 310.9.1, taken from the release
+  package or from a game that ships them. (310.8.0.0 of the neural rendering network, the version
+  before, still runs, but the translation cache of the package is made for 310.9.16.0.) They have to
+  be the original signed files: builds patched to run on older NVIDIA cards cannot be translated.
+- **Super resolution kernels:** `python kernels\build_sr_kernels.py` (the AMD HIP SDK and a d4r
+  checkout, see its header) writes `kernels\sr\`, which `package.py` takes.
 - **Package:** `python package.py --zluda <ZLUDA build> --optiscaler <OptiScaler
   build>` puts everything, the network and the translation cache included,
   into `dist\`.
@@ -330,7 +337,7 @@ To release a cache anyone can use, run:
 
     python runtime\tools\prepare_cache.py
 
-It reads the code modules out of `third_party\nvngx_dlssnr.dll`, translates
+It reads the code modules out of the three libraries in `third_party\`, translates
 them once per GPU target, several at a time, and merges everything into
 `runtime\build\shipped\ComputeCache\zluda2.db` (with the `coverage.txt` the
 runtime checks the GPU against), where `package.py` takes it from. It needs ZLUDA's driver in `runtime\build\bin\zluda\zluda_real.dll` (the
@@ -338,8 +345,11 @@ same one you will package), an AMD GPU with the HIP SDK, and Python. Expect
 it to take hours.
 
 The script builds the cache for the generic targets of RDNA2, RDNA3 and
-RDNA4, and also for gfx1100 and gfx1101, since those cards get some custom
-optimizations. You can choose which targets to build by editing
+RDNA4, and, for the neural rendering network only, for gfx1100 and gfx1101, since those cards get
+some custom optimizations. `--only fb_046,fb_047` translates just the modules whose numbers (those of
+the library: name it too) it lists, which is how a cache is refilled after a change that touched a few
+of them; a module whose PTX did not change keeps its row, but the rows are keyed by the ZLUDA commit,
+so a new commit means rows to re-key (their `zluda_version` column) or a full run. You can choose which targets to build by editing
 `NATIVE_TARGETS` and `GENERIC_TARGETS` in the script, or with `--targets`
 (which builds every target it names without those optimizations).
 

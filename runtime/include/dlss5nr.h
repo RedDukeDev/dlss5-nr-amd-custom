@@ -279,6 +279,143 @@ DLSS5NR_API void dlss5nr_get_status(dlss5nr_context *context, dlss5nr_status *st
  * ZLUDA's nvapi64.dll, not the host's stand-ins. Safe from any thread. */
 DLSS5NR_API uint32_t dlss5nr_loader_thread(dlss5nr_context *context);
 
+
+/* ------------------------------------------------------------------------
+ * Upscalers: NVIDIA's super resolution and ray reconstruction.
+ *
+ * Unlike the neural rendering above these answer in the frame they are asked
+ * for: the upscaled image is the game's next input. So the host cannot hand
+ * them a frame inside a command list it is still recording. It calls
+ * dlss5nr_upscaler_evaluate at a boundary of its own making: everything it
+ * recorded up to the upscale has been submitted to `queue`, and what it
+ * records after goes to the same queue afterwards. (The host splits the game's
+ * command list there: OptiScaler does, with the module taken from d4r.) The
+ * function converts the game's textures into the network's formats on the
+ * queue, runs the network, and converts the answer into the game's output.
+ * Nothing it submits to the queue is waited for on the CPU when the GPU can do
+ * the waiting (see dlss5nr_upscaler_status).
+ * ------------------------------------------------------------------------ */
+
+typedef struct dlss5nr_upscaler dlss5nr_upscaler;
+
+enum dlss5nr_upscaler_kind {
+    DLSS5NR_UPSCALER_SUPER_RESOLUTION = 0,   /* nvngx_dlss.dll */
+    DLSS5NR_UPSCALER_RAY_RECONSTRUCTION = 1, /* nvngx_dlssd.dll */
+};
+
+/* NVIDIA's DLSS creation flags, as the games give them. */
+enum dlss5nr_upscaler_flags {
+    DLSS5NR_UPSCALER_HDR = 1,
+    DLSS5NR_UPSCALER_MOTION_LOW_RES = 2,
+    DLSS5NR_UPSCALER_MOTION_JITTERED = 4,
+    DLSS5NR_UPSCALER_DEPTH_INVERTED = 8,
+    DLSS5NR_UPSCALER_AUTO_EXPOSURE = 64,
+};
+
+typedef struct dlss5nr_upscaler_create_info {
+    uint32_t struct_size;
+    ID3D12Device *device;
+    int32_t kind;                  /* enum dlss5nr_upscaler_kind */
+    /* As in dlss5nr_create_info; snippet_path is nvngx_dlss.dll or nvngx_dlssd.dll
+     * (null: runtime_dir\ plus that name). */
+    const wchar_t *runtime_dir;
+    const wchar_t *snippet_path;
+    const wchar_t *data_dir;
+    dlss5nr_log_fn log;
+    void *log_user;
+    /* The image sizes, in pixels. */
+    uint32_t render_width, render_height;
+    uint32_t output_width, output_height;
+    uint32_t flags;                /* enum dlss5nr_upscaler_flags */
+    int32_t quality;               /* NVIDIA's perf/quality value: 0 max performance .. 2 max quality, 5 DLAA */
+    int32_t preset;                /* 0: the library's own choice */
+} dlss5nr_upscaler_create_info;
+
+/* A game texture and the state it is in at the boundary (D3D12_RESOURCE_STATES);
+ * it is returned in that state. */
+typedef struct dlss5nr_resource {
+    ID3D12Resource *resource;
+    uint32_t state;
+} dlss5nr_resource;
+
+/* A position in a texture, in pixels from its top left corner: where the game's rendered region starts. */
+typedef struct dlss5nr_point {
+    uint32_t x, y;
+} dlss5nr_point;
+
+typedef struct dlss5nr_upscaler_frame {
+    uint32_t struct_size;
+    dlss5nr_resource color;        /* read: the render resolution image */
+    dlss5nr_resource depth;        /* read */
+    dlss5nr_resource motion;       /* read: pixels at the render resolution, times motion_scale */
+    dlss5nr_resource output;       /* written: needs an unordered access view of its format */
+    /* Ray reconstruction's guides; all null for super resolution. normals carries the roughness in its
+     * alpha unless roughness is given. hit_distance may be null. */
+    dlss5nr_resource diffuse_albedo, specular_albedo, normals, roughness, hit_distance;
+    float jitter_x, jitter_y;
+    float motion_scale_x, motion_scale_y;
+    float pre_exposure, exposure_scale, sharpness;
+    int32_t reset;
+    /* 16 floats each, as the game keeps them. Required for ray reconstruction. */
+    const float *world_to_view;
+    const float *view_to_clip;
+
+    /* What follows was added after the first version of this structure: a host built before it leaves it
+     * zero (struct_size says so), and everything below then means "the game has none / the whole texture". */
+
+    /* The game's exposure as a texture (one texel read), and the two masks that mark where the network's
+     * history is not to be trusted: the reactive mask (NVIDIA calls it the bias current colour mask) and
+     * the transparency mask. Each may be null. Their formats are the game's own (R8, R16, R32, half...). */
+    dlss5nr_resource exposure;
+    dlss5nr_resource reactive_mask;
+    dlss5nr_resource transparency_mask;
+
+    /* The region that was rendered this frame, in pixels, starting at the origins below. A game that scales
+     * its resolution dynamically renders anywhere from half the output to the whole of it, whatever size
+     * the upscaler was created for (the library refuses anything else). 0: the size it was created for.
+     * The same region of every input. */
+    uint32_t render_width, render_height;
+    /* Where that region starts in each texture (a game renders into a corner of a larger target, or
+     * several views side by side). The guides of ray reconstruction and the masks share mask_origin. */
+    dlss5nr_point color_origin, depth_origin, motion_origin, guide_origin, mask_origin;
+    /* Where the output starts in the game's output texture; its size is the size the upscaler was
+     * created for. */
+    dlss5nr_point output_origin;
+} dlss5nr_upscaler_frame;
+
+typedef struct dlss5nr_upscaler_status {
+    uint32_t struct_size;
+    char message[256];             /* why creation failed, when it did */
+    uint32_t native_kernels;       /* kernels the gate runs natively */
+    float evaluation_ms;           /* the last evaluation, queue work included, as the CPU saw it */
+    int32_t gpu_synchronised;      /* 1: the GPU waits for the GPU; 0: the CPU does */
+} dlss5nr_upscaler_status;
+
+/* Loads the network and creates the feature: tens of milliseconds to a few seconds, on the calling
+ * thread's behalf (see dlss5nr_upscaler_loader_thread). Returns 0 on success; else *out is null and
+ * dlss5nr_upscaler_last_error says why. One upscaler per process (one network: a game that
+ * makes ray reconstruction and super resolution both has to destroy one first); the neural rendering runs
+ * beside it, each with an NGX host of its own. */
+DLSS5NR_API int dlss5nr_upscaler_create(const dlss5nr_upscaler_create_info *info, dlss5nr_upscaler **out);
+
+/* The host must have waited for the GPU to finish the frames that used it. */
+DLSS5NR_API void dlss5nr_upscaler_destroy(dlss5nr_upscaler *upscaler);
+
+/* Runs one frame at a boundary, as described above. Returns 0 on success; on failure the output was
+ * not written and the host should do the upscale itself. */
+DLSS5NR_API int dlss5nr_upscaler_evaluate(dlss5nr_upscaler *upscaler, ID3D12CommandQueue *queue,
+                                          const dlss5nr_upscaler_frame *frame);
+
+DLSS5NR_API void dlss5nr_upscaler_get_status(dlss5nr_upscaler *upscaler, dlss5nr_upscaler_status *status);
+
+/* The text of the last failure of dlss5nr_upscaler_create (this thread's). */
+DLSS5NR_API const char *dlss5nr_upscaler_last_error(void);
+
+/* The id of the thread that loads the libraries while dlss5nr_upscaler_create runs, else 0. A host that
+ * intercepts library loads must let this thread's loads through untouched, as for dlss5nr_loader_thread.
+ * Safe from any thread. */
+DLSS5NR_API uint32_t dlss5nr_upscaler_loader_thread(void);
+
 #ifdef __cplusplus
 }
 #endif

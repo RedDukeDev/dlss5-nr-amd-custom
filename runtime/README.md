@@ -76,6 +76,42 @@ At full resolution, with the residual unclamped, the output is the network's
 own image. It can be compared with what other tools produce for the same
 picture.
 
+## Upscalers: super resolution and ray reconstruction
+
+The same runtime runs NVIDIA's DLSS upscalers (`nvngx_dlss.dll`, `nvngx_dlssd.dll`), through
+the C interface in the "Upscalers" section of [`include/dlss5nr.h`](include/dlss5nr.h). An
+upscaler has to answer in the frame it is asked for, so the host cannot call it from inside a
+command list it is still recording: it splits the list at the upscale and calls
+`dlss5nr_upscaler_evaluate` in between, with everything it recorded before submitted to the queue.
+OptiScaler's fork does that (`upscalers/dlssz`, with the command-list module taken from d4r) and
+offers the result as the DLSS upscaler on a GPU that is not NVIDIA's; the runtime converts the game's
+textures (any format, any state, a sub-rect of a larger texture, dynamic resolution, exposure, the
+reactive and transparency masks) into the network's own, runs it, and converts the answer into the
+game's output.
+
+Beside the neural rendering's files the `dlss5nr` folder then holds `nvngx_dlss.dll` and
+`nvngx_dlssd.dll`, and `zluda\ngx_sr`, `zluda\ngx_rr` (an NGX host per network, so that they run
+beside the neural rendering). `kernels\kernels_sr.txt` lists the native kernels
+(`kernels\build_sr_kernels.py` in the repository, from d4r's sources): the eleven layers of preset K and the five Swin
+blocks of presets L and M. One cache holds all the networks' translations
+(`tools\prepare_cache.py` for each, merged).
+
+What was measured on an RX 7900 XT, 960x540 to 1920x1080:
+
+| network | time per frame | note |
+|---|---|---|
+| super resolution, preset M (the default) | 5.7 ms | its heavy layers native; translated they take 20 to 30 ms |
+| super resolution, preset K and J | 4 ms | its heavy layers native, the rest translated |
+| ray reconstruction | 72 ms | translated, no native kernels yet |
+
+The upscaler harness (`dlss5up_harness.exe --kind sr|rr --runtime-dir DIR --data-dir DIR --snippet DLL`)
+feeds synthetic frames of ordinary game textures and has what is needed to tell a wrong picture from a
+right one: `--scene gradient|const|corner|topleft|ramp`, `--means` (the output's mean colour after each
+frame), `--preset`, `--flags`, `--subrect`, `--dynamic WxH`, `--exposure`, `--masks`, `--reset-every`,
+`--reset-at`, `--reset-parity`. Run it from a folder with no `dxgi.dll` of OptiScaler's in it.
+`tests/dx12/dx12ngx.cpp` is a Direct3D 12 "game" that upscales through the NGX API, to try the
+OptiScaler integration.
+
 ## Logs
 
 The logs are in `cache\`:

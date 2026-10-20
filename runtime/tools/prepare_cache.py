@@ -14,7 +14,9 @@ produced it, so it has to be rebuilt with every ZLUDA that is shipped.
 
 What it does:
 
-  1. reads the code modules straight out of nvngx_dlssnr.dll -- the fatbins as
+  1. reads the code modules straight out of NVIDIA's libraries (nvngx_dlssnr.dll for the
+     neural rendering, nvngx_dlss.dll for super resolution, nvngx_dlssd.dll for ray
+     reconstruction; the cache is one file for all three) -- the fatbins as
      they sit in the file, not PTX extracted from them. The driver picks which
      embedded module to translate and derives the cache key from that choice,
      so handing it the same bytes is what makes the key match at run time;
@@ -96,6 +98,9 @@ SELECTIVE_FUSE = "2.13"
 # -- a fusion knob, a lowering, a split codegen -- would ship different code
 # under the same key, and nothing would ever notice.
 ZLUDA_VARIABLES_SET_HERE = {"ZLUDA_TARGET_ARCH", "ZLUDA_CACHE_DIR", "ZLUDA_SELECTIVE_FUSE"}
+
+# NVIDIA's libraries, in the order their modules are named.
+LIBRARIES = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll")
 
 FATBIN_MAGIC = struct.pack("<I", 0xBA55ED50)
 
@@ -440,7 +445,7 @@ class Unit:
         self.target = target
         self.module = module
         self.fused = fused
-        self.name = os.path.basename(module)
+        self.name = "%s/%s" % (os.path.basename(os.path.dirname(module)), os.path.basename(module))
         self.directory = os.path.join(work_dir, "unit_%03d_%s" % (index, target))
         self.database = os.path.join(self.directory, "zluda2.db")
         self.log_path = os.path.join(self.directory, "worker.log")
@@ -656,9 +661,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Builds the translation cache shipped with the runtime.",
         epilog="Run this once per ZLUDA build.")
-    parser.add_argument("network", nargs="?",
-                        default=os.path.join(os.path.dirname(PROJECT), "third_party", "nvngx_dlssnr.dll"),
-                        help="path to nvngx_dlssnr.dll (default: third_party\\nvngx_dlssnr.dll)")
+    parser.add_argument("networks", nargs="*",
+                        help="NVIDIA's libraries to translate: nvngx_dlssnr.dll (neural rendering), "
+                             "nvngx_dlss.dll (super resolution), nvngx_dlssd.dll (ray reconstruction). "
+                             "Default: those of them that sit in third_party\\")
     parser.add_argument("--driver", default=os.path.join(BIN, "zluda", "zluda_real.dll"),
                         help="ZLUDA's driver (default: build\\bin\\zluda\\zluda_real.dll)")
     parser.add_argument("--out", default=os.path.join(PROJECT, "build", "shipped", "ComputeCache"),
@@ -666,10 +672,16 @@ def main():
                              "where package.py takes it from)")
     parser.add_argument("--work", default=os.path.join(PROJECT, "build", "cache"),
                         help="scratch directory for the modules and the per-translation databases")
-    parser.add_argument("--targets", help="comma-separated GPU targets, overriding the defaults")
+    parser.add_argument("--targets", help="comma-separated GPU targets for every library, overriding the "
+                                          "defaults (neural rendering: the exact RDNA3 parts and the generic "
+                                          "families; the upscalers: the generic families)")
     parser.add_argument("--jobs", type=int, default=0,
                         help="how many translations at once; 0 (the default) decides from the "
                              "machine, 1 reproduces the old strictly sequential behaviour")
+    parser.add_argument("--only", help="translate only the modules whose file name (fb_NNN_...) starts "
+                                       "with one of these comma-separated prefixes, e.g. fb_046,fb_047: "
+                                       "to refill a cache after a change that touched a few modules "
+                                       "(the numbers are those of the library, so name one library too)")
     parser.add_argument("--keep", action="store_true",
                         help="keep the scratch directory instead of deleting it")
     parser.add_argument("--resume", action="store_true",
@@ -684,7 +696,14 @@ def main():
 
     # Unlike in a game, the name does not matter here: only cuModuleLoadData
     # is called, never the network, which is what insists on nvcuda.dll.
-    for path, what in ((arguments.network, "the network"), (arguments.driver, "ZLUDA's driver")):
+    if not arguments.networks:
+        third_party = os.path.join(os.path.dirname(PROJECT), "third_party")
+        arguments.networks = [os.path.join(third_party, name) for name in LIBRARIES
+                              if os.path.isfile(os.path.join(third_party, name))]
+        if not arguments.networks:
+            raise SystemExit("no library of NVIDIA's in %s: put nvngx_dlssnr.dll, nvngx_dlss.dll and "
+                             "nvngx_dlssd.dll there, or name them" % third_party)
+    for path, what in [(n, "the library") for n in arguments.networks] + [(arguments.driver, "ZLUDA's driver")]:
         if not os.path.isfile(path):
             raise SystemExit("%s was not found at %s" % (what, path))
 
@@ -694,29 +713,44 @@ def main():
         print("ignoring %s from the environment: the cache key does not record them, so they "
               "would change the shipped code unnoticed" % ", ".join(stray))
 
-    if arguments.targets:
-        native = []
-        generic = [t.strip() for t in arguments.targets.split(",") if t.strip()]
-    else:
-        native, generic = NATIVE_TARGETS, GENERIC_TARGETS
-    targets = native + generic
+    override = [x.strip() for x in arguments.targets.split(",") if x.strip()] if arguments.targets else None
 
+    # Per library: the exact parts (fused) and the generic families the neural rendering gets, the
+    # generic families alone for the upscalers.
     modules_dir = os.path.join(arguments.work, "modules")
     if os.path.isdir(modules_dir):
         shutil.rmtree(modules_dir)
-    modules = extract_modules(arguments.network, modules_dir)
+    jobs = []        # (module, native targets, generic targets)
+    targets = []     # every target of every library, in order, for coverage.txt
+    for network in arguments.networks:
+        stem = os.path.splitext(os.path.basename(network))[0]
+        if override is not None:
+            native, generic = [], override
+        elif stem.lower() == "nvngx_dlssnr":
+            native, generic = NATIVE_TARGETS, GENERIC_TARGETS
+        else:
+            native, generic = [], GENERIC_TARGETS
+        modules = extract_modules(network, os.path.join(modules_dir, stem))
+        if arguments.only:
+            prefixes = tuple(p.strip() for p in arguments.only.split(",") if p.strip())
+            modules = [m for m in modules if os.path.basename(m).startswith(prefixes)]
+        jobs += [(m, native, generic) for m in modules]
+        targets += [x for x in native + generic if x not in targets]
+    if not jobs:
+        raise SystemExit("--only %s matches no module" % arguments.only)
+    jobs.sort(key=lambda job: os.path.getsize(job[0]), reverse=True)
 
     # One unit per (module, target), largest module first so the long poles are
     # already running while the short ones fill in around them. Within a module
     # the targets are adjacent, which costs nothing and keeps the log readable.
     units = []
-    for module in modules:
-        for target in targets:
+    for module, native, generic in jobs:
+        for target in native + generic:
             units.append(Unit(target, module, target in native, arguments.work, len(units)))
 
     ceiling = arguments.jobs if arguments.jobs > 0 else (os.cpu_count() or 1)
     free_mb = free_physical_mb()
-    print("%d modules x %d targets = %d translations" % (len(modules), len(targets), len(units)))
+    print("%d modules, %d targets = %d translations" % (len(jobs), len(targets), len(units)))
     print("up to %d at a time%s; %d MB free now, %d MB reserved, %d MB allowed per translation"
           % (ceiling, "" if arguments.jobs > 0 else " as memory allows",
              free_mb, RESERVE_MB, PEAK_PER_JOB_MB))
@@ -744,14 +778,21 @@ def main():
 
     held = merge(os.path.join(arguments.out, "zluda2.db"), units)
 
-    # The check the old shape could not make: every target must hold every
-    # module. A shortfall here means rows went missing between a successful
-    # translation and the merge, and shipping that cache would make a user wait
-    # for exactly the module it is missing.
-    missing = {t: len(modules) - held.get(t, 0) for t in targets if held.get(t, 0) != len(modules)}
+    # The check the old shape could not make: the cache must hold every row the translations
+    # produced. A shortfall here means rows went missing between a successful translation and the
+    # merge, and shipping that cache would make a user wait for exactly the module it is missing.
+    # (Counted in distinct rows: a module two libraries share is translated twice, filed once.)
+    expected = {}
+    for unit in units:
+        if os.path.exists(unit.database):
+            connection = sqlite3.connect(unit.database)
+            for row in connection.execute("SELECT hash, backend_key, device FROM modules"):
+                expected.setdefault(row[2], set()).add(row[:2])
+            connection.close()
+    missing = {d: len(rows) - held.get(d, 0) for d, rows in expected.items() if held.get(d, 0) != len(rows)}
     if missing:
         for target, short in missing.items():
-            print("  %-18s is short by %d of %d modules" % (target, short, len(modules)))
+            print("  %-18s is short by %d of %d modules" % (target, short, len(expected[target])))
         raise SystemExit("the merged cache is incomplete")
 
     # The runtime reads this before it starts the network, and refuses a GPU
@@ -763,8 +804,7 @@ def main():
 
     if not arguments.keep:
         shutil.rmtree(arguments.work, ignore_errors=True)
-    print("\nEvery target holds all %d modules. package.py ships this cache with the runtime."
-          % len(modules))
+    print("\nEvery translation is in the cache. package.py ships it with the runtime.")
     return 0
 
 

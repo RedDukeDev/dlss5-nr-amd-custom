@@ -178,12 +178,90 @@ inline void end(CUstream stream, const char *name, bool native_ran) {
 
 } // namespace profile
 
+// DLSS5NR_GATE_TRACE also times every launch (the launch and the wait for it) and prints the totals per
+// kernel, largest first, when the process unloads the gate. A tracing run serialises the work, so the
+// times are each kernel's own, not the frame's.
+namespace trace_times {
+struct Row {
+    char name[112];
+    double ms;
+    unsigned launches;
+};
+Row g_rows[256];
+unsigned g_count = 0;
+
+inline double now_ms() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
+}
+
+inline void report();
+
+inline void add(const char *name, double ms) {
+    static unsigned adds = 0;
+    EnterCriticalSection(&g_lock);
+    unsigned i = 0;
+    while (i < g_count && strcmp(g_rows[i].name, name) != 0) ++i;
+    if (i == g_count && g_count < sizeof g_rows / sizeof g_rows[0]) {
+        strncpy(g_rows[i].name, name, sizeof g_rows[i].name - 1);
+        ++g_count;
+    }
+    if (i < g_count) {
+        g_rows[i].ms += ms;
+        g_rows[i].launches += 1;
+    }
+    const bool print = ++adds % 100 == 0;
+    LeaveCriticalSection(&g_lock);
+    // A tracing run ends by process termination, which no destructor sees: the table is rewritten
+    // as the run goes, and the last copy in the log is the result.
+    if (print) report();
+}
+
+inline void report() {
+    if (!g_count) return;
+    double total = 0.0;
+    for (unsigned i = 0; i < g_count; ++i) total += g_rows[i].ms;
+    logf("[times] %.1f ms in %u kernels\n", total, g_count);
+    bool shown[256] = {};
+    for (unsigned rank = 0; rank < g_count; ++rank) {
+        unsigned best = g_count;
+        for (unsigned k = 0; k < g_count; ++k)
+            if (!shown[k] && (best == g_count || g_rows[k].ms > g_rows[best].ms)) best = k;
+        shown[best] = true;
+        logf("[times] %5.1f%% %10.2f ms %6u launches  %s\n", 100.0 * g_rows[best].ms / total, g_rows[best].ms,
+             g_rows[best].launches, g_rows[best].name);
+    }
+}
+}  // namespace trace_times
+
 extern "C" {
+
+// The runtime hands the gate the native kernels of each network as that network loads, after the first
+// launch may have happened: the manifests of the networks loaded together are all the gate knows.
+// Returns how many kernels it now has.
+__declspec(dllexport) int dlss5nr_gate_add_manifest(const char *path) {
+    static CRITICAL_SECTION lock;
+    static bool made = false;
+    if (!made) {
+        InitializeCriticalSection(&lock);
+        made = true;
+    }
+    EnterCriticalSection(&lock);
+    native::load_manifest();   // the one the environment names, once
+    if (path && *path) native::load_one_manifest(path);
+    const int count = (int)native::g_entry_count;
+    LeaveCriticalSection(&lock);
+    return count;
+}
 
 __declspec(dllexport) CUresult cuModuleGetFunction(CUfunction *out, CUmodule module, const char *name) {
     if (!g_get_function) g_get_function = real("cuModuleGetFunction");
     auto fn = (CUresult (*)(CUfunction *, CUmodule, const char *))g_get_function;
     const CUresult r = fn(out, module, name);
+    // A kernel the translation does not have is otherwise reported only as the caller's own generic error.
+    if (r != 0) logf("[module] cuModuleGetFunction(%s) -> %d\n", name ? name : "?", r);
     if (r == 0 && out && name) {
         EnterCriticalSection(&g_lock);
         if (g_name_count < sizeof g_names / sizeof g_names[0]) {
@@ -203,9 +281,41 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
     if (!g_launch) g_launch = real("cuLaunchKernel");
     auto fn = (CUresult (*)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                             unsigned, CUstream, void **, void **))g_launch;
+    // DLSS5NR_GATE_SKIP=<kernel name>: do not launch that kernel (isolates which one faults)
+    {
+        static char skip[128];
+        static const bool have = GetEnvironmentVariableA("DLSS5NR_GATE_SKIP", skip, sizeof skip) > 0;
+        if (have && strcmp(skip, name_of(f)) == 0) return 0;
+    }
     if (!profile::on()) {
-        if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) return 0;
-        return fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+        const double started = trace_times::now_ms();
+        if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) {
+            static const bool trace_native = GetEnvironmentVariableA("DLSS5NR_GATE_TRACE", nullptr, 0) > 0;
+            if (trace_native) {
+                static HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+                static void *sync = hip ? (void *)GetProcAddress(hip, "hipDeviceSynchronize") : nullptr;
+                const int status = sync ? ((int (*)())sync)() : 0;
+                trace_times::add(name_of(f), trace_times::now_ms() - started);
+                logf("[trace] native %s grid %u,%u,%u block %u,%u,%u -> %d\n", name_of(f), gx, gy, gz, bx, by, bz, status);
+            }
+            return 0;
+        }
+        CUresult r = fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+        // DLSS5NR_GATE_TRACE=1: wait for every launch, so a fault is blamed on the kernel that caused it
+        // rather than on whichever one is launched next (a launch failure is reported late).
+        static const bool trace = GetEnvironmentVariableA("DLSS5NR_GATE_TRACE", nullptr, 0) > 0;
+        if (trace && r == 0) {
+            static HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+            static void *sync = hip ? (void *)GetProcAddress(hip, "hipDeviceSynchronize") : nullptr;
+            if (sync) r = ((CUresult(*)())sync)() ? 719 : 0;
+            trace_times::add(name_of(f), trace_times::now_ms() - started);
+            logf("[trace] %s grid %u,%u,%u block %u,%u,%u -> %d\n", name_of(f), gx, gy, gz, bx, by, bz, r);
+        }
+        // A refused launch is otherwise silent: the caller only sees its own generic error.
+        if (r != 0)
+            logf("[launch] %s grid %u,%u,%u block %u,%u,%u shared %u -> error %d\n", name_of(f), gx, gy, gz, bx, by, bz,
+                 shared, r);
+        return r;
     }
     profile::begin(stream);
     const bool native_ran = native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra);
@@ -229,6 +339,7 @@ bool same_symbol(const char *symbol, const char *name) {
 
 void substitute(const char *symbol, void **pfn) {
     if (!symbol || !pfn || !*pfn) return;
+    if (GetEnvironmentVariableA("DLSS5NR_GATE_TRACE", nullptr, 0) > 0) logf("[symbol] %s\n", symbol);
     if (same_symbol(symbol, "cuModuleGetFunction")) {
         g_get_function = *pfn;
         *pfn = (void *)&cuModuleGetFunction;
@@ -265,6 +376,9 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) InitializeCriticalSection(&g_lock);
     // At a normal unload only: during process termination (reserved != null)
     // other threads are already gone and the log may be half torn down.
+    // The kernel totals are written even at process termination (reserved != null), where the
+    // other reports are skipped: a run under DLSS5NR_GATE_TRACE ends that way and these are its result.
+    if (reason == DLL_PROCESS_DETACH) trace_times::report();
     if (reason == DLL_PROCESS_DETACH && !reserved) native::report();
     return TRUE;
 }

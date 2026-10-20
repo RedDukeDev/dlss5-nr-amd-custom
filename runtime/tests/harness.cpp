@@ -441,6 +441,62 @@ int wmain(int argc, wchar_t **argv) {
     dlss5nr_context *nr = nullptr;
     if (dlss5nr_create(&info, &nr) != 0) return fail("dlss5nr_create failed"), 1;
 
+    // DLSS5NR_HARNESS_SR=<nvngx_dlss.dll>: a super resolution upscaler beside the neural rendering, asked for
+    // a frame every frame of this loop on the same queue, the way a game with both would. What it makes
+    // is not looked at; what is measured is that both run, and how long the upscaler's frames take.
+    dlss5nr_upscaler *rider = nullptr;
+    ID3D12Resource *rider_color = nullptr, *rider_depth = nullptr, *rider_motion = nullptr, *rider_output = nullptr;
+    std::vector<double> rider_ms;
+    wchar_t rider_dll[512];
+    if (GetEnvironmentVariableW(L"DLSS5NR_HARNESS_SR", rider_dll, 512)) {
+        const UINT rw = 1280, rh = 720, ow = 1920, oh = 1080;
+        rider_color = gpu.texture(rw, rh, DXGI_FORMAT_R16G16B16A16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        rider_depth = gpu.texture(rw, rh, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        rider_motion = gpu.texture(rw, rh, DXGI_FORMAT_R16G16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        rider_output = gpu.texture(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        std::vector<uint16_t> col((size_t)rw * rh * 4), mv((size_t)rw * rh * 2, 0);
+        std::vector<float> dep((size_t)rw * rh, 0.2f);
+        for (size_t i = 0; i < (size_t)rw * rh; ++i) {
+            const float x = (float)(i % rw) / rw, y = (float)(i / rw) / rh;
+            col[i * 4 + 0] = to_half(x);
+            col[i * 4 + 1] = to_half(y);
+            col[i * 4 + 2] = to_half(0.4f + 0.1f * sinf((float)i * 0.01f));
+            col[i * 4 + 3] = to_half(1.0f);
+        }
+        ID3D12Resource *s1 = gpu.buffer((UINT64)rw * rh * 8 + 65536, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource *s2 = gpu.buffer((UINT64)rw * rh * 4 + 65536, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource *s3 = gpu.buffer((UINT64)rw * rh * 4 + 65536, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        gpu.begin();
+        gpu.upload(rider_color, col.data(), rw, rh, 8, s1);
+        gpu.upload(rider_depth, dep.data(), rw, rh, 4, s2);
+        gpu.upload(rider_motion, mv.data(), rw, rh, 4, s3);
+        barrier(gpu.cmd, rider_color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(gpu.cmd, rider_depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(gpu.cmd, rider_motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.submit_and_wait();
+        s1->Release();
+        s2->Release();
+        s3->Release();
+        dlss5nr_upscaler_create_info up{};
+        up.struct_size = sizeof up;
+        up.device = gpu.device;
+        up.kind = DLSS5NR_UPSCALER_SUPER_RESOLUTION;
+        up.runtime_dir = runtime_dir.empty() ? nullptr : runtime_dir.c_str();
+        up.snippet_path = rider_dll;
+        up.data_dir = data_dir.empty() ? nullptr : data_dir.c_str();
+        up.log = &log_sink;
+        up.render_width = rw;
+        up.render_height = rh;
+        up.output_width = ow;
+        up.output_height = oh;
+        up.flags = DLSS5NR_UPSCALER_HDR | DLSS5NR_UPSCALER_MOTION_LOW_RES | DLSS5NR_UPSCALER_DEPTH_INVERTED | DLSS5NR_UPSCALER_AUTO_EXPOSURE;
+        up.quality = 2;
+        if (dlss5nr_upscaler_create(&up, &rider) != 0) {
+            printf("the upscaler rider could not be created: %s\n", dlss5nr_upscaler_last_error());
+            rider = nullptr;
+        }
+    }
+
     dlss5nr_settings settings;
     dlss5nr_default_settings(&settings);
     settings.resolution_scale = scale;
@@ -666,6 +722,23 @@ int wmain(int argc, wchar_t **argv) {
         record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         gpu.submit_and_wait();
         dlss5nr_present(nr, gpu.queue);
+        if (rider) {
+            dlss5nr_upscaler_frame uf{};
+            uf.struct_size = sizeof uf;
+            uf.color = {rider_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            uf.depth = {rider_depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            uf.motion = {rider_motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            uf.output = {rider_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            uf.motion_scale_x = uf.motion_scale_y = 1.0f;
+            uf.pre_exposure = uf.exposure_scale = 1.0f;
+            uf.reset = frame == 0;
+            const auto r0 = std::chrono::steady_clock::now();
+            if (dlss5nr_upscaler_evaluate(rider, gpu.queue, &uf) != 0)
+                printf("the upscaler failed: %s\n", dlss5nr_upscaler_last_error());
+            gpu.begin();
+            gpu.submit_and_wait();   // an empty list: what it waits for is everything before it
+            rider_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+        }
 
         if (series_file && warm >= 0 && frame >= warm + series_start && frame < warm + series_start + series_count) {
             std::vector<uint8_t> raw;
@@ -694,6 +767,13 @@ int wmain(int argc, wchar_t **argv) {
            frame, composed, status.network_width, status.network_height, status.evaluation_ms,
            status.evaluations_per_second, status.native_kernels, record_ms / frame);
     printf("the last result was captured %u frames before it was composed\n", status.result_latency);
+    if (!rider_ms.empty()) {
+        double sum = 0.0, worst = 0.0;
+        const size_t from = rider_ms.size() > 40 ? rider_ms.size() - 40 : 0;
+        for (size_t i = from; i < rider_ms.size(); ++i) sum += rider_ms[i], worst = std::max(worst, rider_ms[i]);
+        printf("the upscaler rider: %zu frames, the last %zu took %.2f ms each, the slowest %.2f ms\n", rider_ms.size(),
+               rider_ms.size() - from, sum / (double)(rider_ms.size() - from), worst);
+    }
     if (frame_ms.size() > 60) {
         double sum = 0.0;
         for (size_t i = frame_ms.size() - 40; i < frame_ms.size(); ++i) sum += frame_ms[i];

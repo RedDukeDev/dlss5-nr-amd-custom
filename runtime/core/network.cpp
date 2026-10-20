@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -17,6 +18,23 @@
 #include "../common/ngx_cuda.h"
 
 namespace dlss5nr {
+
+// What one network owns: its NGX host (a copy of nvngx.dll of its own, so the snippets' globals do not meet),
+// the snippet, and the feature made from it.
+struct Own {
+    HMODULE ngx = nullptr;
+    const char *(*ngx_load)(const wchar_t *) = nullptr;
+    NVSDK_NGX_Result (*ngx_init)(unsigned long long, const wchar_t *, NVSDK_NGX_Version,
+                                 unsigned long long, unsigned, void *) = nullptr;
+    NVSDK_NGX_Result (*ngx_populate)(NVSDK_NGX_Parameter **) = nullptr;
+    NVSDK_NGX_Result (*ngx_create)(NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **) = nullptr;
+    NVSDK_NGX_Result (*ngx_evaluate)(NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *) = nullptr;
+    NVSDK_NGX_Result (*ngx_release)(NVSDK_NGX_Handle *) = nullptr;
+    NVSDK_NGX_Result (*ngx_shutdown)(void) = nullptr;
+    NVSDK_NGX_Parameter *params = nullptr;
+    NVSDK_NGX_Handle *feature = nullptr;
+};
+
 namespace {
 
 void (*g_log)(int, const char *) = nullptr;
@@ -43,29 +61,25 @@ void __cdecl ngx_log_sink(const char *message, int level, unsigned feature) {
     g_log(3, line);
 }
 
+// What the whole process shares: ZLUDA and the gate, the CUDA context, the translation cache. Made by
+// the first network that loads, used by all of them.
 struct State {
     HMODULE nvapi = nullptr;
     HMODULE zluda = nullptr;
     HMODULE gate = nullptr;
-    HMODULE ngx = nullptr;
     CudaApi cu{};
     CUcontext context = nullptr;
-
-    const char *(*ngx_load)(const wchar_t *) = nullptr;
-    NVSDK_NGX_Result (*ngx_init)(unsigned long long, const wchar_t *, NVSDK_NGX_Version,
-                                 unsigned long long, unsigned, void *) = nullptr;
-    NVSDK_NGX_Result (*ngx_populate)(NVSDK_NGX_Parameter **) = nullptr;
-    NVSDK_NGX_Result (*ngx_create)(NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **) = nullptr;
-    NVSDK_NGX_Result (*ngx_evaluate)(NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *) = nullptr;
-    NVSDK_NGX_Result (*ngx_release)(NVSDK_NGX_Handle *) = nullptr;
-    NVSDK_NGX_Result (*ngx_shutdown)(void) = nullptr;
-
-    NVSDK_NGX_Parameter *params = nullptr;
-    NVSDK_NGX_Handle *feature = nullptr;
     std::wstring data_dir;
+    std::string device_name;
+    bool ready = false;     // the part above exists
+    int users = 0;          // networks that have loaded and not shut down
+    std::mutex lock;
+    // The gate learns the native kernels of every network that loads, after it has started.
+    int (*add_manifest)(const char *) = nullptr;
 };
 
 State g;
+
 
 // Copy mode: the queue the pixels are moved on, and the wait for it.
 struct Copier {
@@ -289,6 +303,10 @@ const char *load_cuda_api(HMODULE h, CudaApi &api) {
     LOAD(cuTexObjectDestroy, "cuTexObjectDestroy");
     LOAD(cuArrayGetDescriptor, "cuArrayGetDescriptor");
     LOAD(cuGetErrorString, "cuGetErrorString");
+    *reinterpret_cast<void **>(&api.cuImportExternalSemaphore) = (void *)GetProcAddress(h, "cuImportExternalSemaphore");
+    *reinterpret_cast<void **>(&api.cuDestroyExternalSemaphore) = (void *)GetProcAddress(h, "cuDestroyExternalSemaphore");
+    *reinterpret_cast<void **>(&api.cuWaitExternalSemaphoresAsync) = (void *)GetProcAddress(h, "cuWaitExternalSemaphoresAsync");
+    *reinterpret_cast<void **>(&api.cuSignalExternalSemaphoresAsync) = (void *)GetProcAddress(h, "cuSignalExternalSemaphoresAsync");
     *reinterpret_cast<void **>(&api.cuMemGetInfo) = (void *)GetProcAddress(h, "cuMemGetInfo_v2");
     *reinterpret_cast<void **>(&api.cuMemcpy2D) = (void *)GetProcAddress(h, "cuMemcpy2D_v2");
     *reinterpret_cast<void **>(&api.cuArray3DCreate) = (void *)GetProcAddress(h, "cuArray3DCreate_v2");
@@ -304,6 +322,13 @@ bool cuda_format_of(int dxgi, CUarray_format &format, unsigned &channels) {
     case DXGI_FORMAT_R16G16_FLOAT: format = CU_AD_FORMAT_HALF; channels = 2; return true;
     case DXGI_FORMAT_R32G32_FLOAT: format = CU_AD_FORMAT_FLOAT; channels = 2; return true;
     case DXGI_FORMAT_R32_FLOAT: format = CU_AD_FORMAT_FLOAT; channels = 1; return true;
+    case DXGI_FORMAT_R16_FLOAT: format = CU_AD_FORMAT_HALF; channels = 1; return true;
+    // The formats ray reconstruction's guides are commonly kept in. A normalised integer array reads and
+    // writes as float through the texture or surface, like the half and float ones.
+    case DXGI_FORMAT_R8_UNORM: format = CU_AD_FORMAT_UNSIGNED_INT8; channels = 1; return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: format = CU_AD_FORMAT_UNSIGNED_INT8; channels = 4; return true;
+    case DXGI_FORMAT_R16_UNORM: format = CU_AD_FORMAT_UNSIGNED_INT16; channels = 1; return true;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: format = CU_AD_FORMAT_UNSIGNED_INT16; channels = 4; return true;
     default: return false;
     }
 }
@@ -328,77 +353,137 @@ void *image_param_as(SharedImage &image, bool to_write) {
 
 void set_network_log(void (*sink)(int, const char *)) { g_log = sink; }
 
+Network::Network() : own_(new Own) {}
+Network::~Network() { delete own_; }
+
+// How many native kernels a manifest names, and (unless translation is allowed) whether every code object
+// it names is there.
+static bool check_manifest(const std::wstring &manifest, const std::wstring &runtime_dir, bool may_translate,
+                           uint32_t &count, std::string &error) {
+    FILE *f = _wfopen(manifest.c_str(), L"r");
+    char line[512];
+    while (f && fgets(line, sizeof line, f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p && *p != '#' && *p != '\r' && *p != '\n') {
+            ++count;
+            char name[256] = {}, object[256] = {};
+            if (!may_translate && sscanf(p, "%255s %255s", name, object) == 2) {
+                const std::wstring file = runtime_dir + L"\\kernels\\" + std::wstring(object, object + strlen(object));
+                if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    error = std::string("a native kernel is missing: ") + narrow(file);
+                    fclose(f);
+                    return false;
+                }
+            }
+        }
+    }
+    if (f) fclose(f);
+    return true;
+}
+
 bool Network::load(const NetworkPaths &paths, std::string &error) {
+    Own &o = *own_;
     const std::wstring zluda_dir = paths.runtime_dir + L"\\zluda\\";
-    const std::wstring kernels = paths.runtime_dir + L"\\kernels\\kernels.txt";
+    // The native kernels each network has: a manifest in kernels\. Ray reconstruction has none yet
+    // (its rr2_* kernels run translated), and an empty name means "not expected".
+    const wchar_t *manifest_name = paths.kind == Kind::NeuralRendering   ? L"kernels.txt"
+                                   : paths.kind == Kind::SuperResolution ? L"kernels_sr.txt"
+                                                                         : L"";
+    const std::wstring kernels = paths.runtime_dir + L"\\kernels\\" + manifest_name;
+    const bool expects_natives = manifest_name[0] != 0;
     const std::wstring cache = paths.data_dir + L"\\ComputeCache";
-    g.data_dir = paths.data_dir;
+    kind_ = paths.kind;
 
     const bool may_translate = translation_allowed();
     std::set<std::string> covered;
     if (!may_translate && !read_coverage(cache, covered, error)) return false;
 
-    // Environment first: every consumer reads it on load.
-    //
-    //  - ZLUDA keeps the translated network in its cache, which is shipped
-    //    already filled (tools\prepare_cache.py).
-    //  - The network refuses anything below Blackwell and asks NVAPI; ZLUDA's
-    //    stand-in answers with this architecture.
-    //  - The gate reads its manifest from here, and logs beside our own log.
-    //  - The snippet's own log names file, line and function of every refusal.
-    CreateDirectoryW(cache.c_str(), nullptr);
-    SetEnvironmentVariableW(L"ZLUDA_CACHE_DIR", cache.c_str());
-    SetEnvironmentVariableW(L"ZLUDA_NVAPI_GPU_ARCH", L"0x1B0");
-    if (GetFileAttributesW(kernels.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        SetEnvironmentVariableW(L"NVCUDA_PROXY_NATIVE", kernels.c_str());
-        // One manifest line per native kernel, comments and blanks aside.
-        FILE *f = _wfopen(kernels.c_str(), L"r");
-        char line[512];
-        while (f && fgets(line, sizeof line, f)) {
-            const char *p = line;
-            while (*p == ' ' || *p == '\t') ++p;
-            if (*p && *p != '#' && *p != '\r' && *p != '\n') {
-                ++native_kernels_;
-                char name[256] = {}, object[256] = {};
-                if (!may_translate && sscanf(p, "%255s %255s", name, object) == 2) {
-                    const std::wstring file = paths.runtime_dir + L"\\kernels\\" + std::wstring(object, object + strlen(object));
-                    if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                        error = std::string("a native kernel is missing: ") + narrow(file);
-                        fclose(f);
-                        return false;
-                    }
-                }
-            }
-        }
-        if (f) fclose(f);
+    // Which native kernels this network brings, checked before anything is loaded.
+    bool have_manifest = false;
+    if (!expects_natives) {
+        log(2, "no native kernels for this network: it runs translated");
+    } else if (GetFileAttributesW(kernels.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!check_manifest(kernels, paths.runtime_dir, may_translate, native_kernels_, error)) return false;
+        have_manifest = true;
     } else if (!may_translate) {
         error = "the native kernels are missing: " + narrow(kernels);
         return false;
     } else {
         log(1, "no native kernels at %s: the whole network runs translated", narrow(kernels).c_str());
     }
-    SetEnvironmentVariableW(L"DLSS5NR_GATE_LOG", (paths.data_dir + L"\\gate.log").c_str());
-    SetEnvironmentVariableW(L"__NGX_LOG_LEVEL", L"1");
-    SetEnvironmentVariableW(L"__NGX_ENABLE_OVERRIDE_LOG_PATH", L"1");
-    SetEnvironmentVariableW(L"__NGX_LOG_PATH_OVERRIDE", paths.data_dir.c_str());
 
-    // In dependency order, each by full path, so that the names the others
-    // look for by base name are already in the process: the gate's forwarders
-    // name zluda_real, the snippet asks for nvcuda.dll and nvapi64.dll.
-    if (!(g.nvapi = load_exact(zluda_dir + L"nvapi64.dll", error))) return false;
-    if (!(g.zluda = load_exact(zluda_dir + L"zluda_real.dll", error))) return false;
-    if (!(g.gate = load_exact(zluda_dir + L"nvcuda.dll", error))) return false;
-    if (const char *missing = load_cuda_api(g.gate, g.cu)) {
-        error = std::string("the CUDA driver does not export ") + missing;
-        return false;
+    // The process-wide part, made once by whichever network comes first.
+    {
+        std::lock_guard<std::mutex> guard(g.lock);
+        if (!g.ready) {
+            g.data_dir = paths.data_dir;
+            // Environment first: every consumer reads it on load.
+            //
+            //  - ZLUDA keeps the translated networks in one cache, which is shipped already filled
+            //    (tools\prepare_cache.py).
+            //  - The gate logs beside our own log. Its native kernels are added below, per network.
+            //  - The snippet's own log names file, line and function of every refusal.
+            //  - What GPU the stand-in NVAPI claims to be is decided per snippet by the stand-in itself
+            //    (neural rendering insists on Blackwell, the upscalers are content with Ada).
+            CreateDirectoryW(cache.c_str(), nullptr);
+            SetEnvironmentVariableW(L"ZLUDA_CACHE_DIR", cache.c_str());
+            // Each network is driven from a thread of its own: give each thread its own default stream,
+            // so that one never waits behind the other's kernels (the neural rendering runs for tens of
+            // milliseconds at a time, an upscaler frame wants a few).
+            // (DLSS5NR_PER_THREAD_STREAM=0 keeps the process's one default stream, to compare.)
+            wchar_t per_thread[8] = {};
+            if (!(GetEnvironmentVariableW(L"DLSS5NR_PER_THREAD_STREAM", per_thread, 8) && per_thread[0] == L'0'))
+                SetEnvironmentVariableW(L"ZLUDA_PER_THREAD_STREAM", L"1");
+            SetEnvironmentVariableW(L"DLSS5NR_GATE_LOG", (paths.data_dir + L"\\gate.log").c_str());
+            SetEnvironmentVariableW(L"__NGX_LOG_LEVEL", L"1");
+            SetEnvironmentVariableW(L"__NGX_ENABLE_OVERRIDE_LOG_PATH", L"1");
+            SetEnvironmentVariableW(L"__NGX_LOG_PATH_OVERRIDE", paths.data_dir.c_str());
+
+            // In dependency order, each by full path, so that the names the others look for by base name
+            // are already in the process: the gate's forwarders name zluda_real, the snippets ask for
+            // nvcuda.dll and nvapi64.dll.
+            if (!(g.nvapi = load_exact(zluda_dir + L"nvapi64.dll", error))) return false;
+            if (!(g.zluda = load_exact(zluda_dir + L"zluda_real.dll", error))) return false;
+            if (!(g.gate = load_exact(zluda_dir + L"nvcuda.dll", error))) return false;
+            if (const char *missing = load_cuda_api(g.gate, g.cu)) {
+                error = std::string("the CUDA driver does not export ") + missing;
+                return false;
+            }
+            g.add_manifest = (int (*)(const char *))GetProcAddress(g.gate, "dlss5nr_gate_add_manifest");
+
+            if (!cu_ok(g.cu.cuInit(0), "cuInit", error)) return false;
+            CUdevice device = 0;
+            if (!cu_ok(g.cu.cuDeviceGet(&device, 0), "cuDeviceGet", error)) return false;
+            char name[256] = {};
+            if (g.cu.cuDeviceGetName(name, sizeof name, device) == CUDA_SUCCESS) g.device_name = name;
+            log(2, "device: %s", g.device_name.c_str());
+            if (!cu_ok(g.cu.cuCtxCreate(&g.context, CU_CTX_SCHED_AUTO, device), "cuCtxCreate", error)) return false;
+            g.ready = true;
+        } else if (_wcsicmp(g.data_dir.c_str(), paths.data_dir.c_str()) != 0) {
+            // ZLUDA reads its cache directory once, at start.
+            log(1, "this network asked for the data directory %s, the process already uses %s",
+                narrow(paths.data_dir).c_str(), narrow(g.data_dir).c_str());
+        }
+        ++g.users;
+        counted_ = true;
+    }
+    device_name_ = g.device_name;
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
+
+    if (have_manifest) {
+        // Native kernels are looked up by name at every launch, so adding a network's after another has
+        // started is safe. Without the gate's entry point only the environment is left, which the gate
+        // reads once: fine for the first network, a loss for the later ones.
+        const std::string manifest = narrow(kernels);
+        if (g.add_manifest) {
+            g.add_manifest(manifest.c_str());
+        } else {
+            SetEnvironmentVariableW(L"NVCUDA_PROXY_NATIVE", kernels.c_str());
+            log(1, "the gate cannot add manifests: only the first network's native kernels will run");
+        }
     }
 
-    if (!cu_ok(g.cu.cuInit(0), "cuInit", error)) return false;
-    CUdevice device = 0;
-    if (!cu_ok(g.cu.cuDeviceGet(&device, 0), "cuDeviceGet", error)) return false;
-    char name[256] = {};
-    if (g.cu.cuDeviceGetName(name, sizeof name, device) == CUDA_SUCCESS) device_name_ = name;
-    log(2, "device: %s", device_name_.c_str());
     if (!may_translate) {
         const std::vector<std::string> architectures = gpu_architectures();
         bool served = architectures.empty();   // not told: let the network try
@@ -414,20 +499,22 @@ bool Network::load(const NetworkPaths &paths, std::string &error) {
             return false;
         }
     }
-    if (!cu_ok(g.cu.cuCtxCreate(&g.context, CU_CTX_SCHED_AUTO, device), "cuCtxCreate", error)) return false;
-    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
 
-    // Our NGX runtime. The snippet only accepts calls that come from a module
-    // named nvngx.dll, so every NGX call is made from inside it.
-    if (!(g.ngx = load_exact(zluda_dir + L"nvngx.dll", error))) return false;
-#define NGX(field, symbol)                                                           \
-    do {                                                                             \
-        *reinterpret_cast<void **>(&g.field) = (void *)GetProcAddress(g.ngx, symbol); \
-        if (!g.field) {                                                              \
-            error = "nvngx.dll does not export " symbol                              \
-                    " (another module named nvngx.dll answered?)";                   \
-            return false;                                                            \
-        }                                                                            \
+    // Our NGX runtime. The snippet only accepts calls that come from a module named nvngx.dll, so every
+    // NGX call is made from inside it. Each network has a copy of its own, in a folder of its own, so that
+    // two snippets never share the host's state: Windows loads two files of one name from two folders as
+    // two modules. The first network may use zluda\nvngx.dll itself.
+    const std::wstring host = paths.host_dir.empty() ? zluda_dir + L"nvngx.dll"
+                                                       : zluda_dir + paths.host_dir + L"\\nvngx.dll";
+    if (!(o.ngx = load_exact(host, error))) return false;
+#define NGX(field, symbol)                                                             \
+    do {                                                                               \
+        *reinterpret_cast<void **>(&o.field) = (void *)GetProcAddress(o.ngx, symbol);   \
+        if (!o.field) {                                                                \
+            error = "nvngx.dll does not export " symbol                                \
+                    " (another module named nvngx.dll answered?)";                     \
+            return false;                                                              \
+        }                                                                              \
     } while (0)
     NGX(ngx_load, "ngxrt_load");
     NGX(ngx_init, "ngxrt_init");
@@ -438,17 +525,24 @@ bool Network::load(const NetworkPaths &paths, std::string &error) {
     NGX(ngx_populate, "ngxrt_populate_parameters");
 #undef NGX
 
-    if (const char *problem = g.ngx_load(paths.snippet.c_str())) {
+    // DLSS5NR_TRACE_PARAMS=1: the host reports every parameter the snippet asks for and whether it was there.
+    {
+        char trace[8] = {};
+        typedef void (*trace_fn)(int);
+        if (GetEnvironmentVariableA("DLSS5NR_TRACE_PARAMS", trace, sizeof trace) && trace[0] == '1')
+            if (auto fn = (trace_fn)GetProcAddress(o.ngx, "ngxrt_trace_params")) fn(1);
+    }
+    if (const char *problem = o.ngx_load(paths.snippet.c_str())) {
         error = std::string("could not load the network: ") + problem;
         return false;
     }
-    if (!ngx_ok(g.ngx_init(0, paths.data_dir.c_str(), NVSDK_NGX_Version_API,
+    if (!ngx_ok(o.ngx_init(0, paths.data_dir.c_str(), NVSDK_NGX_Version_API,
                            (unsigned long long)(void *)&ngx_log_sink, 1, g.context),
                 "NVSDK_NGX_CUDA_Init_Ext", error))
         return false;
-    g.params = nullptr;
-    if (!ngx_ok(g.ngx_populate(&g.params), "NVSDK_NGX_CUDA_PopulateParameters_Impl", error)) return false;
-    if (!g.params) {
+    o.params = nullptr;
+    if (!ngx_ok(o.ngx_populate(&o.params), "NVSDK_NGX_CUDA_PopulateParameters_Impl", error)) return false;
+    if (!o.params) {
         error = "NGX returned no parameter block";
         return false;
     }
@@ -458,15 +552,19 @@ bool Network::load(const NetworkPaths &paths, std::string &error) {
 
 bool Network::create_feature(uint32_t width, uint32_t height, const NetworkControls &controls,
                              std::string &error) {
+    Own &o = *own_;
     if (!loaded_) {
         error = "the network is not loaded";
         return false;
     }
-    if (g.feature && width == feature_width_ && height == feature_height_ && controls == feature_controls_)
+    // The context is the process's and another network may have made it current elsewhere since: say
+    // where this thread works.
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
+    if (o.feature && width == feature_width_ && height == feature_height_ && controls == feature_controls_)
         return true;
-    if (g.feature) {
-        g.ngx_release(g.feature);
-        g.feature = nullptr;
+    if (o.feature) {
+        o.ngx_release(o.feature);
+        o.feature = nullptr;
     }
 
     size_t free_bytes = 0, total_bytes = 0;
@@ -476,7 +574,7 @@ bool Network::create_feature(uint32_t width, uint32_t height, const NetworkContr
     // The network alters an image without resizing it, and refuses any other
     // arrangement: input and output are one size. Both spellings of the
     // output size are published, since the snippet's strings carry both.
-    NVSDK_NGX_Parameter *p = g.params;
+    NVSDK_NGX_Parameter *p = o.params;
     p->Set(nr_param::Enabled, 1);
     p->Set(nr_param::Width, width);
     p->Set(nr_param::Height, height);
@@ -499,7 +597,7 @@ bool Network::create_feature(uint32_t width, uint32_t height, const NetworkContr
 
     // On the stand-in the id is SuperSampling: a snippet implements one feature,
     // and the selection that matters is which DLL was loaded.
-    if (!ngx_ok(g.ngx_create(NVSDK_NGX_Feature_SuperSampling, p, &g.feature), "NVSDK_NGX_CUDA_CreateFeature",
+    if (!ngx_ok(o.ngx_create(NVSDK_NGX_Feature_SuperSampling, p, &o.feature), "NVSDK_NGX_CUDA_CreateFeature",
                 error))
         return false;
     feature_width_ = width;
@@ -512,6 +610,7 @@ bool Network::create_feature(uint32_t width, uint32_t height, const NetworkContr
 bool Network::import(SharedImage &t, std::string &error) {
     if (copy_mode_) return import_copy(t, error);
     if (t.external_memory) return true;
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
     CUarray_format format;
     unsigned channels;
     if (!cuda_format_of(t.dxgi_format, format, channels)) {
@@ -762,7 +861,8 @@ void Network::release(SharedImage &t) {
 }
 
 bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
-    if (!g.feature) {
+    Own &o = *own_;
+    if (!o.feature) {
         error = "the network has no feature";
         return false;
     }
@@ -770,7 +870,7 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
     const int passes = d.passes < 1 ? 1 : d.passes;
     if (passes > 1 && !ensure_scratch(*d.output, error)) return false;
     if (copy_mode_ && !copy_in(d, error)) return false;
-    NVSDK_NGX_Parameter *p = g.params;
+    NVSDK_NGX_Parameter *p = o.params;
     const uint32_t w = feature_width_, h = feature_height_;
 
     p->Set(nr_param::Depth, image_param(*d.depth));
@@ -823,11 +923,198 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
         // A pass after the first works on a picture that is new to the network.
         p->Set(nr_param::Reset, (pass > 0 || d.reset) ? 1 : 0);
         p->Set(nr_param::LocalToneStrength, (pass > 0 && !d.keep_local_tone) ? 0.0f : d.controls.local_tone);
-        if (!ngx_ok(g.ngx_evaluate(g.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
+        if (!ngx_ok(o.ngx_evaluate(o.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
         if (!cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error)) return false;
         source = target;
     }
     return !copy_mode_ || copy_out(d, error);
+}
+
+// The parameter names of NVIDIA's upscalers (super resolution and ray reconstruction): the public DLSS
+// ones, as the snippets read them.
+namespace up_param {
+constexpr const char *Width = "Width", *Height = "Height", *OutWidth = "OutWidth", *OutHeight = "OutHeight";
+constexpr const char *Quality = "PerfQualityValue", *CreateFlags = "DLSS.Feature.Create.Flags";
+constexpr const char *Color = "Color", *Depth = "Depth", *Motion = "MotionVectors", *Output = "Output";
+constexpr const char *JitterX = "Jitter.Offset.X", *JitterY = "Jitter.Offset.Y";
+constexpr const char *MotionScaleX = "MV.Scale.X", *MotionScaleY = "MV.Scale.Y";
+constexpr const char *Sharpness = "Sharpness", *PreExposure = "DLSS.Pre.Exposure", *ExposureScale = "DLSS.Exposure.Scale";
+constexpr const char *Reset = "Reset";
+constexpr const char *SubrectW = "DLSS.Render.Subrect.Dimensions.Width", *SubrectH = "DLSS.Render.Subrect.Dimensions.Height";
+constexpr const char *MotionOffsetX = "MV.Offset.X", *MotionOffsetY = "MV.Offset.Y", *JitterSlopeX = "Jitter.Slope.X";
+constexpr const char *DenoiseMode = "DLSS.Denoise.Mode";
+constexpr const char *DiffuseAlbedo = "DLSS.Input.DiffuseAlbedo", *SpecularAlbedo = "DLSS.Input.SpecularAlbedo";
+constexpr const char *Normals = "GBuffer.Normals", *Roughness = "GBuffer.Roughness";
+constexpr const char *HitDistance = "DLSSD.SpecularHitDistance";
+constexpr const char *Exposure = "ExposureTexture", *BiasMask = "DLSS.Input.Bias.Current.Color.Mask";
+constexpr const char *TransparencyMask = "TransparencyMask";
+// Where each input's rendered region starts in its texture (the names are the snippet's own).
+constexpr const char *SubrectBases[] = {
+    "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y", "DLSS.Input.Depth.Subrect.Base.X",
+    "DLSS.Input.Depth.Subrect.Base.Y", "DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y",
+    "DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y", "DLSS.Input.Bias.Current.Color.Subrect.Base.X",
+    "DLSS.Input.Bias.Current.Color.Subrect.Base.Y", "DLSS.TransparencyLayer.Subrect.Base.X",
+    "DLSS.TransparencyLayer.Subrect.Base.Y", "DLSS.Input.DiffuseAlbedo.Subrect.Base.X",
+    "DLSS.Input.DiffuseAlbedo.Subrect.Base.Y", "DLSS.Input.SpecularAlbedo.Subrect.Base.X",
+    "DLSS.Input.SpecularAlbedo.Subrect.Base.Y", "DLSS.Input.Normals.Subrect.Base.X",
+    "DLSS.Input.Normals.Subrect.Base.Y", "DLSS.Input.Roughness.Subrect.Base.X", "DLSS.Input.Roughness.Subrect.Base.Y",
+    "DLSSD.SpecularHitDistance.Subrect.Base.X", "DLSSD.SpecularHitDistance.Subrect.Base.Y"};
+constexpr const char *RoughnessMode = "DLSS.Roughness.Mode", *HardwareDepth = "DLSS.Use.HW.Depth";
+constexpr const char *WorldToView = "WorldToViewMatrix", *ViewToClip = "ViewToClipMatrix";
+constexpr const char *PresetNames[] = {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+                                       "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+                                       "DLSS.Hint.Render.Preset.UltraPerformance",
+                                       "DLSS.Hint.Render.Preset.UltraQuality"};
+} // namespace up_param
+
+bool Network::create_upscaler(const UpscalerCreate &c, std::string &error) {
+    Own &o = *own_;
+    if (!loaded_) {
+        error = "the network is not loaded";
+        return false;
+    }
+    if (kind_ == Kind::NeuralRendering) {
+        error = "this network is the neural rendering one";
+        return false;
+    }
+    if (o.feature && c == upscaler_) return true;
+    if (o.feature) {
+        o.ngx_release(o.feature);
+        o.feature = nullptr;
+    }
+    NVSDK_NGX_Parameter *p = o.params;
+    p->Set(up_param::Width, c.render_width);
+    p->Set(up_param::Height, c.render_height);
+    p->Set(up_param::OutWidth, c.output_width);
+    p->Set(up_param::OutHeight, c.output_height);
+    p->Set(up_param::Quality, c.quality);
+    p->Set(up_param::CreateFlags, c.flags);
+    p->Set(ngx_param::CreationNodeMask, 1u);
+    p->Set(ngx_param::VisibilityNodeMask, 1u);
+    if (c.preset)
+        for (const char *name : up_param::PresetNames) p->Set(name, (unsigned)c.preset);
+    // Ray reconstruction refuses to be created with the denoiser off.
+    if (kind_ == Kind::RayReconstruction) p->Set(up_param::DenoiseMode, 1u);
+    // 13 is NVIDIA's id for ray reconstruction (the feature "SuperSamplingDenoising"); a snippet
+    // implements one feature, and the selection that matters is which DLL was loaded.
+    const NVSDK_NGX_Feature feature =
+        kind_ == Kind::RayReconstruction ? (NVSDK_NGX_Feature)13 : NVSDK_NGX_Feature_SuperSampling;
+    if (!ngx_ok(o.ngx_create(feature, p, &o.feature), "NVSDK_NGX_CUDA_CreateFeature", error)) return false;
+    upscaler_ = c;
+    log(2, "%s created: %ux%u -> %ux%u", kind_ == Kind::RayReconstruction ? "ray reconstruction" : "super resolution",
+        c.render_width, c.render_height, c.output_width, c.output_height);
+    return true;
+}
+
+bool Network::evaluate_upscaler(const UpscalerDesc &d, std::string &error, bool synchronise) {
+    Own &o = *own_;
+    if (!o.feature) {
+        error = "the network has no feature";
+        return false;
+    }
+    if (!d.color || !d.depth || !d.motion || !d.output) {
+        error = "an upscaler needs colour, depth, motion vectors and an output";
+        return false;
+    }
+    const bool rr = kind_ == Kind::RayReconstruction;
+    if (rr && (!d.diffuse_albedo || !d.specular_albedo || !d.normals || !d.world_to_view || !d.view_to_clip)) {
+        error = "ray reconstruction needs diffuse and specular albedo, normals and both matrices";
+        return false;
+    }
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
+    NVSDK_NGX_Parameter *p = o.params;
+    p->Set(up_param::Color, image_param_as(*d.color, false));
+    p->Set(up_param::Depth, image_param_as(*d.depth, false));
+    p->Set(up_param::Motion, image_param_as(*d.motion, false));
+    p->Set(up_param::Output, image_param_as(*d.output, true));
+    if (rr) {
+        p->Set(up_param::DiffuseAlbedo, image_param_as(*d.diffuse_albedo, false));
+        p->Set(up_param::SpecularAlbedo, image_param_as(*d.specular_albedo, false));
+        p->Set(up_param::Normals, image_param_as(*d.normals, false));
+        if (d.roughness) p->Set(up_param::Roughness, image_param_as(*d.roughness, false));
+        if (d.hit_distance) p->Set(up_param::HitDistance, image_param_as(*d.hit_distance, false));
+        p->Set(up_param::RoughnessMode, d.roughness_packed_in_normals ? 1u : 0u);
+        p->Set(up_param::HardwareDepth, 0u);
+        p->Set(up_param::WorldToView, (void *)d.world_to_view);
+        p->Set(up_param::ViewToClip, (void *)d.view_to_clip);
+    }
+    p->Set(up_param::JitterX, d.jitter_x);
+    p->Set(up_param::JitterY, d.jitter_y);
+    p->Set(up_param::MotionScaleX, d.motion_scale_x);
+    p->Set(up_param::MotionScaleY, d.motion_scale_y);
+    p->Set(up_param::Sharpness, d.sharpness);
+    p->Set(up_param::PreExposure, d.pre_exposure);
+    p->Set(up_param::ExposureScale, d.exposure_scale);
+    p->Set(up_param::Reset, d.reset ? 1 : 0);
+    const uint32_t region_w = d.render_width ? d.render_width : upscaler_.render_width;
+    const uint32_t region_h = d.render_height ? d.render_height : upscaler_.render_height;
+    p->Set(up_param::SubrectW, region_w);
+    p->Set(up_param::SubrectH, region_h);
+    // The runtime hands the network images whose rendered region starts at the corner: whatever sub-rect
+    // the game has was undone when the images were made. Said every frame, because the block keeps what it
+    // was last told.
+    for (const char *base : up_param::SubrectBases) p->Set(base, 0u);
+    // The optional inputs: given when the game has them, taken away again when it does not (the block
+    // would otherwise keep last frame's).
+    p->Set(up_param::Exposure, d.exposure ? image_param_as(*d.exposure, false) : nullptr);
+    p->Set(up_param::BiasMask, d.bias_mask ? image_param_as(*d.bias_mask, false) : nullptr);
+    p->Set(up_param::TransparencyMask, d.transparency_mask ? image_param_as(*d.transparency_mask, false) : nullptr);
+    p->Set(up_param::MotionOffsetX, 0.0f);
+    p->Set(up_param::MotionOffsetY, 0.0f);
+    p->Set(up_param::JitterSlopeX, 1.0f);
+    if (!ngx_ok(o.ngx_evaluate(o.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
+    return !synchronise || cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error);
+}
+
+// A Direct3D 12 fence the CUDA side can wait on and signal, for a host that keeps the GPUs' work
+// ordered without stopping its own thread.
+bool Network::import_fence(void *nt_handle, void **semaphore, std::string &error) {
+    if (!g.cu.cuImportExternalSemaphore || !g.cu.cuWaitExternalSemaphoresAsync || !g.cu.cuSignalExternalSemaphoresAsync) {
+        error = "the CUDA driver has no external semaphores";
+        return false;
+    }
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
+    CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC desc{};
+    desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
+    desc.handle.win32.handle = nt_handle;
+    CUexternalSemaphore imported = nullptr;
+    if (!cu_ok(g.cu.cuImportExternalSemaphore(&imported, &desc), "cuImportExternalSemaphore", error)) return false;
+    *semaphore = imported;
+    return true;
+}
+
+bool Network::make_current(std::string &error) {
+    if (!g.context || !g.cu.cuCtxSetCurrent) {
+        error = "the network is not loaded";
+        return false;
+    }
+    return cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error);
+}
+
+void Network::set_thread_high_priority(bool high) {
+    typedef void (*set_fn)(int);
+    static const set_fn set = [] {
+        return g.zluda ? (set_fn)GetProcAddress(g.zluda, "zluda_set_thread_high_priority") : nullptr;
+    }();
+    if (set) set(high ? 1 : 0);
+}
+
+void Network::destroy_fence(void *semaphore) {
+    if (semaphore && g.cu.cuDestroyExternalSemaphore) g.cu.cuDestroyExternalSemaphore((CUexternalSemaphore)semaphore);
+}
+
+bool Network::wait_fence(void *semaphore, uint64_t value, std::string &error) {
+    CUDA_EXTERNAL_SEMAPHORE_PARAMS params{};
+    params.params.fence.value = value;
+    const CUexternalSemaphore sem = (CUexternalSemaphore)semaphore;
+    return cu_ok(g.cu.cuWaitExternalSemaphoresAsync(&sem, &params, 1, nullptr), "cuWaitExternalSemaphoresAsync", error);
+}
+
+bool Network::signal_fence(void *semaphore, uint64_t value, std::string &error) {
+    CUDA_EXTERNAL_SEMAPHORE_PARAMS params{};
+    params.params.fence.value = value;
+    const CUexternalSemaphore sem = (CUexternalSemaphore)semaphore;
+    return cu_ok(g.cu.cuSignalExternalSemaphoresAsync(&sem, &params, 1, nullptr), "cuSignalExternalSemaphoresAsync", error);
 }
 
 bool Network::ensure_scratch(const SharedImage &like, std::string &error) {
@@ -880,16 +1167,25 @@ bool Network::ensure_scratch(const SharedImage &like, std::string &error) {
 }
 
 void Network::shutdown() {
+    Own &o = *own_;
     if (scratch_.array || scratch_.surface) {
         if (g.context) g.cu.cuCtxSetCurrent(g.context);
         release(scratch_);
         scratch_ = SharedImage{};
     }
-    if (g.feature && g.ngx_release) g.ngx_release(g.feature);
-    g.feature = nullptr;
-    if (loaded_ && g.ngx_shutdown) g.ngx_shutdown();
-    if (g.context && g.cu.cuCtxDestroy) g.cu.cuCtxDestroy(g.context);
-    g.context = nullptr;
+    if (o.feature && o.ngx_release) o.ngx_release(o.feature);
+    o.feature = nullptr;
+    if (loaded_ && o.ngx_shutdown) o.ngx_shutdown();
+    // The CUDA context is the process's: it goes with the last network.
+    if (counted_) {
+        std::lock_guard<std::mutex> guard(g.lock);
+        counted_ = false;
+        if (--g.users == 0 && g.context && g.cu.cuCtxDestroy) {
+            g.cu.cuCtxDestroy(g.context);
+            g.context = nullptr;
+            g.ready = false;
+        }
+    }
     // The libraries stay loaded. The snippet, ZLUDA and the HIP runtime keep
     // threads and state of their own, and unloading them under a running game
     // is how processes crash on exit; the process ending releases them.

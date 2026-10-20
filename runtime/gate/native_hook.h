@@ -42,6 +42,9 @@ struct Runtime {
     hipError_t (*module_get_function)(hipFunction_t *, hipModule_t, const char *) = nullptr;
     hipError_t (*module_launch)(hipFunction_t, unsigned, unsigned, unsigned, unsigned, unsigned,
                                 unsigned, unsigned, hipStream_t, void **, void **) = nullptr;
+    // Optional: read a u32 global out of a code object (see Entry::prep).
+    hipError_t (*module_get_global)(void **, size_t *, hipModule_t, const char *) = nullptr;
+    hipError_t (*memcpy_dtoh)(void *, void *, size_t) = nullptr;
     bool tried = false;
     bool ready = false;
 };
@@ -62,6 +65,8 @@ inline Runtime &runtime() {
     r.module_get_function =
         (decltype(r.module_get_function))GetProcAddress(hip, "hipModuleGetFunction");
     r.module_launch = (decltype(r.module_launch))GetProcAddress(hip, "hipModuleLaunchKernel");
+    r.module_get_global = (decltype(r.module_get_global))GetProcAddress(hip, "hipModuleGetGlobal");
+    r.memcpy_dtoh = (decltype(r.memcpy_dtoh))GetProcAddress(hip, "hipMemcpyDtoH");
     r.ready = r.module_load_data && r.module_get_function && r.module_launch;
     if (!r.ready) logf("[native] amdhip64_7.dll does not export the three expected functions\n");
     return r;
@@ -76,13 +81,31 @@ struct Entry {
     hipFunction_t fn = nullptr;
     bool dead = false;      // tried and failed: never again this run
     unsigned launches = 0;
+
+    // Kernels that carry their own weight preparation (the super resolution layers) say so through
+    // u32 globals in the code object. All optional; a code object with none of them is launched
+    // exactly as it was before these existed.
+    //   <entry>_prep        kernel launched first, on the same stream and with the same arguments
+    //   d4r_prep_blocks     its grid size (128 threads per block)
+    //   d4r_prep_key_at     byte offset + 1 of the u64 argument (the weights pointer) that decides
+    //                       what the prep produces: it is skipped while that value repeats
+    //   d4r_prep_key_slots  N > 0: the kernel keeps one prepared image per key for N keys, so the
+    //                       prep runs once per key; keys beyond N are prepared on every launch
+    //   d4r_block_z         block z the native kernel is built for (more waves per window)
+    //   d4r_grid_x          persistent kernels: this many workgroups in x
+    hipFunction_t prep = nullptr;
+    unsigned prep_blocks = 0, block_z = 0, grid_x = 0, prep_slots = 0;
+    long prep_key_offset = -1;
+    unsigned long long prep_last = 0;
+    unsigned long long prep_seen[16] = {};
+    unsigned prep_seen_count = 0;
 };
 
 // Raised from 32 when the manifest outgrew it: lines past the limit used to be
 // dropped without a word, and their kernels stayed translated.
 const unsigned kMaxEntries = 256;
 inline Entry g_entries[kMaxEntries];
-inline unsigned g_entry_count = 0;
+inline volatile unsigned g_entry_count = 0;
 
 // The manifest is one kernel per line:
 //
@@ -90,13 +113,7 @@ inline unsigned g_entry_count = 0;
 //
 // Blank lines and lines starting with # are ignored. A line the parser does not
 // understand is skipped with a complaint rather than guessed at.
-inline void load_manifest() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-
-    char path[MAX_PATH] = {};
-    if (!GetEnvironmentVariableA("NVCUDA_PROXY_NATIVE", path, sizeof path)) return;
+inline void load_one_manifest(const char *path) {
     FILE *file = fopen(path, "r");
     if (!file) {
         logf("[native] manifest %s unreadable: staying on the translation\n", path);
@@ -149,11 +166,73 @@ inline void load_manifest() {
         else
             snprintf(e.object, sizeof e.object, "%s%s", base, object);
         if (!e.entry[0]) strncpy(e.entry, e.kernel, sizeof e.entry - 1);
-        g_entries[g_entry_count++] = e;
+        // Written whole before it is counted: a launch on another thread reads the count and then the
+        // entries, while a later network's manifest may still be coming in.
+        g_entries[g_entry_count] = e;
+        MemoryBarrier();
+        ++g_entry_count;
         logf("[native] %s <- %s (block %ux%ux%u, %u bytes of arguments)\n", e.kernel, e.object,
              e.bx, e.by, e.bz, e.args);
     }
     fclose(file);
+}
+
+// NVCUDA_PROXY_NATIVE names one manifest, or several joined by ';' (the neural rendering kernels
+// and the super resolution ones live in separate files).
+inline void load_manifest() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    char paths[4 * MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("NVCUDA_PROXY_NATIVE", paths, sizeof paths)) return;
+    // Split by hand: load_one_manifest uses strtok itself, which keeps one global position.
+    for (char *start = paths; start && *start;) {
+        char *end = strchr(start, ';');
+        if (end) *end = 0;
+        if (*start) load_one_manifest(start);
+        start = end ? end + 1 : nullptr;
+    }
+}
+
+
+// The optional description of a kernel's own preparation step (see Entry::prep).
+inline bool read_u32_global(hipModule_t module, const char *symbol, unsigned &value) {
+    Runtime &r = runtime();
+    if (!r.module_get_global || !r.memcpy_dtoh) return false;
+    void *where = nullptr;
+    size_t size = 0;
+    if (r.module_get_global(&where, &size, module, symbol) != 0 || size != 4) return false;
+    return r.memcpy_dtoh(&value, where, 4) == 0;
+}
+
+inline void read_prep_description(Entry &e, hipModule_t module) {
+    Runtime &r = runtime();
+    char name[128];
+    snprintf(name, sizeof name, "%s_prep", e.entry);
+    hipFunction_t prep = nullptr;
+    if (r.module_get_function(&prep, module, name) == 0 && prep) {
+        unsigned blocks = 0;
+        if (!read_u32_global(module, "d4r_prep_blocks", blocks) || !blocks) {
+            logf("[native] %s has a prep kernel but no d4r_prep_blocks: prep ignored\n", e.kernel);
+        } else {
+            e.prep = prep;
+            e.prep_blocks = blocks;
+        }
+    }
+    unsigned at = 0;
+    if (read_u32_global(module, "d4r_prep_key_at", at) && at > 0) {
+        e.prep_key_offset = (long)at - 1;
+    } else if (read_u32_global(module, "d4r_prep_key_offset", at) && at > 0) {
+        e.prep_key_offset = (long)at;   // the older form: 0 means "no key"
+    }
+    read_u32_global(module, "d4r_prep_key_slots", e.prep_slots);
+    read_u32_global(module, "d4r_block_z", e.block_z);
+    read_u32_global(module, "d4r_grid_x", e.grid_x);
+    if (e.prep_slots > 16) e.prep_slots = 16;
+    if (e.prep || e.block_z || e.grid_x)
+        logf("[native] %s: prep %u blocks, key at %ld, %u slots, block z %u, grid x %u\n", e.kernel,
+             e.prep_blocks, e.prep_key_offset, e.prep_slots, e.block_z, e.grid_x);
 }
 
 // The code object is loaded the first time its kernel is launched, not at
@@ -194,6 +273,7 @@ inline bool bind(Entry &e) {
         e.dead = true;
         return false;
     }
+    read_prep_description(e, module);
     logf("[native] %s hooked by %s\n", e.kernel, e.object);
     return true;
 }
@@ -203,6 +283,25 @@ inline bool bind(Entry &e) {
 // into the kernel, and the argument buffer size is the ABI itself. The grid is
 // deliberately not checked -- it follows the render resolution and is passed
 // through untouched.
+// ZLUDA_PER_THREAD_STREAM=1 turns the null stream into the calling thread's own default stream (see
+// zluda_common): a native kernel launched here has to go where the translated ones go, or the two
+// kinds of kernel of one network would no longer follow each other in order.
+inline hipStream_t effective_stream(hipStream_t stream) {
+    static const bool per_thread = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("ZLUDA_PER_THREAD_STREAM", value, sizeof value) > 0 && value[0] == '1';
+    }();
+    if (stream || !per_thread) return stream;
+    // The stream ZLUDA itself would give this thread: a plain per-thread one, or a high priority one
+    // for a thread that asked for it (zluda_set_thread_high_priority).
+    typedef void *(*thread_stream_fn)();
+    static const thread_stream_fn thread_stream = [] {
+        HMODULE zluda = GetModuleHandleW(L"zluda_real.dll");
+        return zluda ? (thread_stream_fn)GetProcAddress(zluda, "zluda_thread_default_stream") : nullptr;
+    }();
+    return thread_stream ? (hipStream_t)thread_stream() : (hipStream_t)(uintptr_t)2;
+}
+
 inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
                        unsigned by, unsigned bz, unsigned shared, void *stream, void **extra) {
     load_manifest();
@@ -288,8 +387,45 @@ inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, 
         // Forwarding the caller's list unchanged would leave HIP reading past
         // the end of it (zluda/src/impl/function.rs says the same).
         void *rebuilt[5] = {(void *)1, buffer, (void *)2, &size, (void *)3};
+        if (e.prep) {
+            unsigned long long key = 0;
+            if (e.prep_key_offset >= 0 && (size_t)e.prep_key_offset + 8 <= size)
+                memcpy(&key, (const char *)buffer + e.prep_key_offset, 8);
+            bool run = true;
+            if (key) {
+                if (e.prep_slots == 0) {
+                    run = e.prep_last != key;
+                } else {
+                    run = true;
+                    for (unsigned k = 0; k < e.prep_seen_count; ++k)
+                        if (e.prep_seen[k] == key) run = false;
+                    if (run && e.prep_seen_count < e.prep_slots) e.prep_seen[e.prep_seen_count++] = key;
+                }
+            }
+            if (run) {
+                const hipError_t prepared = runtime().module_launch(
+                    e.prep, e.prep_blocks, 1, 1, 128, 1, 1, 0, effective_stream((hipStream_t)stream), nullptr, rebuilt);
+                if (prepared != 0) {
+                    logf("[native] %s: prep launch -> %d, translation from here on\n", name, prepared);
+                    e.dead = true;
+                    return false;
+                }
+                e.prep_last = key;
+                static const bool trace = GetEnvironmentVariableA("DLSS5NR_GATE_TRACE", nullptr, 0) > 0;
+                if (trace) {
+                    typedef int (*sync_fn)();
+                    static HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+                    static sync_fn sync = hip ? (sync_fn)GetProcAddress(hip, "hipDeviceSynchronize") : nullptr;
+                    logf("[native] %s prep (%u blocks) launched, waiting\n", name, e.prep_blocks);
+                    const int status = sync ? sync() : 0;
+                    logf("[native] %s prep done -> %d\n", name, status);
+                }
+            }
+        }
+        if (e.block_z) bz = e.block_z;
+        if (e.grid_x) { gx = e.grid_x; gy = 1; gz = 1; }
         const hipError_t launched = runtime().module_launch(
-            e.fn, gx, gy, gz, bx, by, bz, shared, (hipStream_t)stream, nullptr, rebuilt);
+            e.fn, gx, gy, gz, bx, by, bz, shared, effective_stream((hipStream_t)stream), nullptr, rebuilt);
         if (launched != 0) {
             logf("[native] %s: hipModuleLaunchKernel -> %d, translation from here on\n", name,
                  launched);

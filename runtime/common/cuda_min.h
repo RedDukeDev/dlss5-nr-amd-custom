@@ -50,6 +50,7 @@ struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
 
 enum CUarray_format : uint32_t {
     CU_AD_FORMAT_UNSIGNED_INT8 = 0x01,
+    CU_AD_FORMAT_UNSIGNED_INT16 = 0x02,
     CU_AD_FORMAT_HALF = 0x10,
     CU_AD_FORMAT_FLOAT = 0x20,
 };
@@ -146,6 +147,45 @@ constexpr unsigned int CU_CTX_SCHED_AUTO = 0;
 constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
 
+typedef void *CUexternalSemaphore;
+
+// A Direct3D 12 fence, shared and imported, as a semaphore the GPU can wait on and signal.
+constexpr uint32_t CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE = 4;
+
+// Laid out exactly as the CUDA header.
+struct CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
+    uint32_t type;
+    union {
+        int fd;
+        struct {
+            void *handle;
+            const void *name;
+        } win32;
+        const void *nvSciSyncObj;
+    } handle;
+    unsigned int flags;
+    unsigned int reserved[16];
+};
+
+// The same layout serves a wait and a signal: the fence value first, then what a fence does not use.
+struct CUDA_EXTERNAL_SEMAPHORE_PARAMS {
+    struct {
+        struct {
+            unsigned long long value;
+        } fence;
+        union {
+            void *fence;
+            unsigned long long reserved;
+        } nvSciSync;
+        struct {
+            unsigned long long key;
+        } keyedMutex;
+        unsigned int reserved[12];
+    } params;
+    unsigned int flags;
+    unsigned int reserved[16];
+};
+
 struct CudaApi {
     CUresult (*cuInit)(unsigned int);
     CUresult (*cuDeviceGet)(CUdevice *, int);
@@ -160,6 +200,14 @@ struct CudaApi {
     CUresult (*cuDestroyExternalMemory)(CUexternalMemory);
     CUresult (*cuExternalMemoryGetMappedMipmappedArray)(CUmipmappedArray *, CUexternalMemory,
                                                         const CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC *);
+    // Optional: the GPU side of waiting for the game's queue and telling it the network is done. Without
+    // them the host waits on the CPU instead.
+    CUresult (*cuImportExternalSemaphore)(CUexternalSemaphore *, const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC *);
+    CUresult (*cuDestroyExternalSemaphore)(CUexternalSemaphore);
+    CUresult (*cuWaitExternalSemaphoresAsync)(const CUexternalSemaphore *, const CUDA_EXTERNAL_SEMAPHORE_PARAMS *,
+                                              unsigned int, void *);
+    CUresult (*cuSignalExternalSemaphoresAsync)(const CUexternalSemaphore *, const CUDA_EXTERNAL_SEMAPHORE_PARAMS *,
+                                                unsigned int, void *);
     CUresult (*cuMipmappedArrayGetLevel)(CUarray *, CUmipmappedArray, unsigned int);
     CUresult (*cuMipmappedArrayDestroy)(CUmipmappedArray);
     CUresult (*cuSurfObjectCreate)(CUsurfObject *, const CUDA_RESOURCE_DESC *);

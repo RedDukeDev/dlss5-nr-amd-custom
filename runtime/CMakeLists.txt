@@ -67,10 +67,26 @@ add_library(dlss5nr_runtime SHARED
     include/dlss5nr.h
     core/runtime.cpp
     core/network.cpp core/network.h
+    core/upscaler.cpp
     core/passes.cpp core/passes.h core/shaders.h
     common/cuda_min.h common/ngx_cuda.h)
 target_link_libraries(dlss5nr_runtime PRIVATE d3d12 ${D3DCOMPILER})
 set_target_properties(dlss5nr_runtime PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${BIN})
+
+# ------------------------------------------------- the upscalers' harness
+# Drives the Network class on Direct3D 12 textures: super resolution and ray reconstruction.
+# network.cpp is compiled in rather than linked, the class is not part of the runtime's interface.
+add_executable(dlss5sr_harness tests/sr_harness.cpp core/network.cpp core/network.h
+               common/cuda_min.h common/ngx_cuda.h)
+target_include_directories(dlss5sr_harness PRIVATE include)
+target_link_libraries(dlss5sr_harness PRIVATE d3d12 dxgi)
+set_target_properties(dlss5sr_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${BIN})
+
+# The upscalers through the runtime's C interface, as a host drives them.
+add_executable(dlss5up_harness tests/upscaler_harness.cpp)
+target_include_directories(dlss5up_harness PRIVATE include)
+target_link_libraries(dlss5up_harness PRIVATE dlss5nr_runtime d3d12 dxgi)
+set_target_properties(dlss5up_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${BIN})
 
 # ------------------------------------------------------------ test harness
 add_executable(dlss5nr_harness tests/harness.cpp)

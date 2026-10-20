@@ -23,8 +23,9 @@ the runtime there.
              OptiScaler\\dlss5nr\\cache\\ComputeCache so that no player waits for the
              network's code to be translated. It only answers the ZLUDA build
              that produced it: rebuild it whenever a different ZLUDA is shipped.
---no-network leaves NVIDIA's network out, to be added to OptiScaler\\dlss5nr\\
-             by hand.
+--no-network leaves NVIDIA's libraries out (nvngx_dlssnr.dll, the neural rendering;
+             nvngx_dlss.dll, super resolution; nvngx_dlssd.dll, ray reconstruction), to be
+             added to OptiScaler\\dlss5nr\\ by hand.
 
 The Linux side (amdhip64_7.dll and libdlss5nr_hip_bridge.so from linux\\build, built
 with linux/build.sh, plus launch.sh and README.txt) goes into linux\\ beside
@@ -39,8 +40,11 @@ beside a Direct3D 9 or 10 game.
 
 The runtime (runtime\\build\\bin) and the native kernels (kernels\\, built with
 build_kernels.py) must be built first. Only the kernels the manifest names are
-packaged. NVIDIA's network, third_party\\nvngx_dlssnr.dll, goes into
-OptiScaler\\dlss5nr\\ as it is.
+packaged. The native super resolution layers (kernels\\sr, built with
+build_sr_kernels.py) and their manifest, kernels_sr.txt, go with them. NVIDIA's libraries, in
+third_party\\, go into OptiScaler\\dlss5nr\\ as they are. The upscalers' NGX hosts (zluda\\ngx_sr,
+zluda\\ngx_rr) are copies of zluda\\nvngx.dll: each network has a folder of its own so that
+they can run beside the neural rendering.
 """
 import argparse
 import filecmp
@@ -49,6 +53,9 @@ import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# NVIDIA's libraries, in third_party\\: the neural rendering network, super resolution, ray reconstruction.
+NETWORKS = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll")
 
 
 def copy(source, target):
@@ -157,22 +164,27 @@ def main():
     target = os.path.join(args.out, "OptiScaler", "dlss5nr")
     # Checked before the old package is removed, which a missing network
     # would otherwise leave half rebuilt.
-    network = os.path.join(ROOT, "third_party", "nvngx_dlssnr.dll")
-    if not args.no_network and not os.path.isfile(network):
-        sys.exit("missing: %s (NVIDIA's network, version 310.9.16.0, is not in the repository: "
-                 "put it there before packaging, or pass --no-network)" % network)
+    networks = [os.path.join(ROOT, "third_party", name) for name in NETWORKS]
+    missing = [n for n in networks if not os.path.isfile(n)]
+    if not args.no_network and missing:
+        sys.exit("missing: %s (NVIDIA's libraries are not in the repository: the neural rendering "
+                 "network, version 310.9.16.0, and the DLSS ones, 310.9.1, go in third_party\\ "
+                 "before packaging; or pass --no-network)" % ", ".join(missing))
     if os.path.exists(args.out):
         shutil.rmtree(args.out)
 
     copy(os.path.join(runtime, "dlss5nr_runtime.dll"), os.path.join(target, "dlss5nr_runtime.dll"))
     copy(os.path.join(runtime, "zluda", "nvcuda.dll"), os.path.join(target, "zluda", "nvcuda.dll"))
     copy(os.path.join(runtime, "zluda", "nvngx.dll"), os.path.join(target, "zluda", "nvngx.dll"))
+    for host in ("ngx_sr", "ngx_rr"):
+        copy(os.path.join(runtime, "zluda", "nvngx.dll"), os.path.join(target, "zluda", host, "nvngx.dll"))
     copy(os.path.join(args.zluda, "nvcuda.dll"), os.path.join(target, "zluda", "zluda_real.dll"))
     copy(os.path.join(args.zluda, "nvapi64.dll"), os.path.join(target, "zluda", "nvapi64.dll"))
     # Where the runtime looks for it when the host names no other path. It is
     # not in the repository: whoever packages keeps a copy in third_party\.
     if not args.no_network:
-        copy(network, os.path.join(target, "nvngx_dlssnr.dll"))
+        for network in networks:
+            copy(network, os.path.join(target, os.path.basename(network)))
 
     if not args.no_cache:
         database = os.path.join(args.cache, "zluda2.db")
@@ -202,6 +214,16 @@ def main():
             objects.add(fields[1])
     for name in sorted(objects):
         copy(os.path.join(kernels, name), os.path.join(target, "kernels", name))
+
+    # The super resolution layers: the manifest and the code objects build_sr_kernels.py wrote.
+    upscaler_kernels = os.path.join(kernels, "sr")
+    upscaler_manifest = os.path.join(upscaler_kernels, "kernels_sr.txt")
+    copy(upscaler_manifest, os.path.join(target, "kernels", "kernels_sr.txt"))
+    for line in open(upscaler_manifest, encoding="utf-8"):
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2:
+            objects.add(fields[1])
+            copy(os.path.join(upscaler_kernels, fields[1]), os.path.join(target, "kernels", fields[1]))
 
     if args.optiscaler:
         for name in os.listdir(args.optiscaler):

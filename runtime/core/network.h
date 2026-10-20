@@ -18,10 +18,22 @@ struct ID3D12GraphicsCommandList;
 
 namespace dlss5nr {
 
+// Which of NVIDIA's networks a Network instance hosts. A process runs one: the NGX runtime, the CUDA
+// context and the stand-in NVAPI are single, and each network wants the GPU described its own way.
+enum class Kind {
+    NeuralRendering,     // nvngx_dlssnr.dll: alters the finished image
+    SuperResolution,     // nvngx_dlss.dll: upscales from the game's low resolution inputs
+    RayReconstruction,   // nvngx_dlssd.dll: upscales and denoises from the G-buffer
+};
+
 struct NetworkPaths {
     std::wstring runtime_dir;   // holds zluda\ and kernels\ (see dlss5nr.h)
-    std::wstring snippet;       // nvngx_dlssnr.dll
+    std::wstring snippet;       // nvngx_dlssnr.dll, nvngx_dlss.dll or nvngx_dlssd.dll, to match kind
     std::wstring data_dir;      // logs; the translation cache lives in data_dir\ComputeCache
+    Kind kind = Kind::NeuralRendering;
+    // A folder of zluda\ holding a copy of nvngx.dll for this network alone (empty: zluda\nvngx.dll itself).
+    // Two networks in one process each need their own.
+    std::wstring host_dir;
 };
 
 // One D3D12 texture made shareable and imported into CUDA.
@@ -95,8 +107,53 @@ struct EvaluateDesc {
     bool staged_by_list = false;
 };
 
+// What an upscaling network is created for. Sizes in pixels; flags are NVIDIA's DLSS creation flags
+// (HDR 1, low resolution motion vectors 2, jittered motion vectors 4, inverted depth 8, auto exposure 32).
+struct UpscalerCreate {
+    uint32_t render_width = 0, render_height = 0;
+    uint32_t output_width = 0, output_height = 0;
+    uint32_t flags = 1 | 8 | 32;
+    int32_t quality = 2;    // NVSDK_NGX_PerfQuality_Value
+    int32_t preset = 0;     // 0: the library's own choice
+    bool operator==(const UpscalerCreate &o) const {
+        return render_width == o.render_width && render_height == o.render_height &&
+               output_width == o.output_width && output_height == o.output_height && flags == o.flags &&
+               quality == o.quality && preset == o.preset;
+    }
+};
+
+// One frame for an upscaling network. Images are the runtime's own shared textures. The optional ones
+// (null: absent) are what ray reconstruction takes beyond super resolution.
+struct UpscalerDesc {
+    SharedImage *color = nullptr, *depth = nullptr, *motion = nullptr, *output = nullptr;
+    SharedImage *diffuse_albedo = nullptr, *specular_albedo = nullptr, *normals = nullptr;
+    SharedImage *roughness = nullptr, *hit_distance = nullptr;
+    // Optional for both: the game's exposure (a texture of one texel), and the two masks that tell the
+    // network where its history is not to be trusted (the "bias current colour" mask, what games and FSR call
+    // the reactive mask, and the transparency mask). Null: the game has none.
+    SharedImage *exposure = nullptr, *bias_mask = nullptr, *transparency_mask = nullptr;
+    // The region of the images that was rendered this frame, from their top left corner: smaller than
+    // the creation size when the game scales its resolution dynamically. 0: the creation size.
+    uint32_t render_width = 0, render_height = 0;
+    float jitter_x = 0.0f, jitter_y = 0.0f;
+    float motion_scale_x = 1.0f, motion_scale_y = 1.0f;
+    float pre_exposure = 1.0f, exposure_scale = 1.0f, sharpness = 0.0f;
+    bool reset = false;
+    // Ray reconstruction: column-major or row-major as the game keeps them, passed through untouched.
+    const float *world_to_view = nullptr;   // 16 floats
+    const float *view_to_clip = nullptr;    // 16 floats
+    bool roughness_packed_in_normals = true;
+};
+
+struct Own;
+
 class Network {
 public:
+    Network();
+    ~Network();
+    Network(const Network &) = delete;
+    Network &operator=(const Network &) = delete;
+
     // Loads the whole chain and initialises NGX. On failure, error says why
     // and nothing else may be called.
     bool load(const NetworkPaths &paths, std::string &error);
@@ -128,6 +185,25 @@ public:
     // output holds the result.
     bool evaluate(const EvaluateDesc &desc, std::string &error);
 
+    // Super resolution and ray reconstruction (Kind::SuperResolution, Kind::RayReconstruction).
+    // The feature is made again only when what it is made for changes.
+    bool create_upscaler(const UpscalerCreate &create, std::string &error);
+    // synchronise false: the evaluation is only queued on the CUDA side, to be waited for with a fence
+    // (signal_fence after it); true waits for the GPU to be done, as evaluate() does.
+    bool evaluate_upscaler(const UpscalerDesc &desc, std::string &error, bool synchronise = true);
+    // A Direct3D 12 fence (a shared NT handle) as a CUDA semaphore; waits and signals are queued on the
+    // CUDA side's own stream, in order with the network's kernels. False if the driver cannot.
+    bool import_fence(void *nt_handle, void **semaphore, std::string &error);
+    // Makes the network's CUDA context current on the calling thread: needed before importing or
+    // releasing images from a thread other than the one that loaded.
+    bool make_current(std::string &error);
+    // The calling thread's default CUDA stream gets high priority (or goes back to the plain one): the
+    // upscalers ask for it, so that they are not held up by the neural rendering on the same GPU.
+    void set_thread_high_priority(bool high);
+    void destroy_fence(void *semaphore);
+    bool wait_fence(void *semaphore, uint64_t value, std::string &error);
+    bool signal_fence(void *semaphore, uint64_t value, std::string &error);
+
     void shutdown();
 
     uint32_t native_kernels() const { return native_kernels_; }
@@ -146,6 +222,10 @@ private:
     bool copy_mode_ = false;
     uint32_t feature_width_ = 0, feature_height_ = 0;
     NetworkControls feature_controls_;
+    UpscalerCreate upscaler_;
+    Kind kind_ = Kind::NeuralRendering;
+    Own *own_ = nullptr;
+    bool counted_ = false;   // this network is one of the process's users of the CUDA context
     uint32_t native_kernels_ = 0;
     std::string device_name_;
 };

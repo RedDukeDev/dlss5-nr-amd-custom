@@ -1,5 +1,6 @@
-# Nvidia's Library
-third_party/nvngx_dlssnr.dll
+# NVIDIA's libraries (neural rendering, super resolution, ray reconstruction): too large for
+# the repository, kept in third_party/ for building and packaging
+third_party/nvngx_*.dll
 
 # Build outputs
 build/
@@ -7,6 +8,7 @@ runtime/build/
 runtime/build-mingw/
 linux/build/
 out/
+kernels/sr/
 dist/
 *.hsaco
 *.isa
@@ -36,9 +38,9 @@ captures/
 *.npz
 *.npy
 *.db
-# The network itself is shipped in the release package only: a copy kept in
+# The networks themselves are shipped in the release package only: a copy kept in
 # third_party\ for packaging stays out of the repository.
-nvngx_dlssnr*.dll
+nvngx_dlss*.dll
 
 # Local tooling
 .vs/
