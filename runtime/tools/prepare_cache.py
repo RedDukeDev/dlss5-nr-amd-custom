@@ -16,7 +16,7 @@ What it does:
 
   1. reads the code modules straight out of NVIDIA's libraries (nvngx_dlssnr.dll for the
      neural rendering, nvngx_dlss.dll for super resolution, nvngx_dlssd.dll for ray
-     reconstruction; the cache is one file for all three) -- the fatbins as
+     reconstruction, nvngx_dlssg.dll for frame generation; the cache is one file for all four) -- the fatbins as
      they sit in the file, not PTX extracted from them. The driver picks which
      embedded module to translate and derives the cache key from that choice,
      so handing it the same bytes is what makes the key match at run time;
@@ -100,7 +100,7 @@ SELECTIVE_FUSE = "2.13"
 ZLUDA_VARIABLES_SET_HERE = {"ZLUDA_TARGET_ARCH", "ZLUDA_CACHE_DIR", "ZLUDA_SELECTIVE_FUSE"}
 
 # NVIDIA's libraries, in the order their modules are named.
-LIBRARIES = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll")
+LIBRARIES = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssg.dll")
 
 FATBIN_MAGIC = struct.pack("<I", 0xBA55ED50)
 

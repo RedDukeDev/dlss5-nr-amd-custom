@@ -1,7 +1,7 @@
 // The gate: a thin nvcuda.dll in front of ZLUDA that launches the native
 // kernels (kernels/) in place of the translated ones they reproduce.
 //
-// Everything is forwarded to ZLUDA, renamed zluda_real.dll, except the four
+// Everything is forwarded to ZLUDA, renamed zluda_real.dll, except the five
 // calls the gate needs:
 //
 //   cuGetProcAddress(_v2)  the network resolves its entry points through the
@@ -10,6 +10,7 @@
 //   cuModuleGetFunction    remembers which name each function handle has
 //   cuLaunchKernel         asks native_hook.h whether a native kernel takes
 //                          the launch; if not, ZLUDA runs the translation
+//   cuCtxSynchronize       polls an event instead of holding a lock inside HIP
 //
 // The native side is strictly opt-in and strictly fallible: without a manifest
 // (NVCUDA_PROXY_NATIVE) the gate changes nothing, and any kernel whose
@@ -275,6 +276,41 @@ __declspec(dllexport) CUresult cuModuleGetFunction(CUfunction *out, CUmodule mod
     return r;
 }
 
+// Waits for the device without holding ZLUDA's lock while it waits. cuCtxSynchronize is a hipDeviceSynchronize, which
+// keeps a lock inside HIP for as long as the GPU takes; a thread that meanwhile needs the same lock (the frame
+// generation creating a surface object) stands still, and when what the GPU waits for depends on that thread, nothing
+// moves again. An event on the default stream, which orders after the work of the blocking streams, is polled instead.
+__declspec(dllexport) CUresult cuCtxSynchronize() {
+    typedef CUresult (*create_fn)(void **, unsigned);
+    typedef CUresult (*record_fn)(void *, CUstream);
+    typedef CUresult (*query_fn)(void *);
+    static auto create = (create_fn)real("cuEventCreate");
+    static auto record = (record_fn)real("cuEventRecord");
+    static auto query = (query_fn)real("cuEventQuery");
+    static auto direct = (CUresult(*)())real("cuCtxSynchronize");
+    constexpr unsigned kDisableTiming = 2;
+    constexpr CUresult kNotReady = (CUresult)600;
+
+    thread_local void *event = nullptr;
+    if (!create || !record || !query) return direct();
+    if (!event && create(&event, kDisableTiming) != 0) {
+        event = nullptr;
+        return direct();
+    }
+    CUresult r = record(event, nullptr);
+    if (r != 0) return r;
+    for (unsigned spins = 0;; ++spins) {
+        r = query(event);
+        if (r != kNotReady) return r;
+        if (spins < 2000)
+            YieldProcessor();
+        else if (spins < 20000)
+            SwitchToThread();
+        else
+            Sleep(0);
+    }
+}
+
 __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
                                               unsigned bx, unsigned by, unsigned bz, unsigned shared,
                                               CUstream stream, void **params, void **extra) {
@@ -346,6 +382,8 @@ void substitute(const char *symbol, void **pfn) {
     } else if (same_symbol(symbol, "cuLaunchKernel")) {
         g_launch = *pfn;
         *pfn = (void *)&cuLaunchKernel;
+    } else if (strcmp(symbol, "cuCtxSynchronize") == 0) {
+        *pfn = (void *)&cuCtxSynchronize;
     }
 }
 

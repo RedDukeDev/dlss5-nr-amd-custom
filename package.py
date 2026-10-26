@@ -24,7 +24,8 @@ the runtime there.
              network's code to be translated. It only answers the ZLUDA build
              that produced it: rebuild it whenever a different ZLUDA is shipped.
 --no-network leaves NVIDIA's libraries out (nvngx_dlssnr.dll, the neural rendering;
-             nvngx_dlss.dll, super resolution; nvngx_dlssd.dll, ray reconstruction), to be
+             nvngx_dlss.dll, super resolution; nvngx_dlssd.dll, ray reconstruction; nvngx_dlssg.dll, frame
+             generation), to be
              added to OptiScaler\\dlss5nr\\ by hand.
 
 The Linux side (amdhip64_7.dll and libdlss5nr_hip_bridge.so from linux\\build, built
@@ -55,7 +56,7 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # NVIDIA's libraries, in third_party\\: the neural rendering network, super resolution, ray reconstruction.
-NETWORKS = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll")
+NETWORKS = ("nvngx_dlssnr.dll", "nvngx_dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssg.dll")
 
 
 def copy(source, target):
@@ -176,10 +177,22 @@ def main():
     copy(os.path.join(runtime, "dlss5nr_runtime.dll"), os.path.join(target, "dlss5nr_runtime.dll"))
     copy(os.path.join(runtime, "zluda", "nvcuda.dll"), os.path.join(target, "zluda", "nvcuda.dll"))
     copy(os.path.join(runtime, "zluda", "nvngx.dll"), os.path.join(target, "zluda", "nvngx.dll"))
-    for host in ("ngx_sr", "ngx_rr"):
+    for host in ("ngx_sr", "ngx_rr", "ngx_fg"):
         copy(os.path.join(runtime, "zluda", "nvngx.dll"), os.path.join(target, "zluda", host, "nvngx.dll"))
     copy(os.path.join(args.zluda, "nvcuda.dll"), os.path.join(target, "zluda", "zluda_real.dll"))
-    copy(os.path.join(args.zluda, "nvapi64.dll"), os.path.join(target, "zluda", "nvapi64.dll"))
+    # NVAPI: ZLUDA's stays beside the stand-in for frame generation, which is what the processes ask for by name. It
+    # answers what is not frame generation's with ZLUDA's, and brings along the pairing of the library's cubins with
+    # their PTX and the native kernels it launches in their place.
+    copy(os.path.join(args.zluda, "nvapi64.dll"), os.path.join(target, "zluda", "zluda_nvapi.dll"))
+    copy(os.path.join(runtime, "zluda", "nvapi64.dll"), os.path.join(target, "zluda", "nvapi64.dll"))
+    copy(os.path.join(ROOT, "runtime", "fg", "data", "cubin_fatbin_map.txt"),
+         os.path.join(target, "zluda", "cubin_fatbin_map.txt"))
+    for kernel in ("fg_conv.hsaco", "fg_custom.hsaco"):
+        built = os.path.join(kernels, kernel)
+        if os.path.isfile(built):
+            copy(built, os.path.join(target, "zluda", kernel))
+        else:
+            print("warning: %s is not built (kernels\build_fg_kernels.py): frame generation runs on the translation alone" % kernel)
     # Where the runtime looks for it when the host names no other path. It is
     # not in the repository: whoever packages keeps a copy in third_party\.
     if not args.no_network:

@@ -231,6 +231,12 @@ PFN_D3D12_InitExt s_d3d12_init_ext = nullptr;
 PFN_D3D12_Create s_d3d12_create = nullptr;
 PFN_D3D12_Evaluate s_d3d12_evaluate = nullptr;
 PFN_D3D12_Release s_d3d12_release = nullptr;
+// Opaque on purpose, like the device above: the adapter, the discovery info and the requirement block are only
+// passed through.
+typedef NVSDK_NGX_Result (*PFN_D3D12_Requirements)(void *adapter, const void *info, void *out);
+PFN_D3D12_Requirements s_d3d12_requirements = nullptr;
+typedef NVSDK_NGX_Result (*PFN_D3D12_Scratch)(NVSDK_NGX_Feature feature_id, const void *params, size_t *out_size);
+PFN_D3D12_Scratch s_d3d12_scratch = nullptr;
 PFN_D3D12_Populate s_d3d12_populate = nullptr;
 PFN_D3D12_Shutdown1 s_d3d12_shutdown1 = nullptr;
 
@@ -320,19 +326,21 @@ __declspec(dllexport) const char *ngxrt_load(const wchar_t *snippet_path) {
         return asked;
     }
 
+    // The CUDA entries are what the DLSS snippets are driven through. A frame generation library has none that work
+    // (its CUDA exports are stubs, and some are absent): it needs only the Direct3D 12 ones.
+    const char *missing_cuda = nullptr;
     // NVSDK_NGX_CUDA_Init is deliberately not resolved: that export is a stub
     // returning 0xBAD00001, shared with D3D11_Init and D3D12_Init.
-    if (!resolve(s_init_ext, "NVSDK_NGX_CUDA_Init_Ext")) return "NVSDK_NGX_CUDA_Init_Ext";
+    if (!resolve(s_init_ext, "NVSDK_NGX_CUDA_Init_Ext") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_Init_Ext";
     // Optional: only the _Ext1 form registers the feature under a usable key,
     // but keep working if a snippet build lacks it.
     resolve(s_init_ext1, "NVSDK_NGX_CUDA_Init_Ext1");
-    if (!resolve(s_create, "NVSDK_NGX_CUDA_CreateFeature")) return "NVSDK_NGX_CUDA_CreateFeature";
+    if (!resolve(s_create, "NVSDK_NGX_CUDA_CreateFeature") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_CreateFeature";
     resolve(s_create1, "NVSDK_NGX_CUDA_CreateFeature1");
-    if (!resolve(s_evaluate, "NVSDK_NGX_CUDA_EvaluateFeature")) return "NVSDK_NGX_CUDA_EvaluateFeature";
-    if (!resolve(s_release, "NVSDK_NGX_CUDA_ReleaseFeature")) return "NVSDK_NGX_CUDA_ReleaseFeature";
-    if (!resolve(s_shutdown, "NVSDK_NGX_CUDA_Shutdown")) return "NVSDK_NGX_CUDA_Shutdown";
-    if (!resolve(s_populate, "NVSDK_NGX_CUDA_PopulateParameters_Impl"))
-        return "NVSDK_NGX_CUDA_PopulateParameters_Impl";
+    if (!resolve(s_evaluate, "NVSDK_NGX_CUDA_EvaluateFeature") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_EvaluateFeature";
+    if (!resolve(s_release, "NVSDK_NGX_CUDA_ReleaseFeature") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_ReleaseFeature";
+    if (!resolve(s_shutdown, "NVSDK_NGX_CUDA_Shutdown") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_Shutdown";
+    if (!resolve(s_populate, "NVSDK_NGX_CUDA_PopulateParameters_Impl") && !missing_cuda) missing_cuda = "NVSDK_NGX_CUDA_PopulateParameters_Impl";
     // Optional: not every snippet build exports it, and nothing else depends on
     // it -- it is only used to identify which feature id a snippet implements.
     resolve(s_scratch_size, "NVSDK_NGX_CUDA_GetScratchBufferSize");
@@ -343,7 +351,10 @@ __declspec(dllexport) const char *ngxrt_load(const wchar_t *snippet_path) {
     resolve(s_d3d12_create, "NVSDK_NGX_D3D12_CreateFeature");
     resolve(s_d3d12_evaluate, "NVSDK_NGX_D3D12_EvaluateFeature");
     resolve(s_d3d12_release, "NVSDK_NGX_D3D12_ReleaseFeature");
+    resolve(s_d3d12_requirements, "NVSDK_NGX_D3D12_GetFeatureRequirements");
+    resolve(s_d3d12_scratch, "NVSDK_NGX_D3D12_GetScratchBufferSize");
     resolve(s_d3d12_populate, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
+    if (missing_cuda && !(s_d3d12_init_ext && s_d3d12_create && s_d3d12_evaluate && s_d3d12_release)) return missing_cuda;
     resolve(s_d3d12_shutdown1, "NVSDK_NGX_D3D12_Shutdown1");
     return nullptr;
 }
@@ -530,6 +541,32 @@ __declspec(dllexport) NVSDK_NGX_Result ngxrt_d3d12_evaluate(ID3D12GraphicsComman
 __declspec(dllexport) NVSDK_NGX_Result ngxrt_d3d12_release(NVSDK_NGX_Handle *handle) {
     if (!s_d3d12_release) return NVSDK_NGX_Result_Fail;
     NVSDK_NGX_Result r = s_d3d12_release(handle);
+    g_no_tail_call = 1;
+    return r;
+}
+
+// Whether the snippet reports its feature supported on this adapter: the question Streamline asks the NGX
+// runtime before it offers the feature at all.
+__declspec(dllexport) NVSDK_NGX_Result ngxrt_d3d12_requirements(void *adapter, const void *info, void *out) {
+    if (!s_d3d12_requirements) return NVSDK_NGX_Result_Fail;
+    NVSDK_NGX_Result r = s_d3d12_requirements(adapter, info, out);
+    g_no_tail_call = 1;
+    return r;
+}
+
+// Fills a parameter object of the caller's with what the snippet reports about itself, where ngxrt_d3d12_populate
+// hands out this runtime's own block.
+__declspec(dllexport) NVSDK_NGX_Result ngxrt_d3d12_populate_into(NVSDK_NGX_Parameter *params) {
+    if (!s_d3d12_populate || !params) return NVSDK_NGX_Result_Fail;
+    NVSDK_NGX_Result r = s_d3d12_populate(params);
+    g_no_tail_call = 1;
+    return r;
+}
+
+__declspec(dllexport) NVSDK_NGX_Result ngxrt_d3d12_scratch_size(NVSDK_NGX_Feature feature_id, const void *params,
+                                                               size_t *out_size) {
+    if (!s_d3d12_scratch) return NVSDK_NGX_Result_Fail;
+    NVSDK_NGX_Result r = s_d3d12_scratch(feature_id, params, out_size);
     g_no_tail_call = 1;
     return r;
 }

@@ -112,13 +112,55 @@ frame), `--preset`, `--flags`, `--subrect`, `--dynamic WxH`, `--exposure`, `--ma
 `tests/dx12/dx12ngx.cpp` is a Direct3D 12 "game" that upscales through the NGX API, to try the
 OptiScaler integration.
 
+## Frame generation
+
+NVIDIA's frame generation (`nvngx_dlssg.dll`, 310.9.1) runs here too, for a game that has DLSS-G of its own.
+Unlike the upscalers it has no CUDA path: its kernels are launched through NVAPI inside a Direct3D 12 command
+list, on buffers and textures the library creates on the device. `fg/nvapi_fg.cpp` is the `nvapi64.dll` that
+answers that (ZLUDA's NVAPI is `zluda_nvapi.dll` beside it, and gets everything that is not frame generation's):
+
+- the buffers the library creates are found by hooking the device, only while the library runs, and their memory
+  is imported into HIP, so that a GPU virtual address in a kernel's arguments becomes the HIP pointer;
+- a texture or surface the library asks for through a descriptor is the resource behind it, imported the same way;
+  a normalised 8 or 16 bit array gets a normalised surface, as Direct3D's would have (`sust.p` converts floats);
+- a launch waits for the command list: the host splits the game's list (d4r's `record_boundary`) and the launches
+  of one split run together, between what was recorded before and after, with HIP and the queue waiting for each
+  other on a shared fence;
+- the game's textures are not shared with HIP, and may be in formats the library does not take, so `fgnv_evaluate`
+  copies them (with the converter the upscalers use, `core/convert.cpp`) into shared textures of its own, hands the
+  library those, and copies what it generates back into the game's texture. 10 bit and HDR colour is brought down
+  to 8 bit RGBA for the library.
+
+The kernels `fg_conv.hip` and `fg_custom.hip` (`kernels/build_fg_kernels.py`) stand in for 27 of the network's
+translated kernels, byte for byte what they compute. The NGX host (`zluda\ngx_fg\nvngx.dll`) is what the library
+insists on being called from; `fgnv_*` are the stand-in's entry points, which OptiScaler's `Nvngx_Nvidia` provider
+uses. `cubin_fatbin_map.txt` pairs the machine code the library hands over with the PTX that is next to it in its
+file; it is for 310.9.1 only.
+
+`dlss5nr_fg_harness.exe` (`fg/build_harness.bat`, then `fg/prepare_run.py`) does what the provider does, with
+Direct3D 12 textures of its own: a bright disc moves across a background and the frame generated between two is
+written as a PNG, where the disc should be half way. `FG_HARNESS_SESSION=1` gives the library the game's textures
+as a game would (not shared), `FG_HARNESS_FORMAT=bgra8|rgb10a2` changes the backbuffer's format,
+`FG_HARNESS_DIST=1` runs as the package does. `FG_NVAPI_PERKERNEL=1` synchronises after every kernel and reports
+what it left in the textures it touched.
+
+In OptiScaler the library can be driven by the game's own DLSS-G (`FGInput=NvngxFG`), or, with
+`FGOutput=DLSSG` and `FGNvngxReplacement=Nvidia`, by any other input that gives OptiScaler the frame: FSR 3 frame
+generation, XeFG (the game's depth and motion vectors come from its tags) or the upscaler. The FSR-FG swapchain
+paces the frames and the library makes them, with no Streamline of OptiScaler's.
+
+Every launch of the library goes on one stream of the stand-in's own, native or translated: the upscalers of the
+same process run with a default stream per thread (`ZLUDA_PER_THREAD_STREAM`), and launches split between that and
+HIP's null stream do not wait for each other (the generated frame comes out black, with no error).
+
 ## Logs
 
 The logs are in `cache\`:
 
 - `dlss5nr.log`: the runtime;
 - `gate.log`: the native kernels, which ones load and which fall back;
-- NVIDIA's own NGX log.
+- NVIDIA's own NGX log;
+- `zluda\fg_nvapi.log`: the frame generation stand-in (what it attached to, mirrors made, launches that failed).
 
 The network reports its fatal errors to the NGX log and then ends the
 process. When a game closes on its own, look there.

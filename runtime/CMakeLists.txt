@@ -62,12 +62,22 @@ set_target_properties(gate PROPERTIES OUTPUT_NAME nvcuda RUNTIME_OUTPUT_DIRECTOR
 add_library(ngx SHARED ngx/ngx_runtime.cpp common/ngx_cuda.h)
 set_target_properties(ngx PROPERTIES OUTPUT_NAME nvngx RUNTIME_OUTPUT_DIRECTORY ${BIN}/zluda)
 
+# ------------------------------------------- the NVAPI stand-in for frame generation
+# nvapi64.dll to the library: ZLUDA's NVAPI (zluda_nvapi.dll beside it) for everything but the kernels the library
+# launches inside a command list and the textures it asks for, which it answers with HIP. It also holds the
+# evaluation of a frame (fgnv_evaluate). The host (OptiScaler) attaches a device and splits the lists; see fg/.
+add_library(nvapi_fg SHARED fg/nvapi_fg.cpp core/convert.cpp core/convert.h
+            common/cuda_min.h common/ngx_cuda.h fg/fg_native_table.inc)
+target_link_libraries(nvapi_fg PRIVATE d3d12 dxgi ${D3DCOMPILER})
+set_target_properties(nvapi_fg PROPERTIES OUTPUT_NAME nvapi64 RUNTIME_OUTPUT_DIRECTORY ${BIN}/zluda)
+
 # ------------------------------------------------------------- the runtime
 add_library(dlss5nr_runtime SHARED
     include/dlss5nr.h
     core/runtime.cpp
     core/network.cpp core/network.h
     core/upscaler.cpp
+    core/convert.cpp core/convert.h
     core/passes.cpp core/passes.h core/shaders.h
     common/cuda_min.h common/ngx_cuda.h)
 target_link_libraries(dlss5nr_runtime PRIVATE d3d12 ${D3DCOMPILER})

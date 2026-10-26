@@ -27,6 +27,7 @@ IMPLEMENTED = {
     "cuGetProcAddress_v2",
     "cuModuleGetFunction",
     "cuLaunchKernel",
+    "cuCtxSynchronize",
 }
 
 # Not forwardable: the loader would bind our DllMain to ZLUDA's, and the delay

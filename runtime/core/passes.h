@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <string>
 
+#include "convert.h"
+
 namespace dlss5nr {
 
 enum class Pass { Exposure, Capture, Refresh, Soften, Track, Compose, SyncSignal, SyncWait, Count };
@@ -82,10 +84,6 @@ private:
     UINT next_ = 0;
 };
 
-// The view format for reading or writing a texture of this storage format:
-// typeless and depth formats become their readable form, sRGB becomes UNORM
-// so values are read and written as stored. Unknown on formats the passes
-// cannot use.
-DXGI_FORMAT view_format(DXGI_FORMAT storage);
+
 
 } // namespace dlss5nr
