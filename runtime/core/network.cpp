@@ -965,6 +965,10 @@ constexpr const char *PresetNames[] = {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hin
                                        "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
                                        "DLSS.Hint.Render.Preset.UltraPerformance",
                                        "DLSS.Hint.Render.Preset.UltraQuality"};
+constexpr const char *RayReconstructionPresetNames[] = {
+    "RayReconstruction.Hint.Render.Preset.DLAA", "RayReconstruction.Hint.Render.Preset.Quality",
+    "RayReconstruction.Hint.Render.Preset.Balanced", "RayReconstruction.Hint.Render.Preset.Performance",
+    "RayReconstruction.Hint.Render.Preset.UltraPerformance", "RayReconstruction.Hint.Render.Preset.UltraQuality"};
 } // namespace up_param
 
 bool Network::create_upscaler(const UpscalerCreate &c, std::string &error) {
@@ -995,6 +999,9 @@ bool Network::create_upscaler(const UpscalerCreate &c, std::string &error) {
         for (const char *name : up_param::PresetNames) p->Set(name, (unsigned)c.preset);
     // Ray reconstruction refuses to be created with the denoiser off.
     if (kind_ == Kind::RayReconstruction) p->Set(up_param::DenoiseMode, 1u);
+    // Its presets have names of their own.
+    if (kind_ == Kind::RayReconstruction && c.preset)
+        for (const char *name : up_param::RayReconstructionPresetNames) p->Set(name, (unsigned)c.preset);
     // 13 is NVIDIA's id for ray reconstruction (the feature "SuperSamplingDenoising"); a snippet
     // implements one feature, and the selection that matters is which DLL was loaded.
     const NVSDK_NGX_Feature feature =
@@ -1017,8 +1024,9 @@ bool Network::evaluate_upscaler(const UpscalerDesc &d, std::string &error, bool 
         return false;
     }
     const bool rr = kind_ == Kind::RayReconstruction;
-    if (rr && (!d.diffuse_albedo || !d.specular_albedo || !d.normals || !d.world_to_view || !d.view_to_clip)) {
-        error = "ray reconstruction needs diffuse and specular albedo, normals and both matrices";
+    // The camera matrices are optional (see upscaler.cpp).
+    if (rr && (!d.diffuse_albedo || !d.specular_albedo || !d.normals)) {
+        error = "ray reconstruction needs diffuse and specular albedo and normals";
         return false;
     }
     if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;

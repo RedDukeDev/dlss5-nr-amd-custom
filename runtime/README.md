@@ -104,6 +104,12 @@ What was measured on an RX 7900 XT, 960x540 to 1920x1080:
 | super resolution, preset K and J | 4 ms | its heavy layers native, the rest translated |
 | ray reconstruction | 72 ms | translated, no native kernels yet |
 
+Ray reconstruction in a game: the game offers it when OptiScaler reports `SuperSamplingDenoising.Available`
+(it does, for D3D12, where this runtime is usable) and, in Unreal's DLSS plugin as Hogwarts Legacy has it, with
+`r.RayTracing.EnableInGame=True` under `[RayTracing]` and DLSS as the upscaler. The camera matrices are optional
+(Unreal passes null pointers). The render preset is D unless the DLSSD menu or the game's hint (4 or 5) says E: left
+to the snippet, the default is neither and the picture is grainy.
+
 The upscaler harness (`dlss5up_harness.exe --kind sr|rr --runtime-dir DIR --data-dir DIR --snippet DLL`)
 feeds synthetic frames of ordinary game textures and has what is needed to tell a wrong picture from a
 right one: `--scene gradient|const|corner|topleft|ramp`, `--means` (the output's mean colour after each

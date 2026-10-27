@@ -258,9 +258,10 @@ bool run(dlss5nr_upscaler &u, ID3D12CommandQueue *queue, const dlss5nr_upscaler_
         error = "colour, depth, motion vectors and output are all needed";
         return false;
     }
-    if (rr && (!f.diffuse_albedo.resource || !f.specular_albedo.resource || !f.normals.resource || !f.world_to_view ||
-               !f.view_to_clip)) {
-        error = "ray reconstruction needs diffuse and specular albedo, normals and both matrices";
+    // The camera matrices are optional: a game may leave them out (Unreal's DLSS passes null pointers) and the
+    // network works from the G-buffer without them.
+    if (rr && (!f.diffuse_albedo.resource || !f.specular_albedo.resource || !f.normals.resource)) {
+        error = "ray reconstruction needs diffuse and specular albedo and normals";
         return false;
     }
     const uint32_t slot = u.ring_next++ % dlss5nr_upscaler::kRing;
