@@ -78,6 +78,7 @@ struct Entry {
     char entry[96] = {};    // the symbol inside it, if not the same name
     unsigned bx = 0, by = 1, bz = 1;  // the block shape it was written for
     unsigned args = 0;      // the packed argument buffer size it expects
+    unsigned waves = 0;     // waves per block to launch with, when not the PTX's (the grid is the same)
     hipFunction_t fn = nullptr;
     bool dead = false;      // tried and failed: never again this run
     unsigned launches = 0;
@@ -110,6 +111,8 @@ inline volatile unsigned g_entry_count = 0;
 // The manifest is one kernel per line:
 //
 //   <ptx kernel name>  <code object>  block=256,1,1  args=248  [entry=<symbol>]
+//   waves=N launches the native kernel with N waves per block (block z), where the PTX uses fewer: the
+//   kernel is written for any count
 //
 // Blank lines and lines starting with # are ignored. A line the parser does not
 // understand is skipped with a complaint rather than guessed at.
@@ -150,6 +153,7 @@ inline void load_one_manifest(const char *path) {
         while ((token = strtok(nullptr, " \t\r\n")) != nullptr) {
             if (sscanf(token, "block=%u,%u,%u", &e.bx, &e.by, &e.bz) >= 1) continue;
             if (sscanf(token, "args=%u", &e.args) == 1) continue;
+            if (sscanf(token, "waves=%u", &e.waves) == 1) continue;
             if (strncmp(token, "entry=", 6) == 0) {
                 strncpy(e.entry, token + 6, sizeof e.entry - 1);
                 continue;
@@ -422,6 +426,7 @@ inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, 
                 }
             }
         }
+        if (e.waves) bz = e.waves;
         if (e.block_z) bz = e.block_z;
         if (e.grid_x) { gx = e.grid_x; gy = 1; gz = 1; }
         const hipError_t launched = runtime().module_launch(

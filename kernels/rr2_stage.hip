@@ -105,16 +105,47 @@ __device__ inline u32x4 acc_load(const f16 *m, int ld, int token, int ch0, int u
 }
 
 // Chain of 32-deep slices: D[row][token] = sum_k A[row][k] B[k][token] + C, 16 tokens (tb) by 16 rows (cb).
-// The tiles are dealt out to the block's waves.
-template <int NCB, int KS, class AOp, class BOp, class Init, class Store>
+// A tile is TBG token blocks of one column block: the A operand (usually the weights, from L2) is read once for
+// all of them. The tiles are dealt out to the block's waves.
+template <int NCB, int KS, int TBG, class AOp, class BOp, class Init, class Store>
 __device__ inline void product(int ntb, AOp aop, BOp bop, Init init, Store store) {
     const int lane = threadIdx.x, i = lane & 15, u = lane >> 4;
     const int wave = threadIdx.z, waves = blockDim.z;
-    for (int tile = wave; tile < ntb * NCB; tile += waves) {
-        const int tb = tile / NCB, cb = tile % NCB;
-        u32x4 acc = init(tb, cb, i, u);
-        for (int s = 0; s < KS; ++s) acc = slice(acc, aop(cb, i, s, 0), bop(tb, i, s, 0), aop(cb, i, s, 1), bop(tb, i, s, 1));
-        store(tb, cb, i, u, acc);
+    const int groups = ntb / TBG;
+    for (int tile = wave; tile < groups * NCB; tile += waves) {
+        const int cb = tile % NCB, tb0 = (tile / NCB) * TBG;
+        u32x4 acc[TBG];
+#pragma unroll
+        for (int g = 0; g < TBG; ++g) acc[g] = init(tb0 + g, cb, i, u);
+        for (int s = 0; s < KS; ++s) {
+            const half16 a0 = aop(cb, i, s, 0), a1 = aop(cb, i, s, 1);
+#pragma unroll
+            for (int g = 0; g < TBG; ++g) acc[g] = slice(acc[g], a0, bop(tb0 + g, i, s, 0), a1, bop(tb0 + g, i, s, 1));
+        }
+#pragma unroll
+        for (int g = 0; g < TBG; ++g) store(tb0 + g, cb, i, u, acc[g]);
+    }
+}
+
+// The same product for several independent copies (the heads of a group) at once: the functors take the copy
+// as their first argument.
+template <int NCB, int KS, int TBG, class AOp, class BOp, class Init, class Store>
+__device__ inline void product_h(int copies, int ntb, AOp aop, BOp bop, Init init, Store store) {
+    const int lane = threadIdx.x, i = lane & 15, u = lane >> 4;
+    const int wave = threadIdx.z, waves = blockDim.z;
+    const int groups = ntb / TBG;
+    for (int tile = wave; tile < copies * groups * NCB; tile += waves) {
+        const int cb = tile % NCB, tb0 = ((tile / NCB) % groups) * TBG, copy = tile / (NCB * groups);
+        u32x4 acc[TBG];
+#pragma unroll
+        for (int g = 0; g < TBG; ++g) acc[g] = init(copy, tb0 + g, cb, i, u);
+        for (int s = 0; s < KS; ++s) {
+            const half16 a0 = aop(copy, cb, i, s, 0), a1 = aop(copy, cb, i, s, 1);
+#pragma unroll
+            for (int g = 0; g < TBG; ++g) acc[g] = slice(acc[g], a0, bop(copy, tb0 + g, i, s, 0), a1, bop(copy, tb0 + g, i, s, 1));
+        }
+#pragma unroll
+        for (int g = 0; g < TBG; ++g) store(copy, tb0 + g, cb, i, u, acc[g]);
     }
 }
 
@@ -186,7 +217,8 @@ __device__ void stage(const StageArgs &args) {
     using L = Image<C, NH, NB, CUP, CLO, CM>;
     constexpr int KS = C / 32, NCB = C / 16;
     // [xa codes 64C][acc f16 128C][xn / mlp f16 128C][scores 8192][qa 2048][vt 2048][oa 2048]
-    __shared__ __attribute__((aligned(32))) uint8_t lds[320 * C + 14336];
+    constexpr int HG = (C <= 96 && C > 32) ? 2 : 1;                       // heads worked on at once, each with 14336 bytes of scratch
+    __shared__ __attribute__((aligned(32))) uint8_t lds[320 * C + 14336 * HG];
     uint8_t *const xa = lds;                                  // x, then r, then y: codes in position order
     f16 *const acc = (f16 *)(lds + 64 * C);                   // the attention sum, then r; expand: the expanded sums
     f16 *const xn = (f16 *)(lds + 192 * C);                   // expand: x unquantised; later the MLP sum
@@ -206,7 +238,7 @@ __device__ void stage(const StageArgs &args) {
 
     // ---- input: x in xa as codes
     if (IN == MERGE) {
-        product<NCB, 4 * CUP / 32>(
+        product<NCB, 4 * CUP / 32, 2>(
             4, Weights<NCB, 4 * CUP / 32, true>{image},
             [&](int tb, int i, int s, int h) {
                 const int t = 16 * tb + i;
@@ -229,7 +261,7 @@ __device__ void stage(const StageArgs &args) {
     } else {
         // expand: e = We . [the 4x4 tokens one level down] + be, 16 tokens by 4C, into acc as f16
         const int wl = wd / 2, hl = ht / 2;
-        product<4 * C / 16, (CLO >= 32 ? CLO / 32 : 1)>(
+        product<4 * C / 16, (CLO >= 32 ? CLO / 32 : 1), 1>(
             1, Weights<4 * C / 16, (CLO >= 32 ? CLO / 32 : 1), true>{image},
             [&](int tb, int i, int s, int h) {
                 const int X = mirror((x0 >> 1) + (i & 3), wl), Y = mirror((y0 >> 1) + (i >> 2), hl);
@@ -258,43 +290,53 @@ __device__ void stage(const StageArgs &args) {
     }
     __syncthreads();
 
-    // ---- the heads
-    for (int h = 0; h < NH; ++h) {
-        const uint8_t *const head = image + L::heads + h * L::HEAD;
+    // ---- the heads, HG at a time: each phase runs the group's heads together, and the out-projections of the
+    // group are one chain per tile with the sum in registers (the same slices in head order)
+    for (int h0 = 0; h0 < NH; h0 += HG) {
+        const int hgs = NH - h0 < HG ? NH - h0 : HG;
+        auto head_of = [&](int hg) { return image + L::heads + (h0 + hg) * L::HEAD; };
+        auto pe_of = [&](int hg) { return pe + hg * 14336; };
+        auto qa_of = [&](int hg) { return pe + hg * 14336 + 8192; };
+        auto vt_of = [&](int hg) { return pe + hg * 14336 + 10240; };
+        auto oa_of = [&](int hg) { return pe + hg * 14336 + 12288; };
+
         // q and v: 64 x 32 each, K = C
-        product<2, KS>(
-            4, Weights<2, KS, false>{head}, Codes{xa, C},
-            [&](int tb, int cb, int i, int u) { return acc_zero(); },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+        product_h<2, KS, 2>(
+            hgs, 4, [&](int hg, int cb, int i, int s, int hh) { return weight_half(head_of(hg) + 512 * (s * 2 + cb), i, hh); },
+            [&](int hg, int tb, int i, int s, int hh) { return code_half16(xa + (16 * tb + i) * C + 32 * s + 16 * hh); },
+            [&](int hg, int tb, int cb, int i, int u) { return acc_zero(); },
+            [&](int hg, int tb, int cb, int i, int u, u32x4 a) {
 #pragma unroll
-                for (int j = 0; j < 4; ++j) put_pair(qa + (16 * tb + i) * 32, 16 * cb + 4 * j + u, as_half2(a[j]));
+                for (int j = 0; j < 4; ++j) put_pair(qa_of(hg) + (16 * tb + i) * 32, 16 * cb + 4 * j + u, as_half2(a[j]));
             });
-        product<2, KS>(
-            4, Weights<2, KS, false>{head + 32 * C}, Codes{xa, C},
-            [&](int tb, int cb, int i, int u) { return acc_zero(); },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+        product_h<2, KS, 2>(
+            hgs, 4, [&](int hg, int cb, int i, int s, int hh) { return weight_half(head_of(hg) + 32 * C + 512 * (s * 2 + cb), i, hh); },
+            [&](int hg, int tb, int i, int s, int hh) { return code_half16(xa + (16 * tb + i) * C + 32 * s + 16 * hh); },
+            [&](int hg, int tb, int cb, int i, int u) { return acc_zero(); },
+            [&](int hg, int tb, int cb, int i, int u, u32x4 a) {
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const uint32_t codes = codes_e4m3x2(round_e4m3x2(a[j]));
                     const int ch = 16 * cb + 4 * j + u, t = pos_of(16 * tb + i);
-                    vt[ch * 64 + t] = (uint8_t)codes;
-                    vt[(ch + 2) * 64 + t] = (uint8_t)(codes >> 16);
+                    vt_of(hg)[ch * 64 + t] = (uint8_t)codes;
+                    vt_of(hg)[(ch + 2) * 64 + t] = (uint8_t)(codes >> 16);
                 }
             });
         __syncthreads();
 
         // scores: rows are keys, columns queries; the table is symmetric. e = the cubic's exponent bits.
-        const uint8_t *const bias = head + 64 * C;
-        product<4, 1>(
-            4, Codes{qa, 32}, Codes{qa, 32},
-            [&](int tb, int jb, int i, int u) {
+        product_h<4, 1, 1>(
+            hgs, 4, [&](int hg, int jb, int i, int s, int hh) { return code_half16(qa_of(hg) + (16 * jb + i) * 32 + 16 * hh); },
+            [&](int hg, int tb, int i, int s, int hh) { return code_half16(qa_of(hg) + (16 * tb + i) * 32 + 16 * hh); },
+            [&](int hg, int tb, int jb, int i, int u) {
+                const uint8_t *const bias = head_of(hg) + 64 * C;
                 u32x4 r;
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
                     r[j] = as_u32((half2){head_bias(bias, 16 * jb + 4 * j + u, 16 * tb + i), head_bias(bias, 16 * jb + 4 * j + 2 + u, 16 * tb + i)});
                 return r;
             },
-            [&](int tb, int jb, int i, int u, u32x4 a) {
+            [&](int hg, int tb, int jb, int i, int u, u32x4 a) {
                 const half2 lo = {(f16)-0.55615234375f, (f16)-0.55615234375f}, hi = {(f16)0.55615234375f, (f16)0.55615234375f};
                 const half2 k0 = {(f16)0.017181396484375f, (f16)0.017181396484375f};
                 const half2 k1 = {(f16)0.92724609375f, (f16)0.92724609375f}, k2 = {(f16)1.375f, (f16)1.375f};
@@ -306,15 +348,16 @@ __device__ void stage(const StageArgs &args) {
                     const half2 v = __builtin_elementwise_fma(m, t, k2);
                     const half2 e = as_half2((as_u32(v) << 5) & 0x7FE07FE0u);
                     const int key = 16 * jb + 4 * j + u, q = 16 * tb + i;
-                    ((f16 *)pe)[q * 64 + key] = e[0];
-                    ((f16 *)pe)[q * 64 + key + 2] = e[1];
+                    ((f16 *)pe_of(hg))[q * 64 + key] = e[0];
+                    ((f16 *)pe_of(hg))[q * 64 + key + 2] = e[1];
                 }
             });
         __syncthreads();
 
         // the softmax of each query's 64 keys, summed in NVIDIA's order; p as codes in position order
-        for (int q = tid; q < 64; q += threads) {
-            f16 *row = (f16 *)pe + q * 64;
+        for (int k = tid; k < hgs * 64; k += threads) {
+            const int hg = k >> 6, q = k & 63;
+            f16 *row = (f16 *)pe_of(hg) + q * 64;
             f16 part[4][2];
             for (int tt = 0; tt < 4; ++tt) {
                 for (int half = 0; half < 2; ++half) {
@@ -328,37 +371,53 @@ __device__ void stage(const StageArgs &args) {
             const f16 sum1 = (f16)((f16)(part[0][1] + part[1][1]) + (f16)(part[2][1] + part[3][1]));
             const f16 r = (f16)__builtin_amdgcn_rcpf((float)(f16)(sum0 + sum1));
             uint8_t p[64];
-            for (int k = 0; k < 64; ++k) p[k] = (uint8_t)code_q8((f16)(row[k] * r));
-            uint8_t *out = pe + q * 128;
-            for (int k = 0; k < 64; ++k) out[pos_of(k)] = p[k];
+            for (int kk = 0; kk < 64; ++kk) p[kk] = (uint8_t)code_q8((f16)(row[kk] * r));
+            uint8_t *out = pe_of(hg) + q * 128;
+            for (int kk = 0; kk < 64; ++kk) out[pos_of(kk)] = p[kk];
         }
         __syncthreads();
 
         // o = p v: rows are v's channels, K = the 64 keys
-        product<2, 2>(
-            4, Codes{vt, 64}, Codes{pe, 128},
-            [&](int tb, int cb, int i, int u) { return acc_zero(); },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+        product_h<2, 2, 2>(
+            hgs, 4, [&](int hg, int cb, int i, int s, int hh) { return code_half16(vt_of(hg) + (16 * cb + i) * 64 + 32 * s + 16 * hh); },
+            [&](int hg, int tb, int i, int s, int hh) { return code_half16(pe_of(hg) + (16 * tb + i) * 128 + 32 * s + 16 * hh); },
+            [&](int hg, int tb, int cb, int i, int u) { return acc_zero(); },
+            [&](int hg, int tb, int cb, int i, int u, u32x4 a) {
 #pragma unroll
-                for (int j = 0; j < 4; ++j) put_pair(oa + (16 * tb + i) * 32, 16 * cb + 4 * j + u, as_half2(a[j]));
+                for (int j = 0; j < 4; ++j) put_pair(oa_of(hg) + (16 * tb + i) * 32, 16 * cb + 4 * j + u, as_half2(a[j]));
             });
         __syncthreads();
 
-        // the out-projection, onto bo for the first head and onto the previous sum after that
-        product<NCB, 1>(
-            4, Weights<NCB, 1, true>{head + 64 * C + 6144}, Codes{oa, 32},
-            [&](int tb, int cb, int i, int u) {
-                return h == 0 ? acc_bias((const f16 *)(image + L::bo), 16 * cb, u) : acc_load(acc, C, 16 * tb + i, 16 * cb, u);
-            },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+        // the out-projections of the group, chained: onto bo for the first head, onto the sum so far after that
+        {
+            const int i = lane & 15, u = lane >> 4;
+            const int wave = threadIdx.z, waves = blockDim.z;
+            for (int tile = wave; tile < NCB * 2; tile += waves) {
+                const int cb = tile % NCB, tb0 = (tile / NCB) * 2;
+                u32x4 a2[2];
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const half2 v = as_half2(a[j]);
-                    const int ch = 16 * cb + 4 * j + u, t = 16 * tb + i;
-                    acc[t * C + ch] = v[0];
-                    acc[t * C + ch + 2] = v[1];
+                for (int g = 0; g < 2; ++g)
+                    a2[g] = h0 == 0 ? acc_bias((const f16 *)(image + L::bo), 16 * cb, u) : acc_load(acc, C, 16 * (tb0 + g) + i, 16 * cb, u);
+                for (int hg = 0; hg < hgs; ++hg) {
+                    const uint8_t *const wo = head_of(hg) + 64 * C + 6144 + 512 * cb;
+                    const half16 w0 = weight_half(wo, i, 0), w1 = weight_half(wo, i, 1);
+#pragma unroll
+                    for (int g = 0; g < 2; ++g)
+                        a2[g] = slice(a2[g], w0, code_half16(oa_of(hg) + (16 * (tb0 + g) + i) * 32), w1,
+                                      code_half16(oa_of(hg) + (16 * (tb0 + g) + i) * 32 + 16));
                 }
-            });
+#pragma unroll
+                for (int g = 0; g < 2; ++g) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const half2 v = as_half2(a2[g][j]);
+                        const int ch = 16 * cb + 4 * j + u, t = 16 * (tb0 + g) + i;
+                        acc[t * C + ch] = v[0];
+                        acc[t * C + ch + 2] = v[1];
+                    }
+                }
+            }
+        }
         __syncthreads();
     }
 
@@ -372,39 +431,75 @@ __device__ void stage(const StageArgs &args) {
     }
     __syncthreads();
 
-    // ---- the MLP: C -> 32 -> activation -> C per branch
-    for (int j = 0; j < NB; ++j) {
-        const uint8_t *const branch = image + L::branch(j);
-        product<2, KS>(
-            4, Weights<2, KS, true>{branch}, Codes{xa, C},
-            [&](int tb, int cb, int i, int u) { return acc_bias((const f16 *)(branch + 32 * C), 16 * cb, u); },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+    // ---- the MLP: C -> 32 -> activation -> C per branch. The branches' activations are made a group at a time,
+    // all at once, and the sum over the group's branches then runs as one chain per tile with its accumulator
+    // in registers: the same slices in the same order, without a barrier and a trip through LDS per branch.
+    constexpr int GB = NB < 7 ? NB : 7;                       // 2048 bytes of activations each, in pe .. oa
+    for (int g0 = 0; g0 < NB; g0 += GB) {
+        const int gb = NB - g0 < GB ? NB - g0 : GB;
+        {
+            const int lane_i = lane & 15, u = lane >> 4;
+            const int wave = threadIdx.z, waves = blockDim.z;
+            for (int tile = wave; tile < gb * 4; tile += waves) {
+                const int jj = tile >> 2, cb = (tile >> 1) & 1, tb0 = (tile & 1) * 2;
+                const uint8_t *const branch = image + L::branch(g0 + jj);
+                uint8_t *const act = pe + jj * 2048;
+                u32x4 acc2[2];
+                acc2[0] = acc2[1] = acc_bias((const f16 *)(branch + 32 * C), 16 * cb, u);
+                for (int st = 0; st < KS; ++st) {
+                    const half16 a0 = weight_half(branch + 512 * (cb * KS + st), lane_i, 0);
+                    const half16 a1 = weight_half(branch + 512 * (cb * KS + st), lane_i, 1);
+#pragma unroll
+                    for (int g = 0; g < 2; ++g)
+                        acc2[g] = slice(acc2[g], a0, code_half16(xa + (16 * (tb0 + g) + lane_i) * C + 32 * st), a1,
+                                        code_half16(xa + (16 * (tb0 + g) + lane_i) * C + 32 * st + 16));
+                }
                 const half2 two = {(f16)2.0f, (f16)2.0f};
                 const half2 k0 = {(f16)0.0810546875f, (f16)0.0810546875f}, k1 = {(f16)0.412109375f, (f16)0.412109375f};
                 const half2 half_ = {(f16)0.5f, (f16)0.5f};
 #pragma unroll
-                for (int jj = 0; jj < 4; ++jj) {
-                    const half2 x = as_half2(a[jj]);
-                    const half2 y = __builtin_elementwise_min(__builtin_elementwise_max(x, -two), two);
-                    const half2 g = half_ + y * (k1 - k0 * __builtin_elementwise_abs(y));
-                    put_pair(qa + (16 * tb + i) * 32, 16 * cb + 4 * jj + u, x * g);
-                }
-            });
-        __syncthreads();
-        product<NCB, 1>(
-            4, Weights<NCB, 1, true>{branch + 32 * C + 64}, Codes{qa, 32},
-            [&](int tb, int cb, int i, int u) {
-                return j == 0 ? acc_bias((const f16 *)(branch + 64 * C + 64), 16 * cb, u) : acc_load(mlp, C, 16 * tb + i, 16 * cb, u);
-            },
-            [&](int tb, int cb, int i, int u, u32x4 a) {
+                for (int g = 0; g < 2; ++g) {
 #pragma unroll
-                for (int jj = 0; jj < 4; ++jj) {
-                    const half2 v = as_half2(a[jj]);
-                    const int ch = 16 * cb + 4 * jj + u, t = 16 * tb + i;
-                    mlp[t * C + ch] = v[0];
-                    mlp[t * C + ch + 2] = v[1];
+                    for (int q = 0; q < 4; ++q) {
+                        const half2 x = as_half2(acc2[g][q]);
+                        const half2 y = __builtin_elementwise_min(__builtin_elementwise_max(x, -two), two);
+                        const half2 gate = half_ + y * (k1 - k0 * __builtin_elementwise_abs(y));
+                        put_pair(act + (16 * (tb0 + g) + lane_i) * 32, 16 * cb + 4 * q + u, x * gate);
+                    }
                 }
-            });
+            }
+        }
+        __syncthreads();
+        {
+            const int lane_i = lane & 15, u = lane >> 4;
+            const int wave = threadIdx.z, waves = blockDim.z;
+            for (int tile = wave; tile < NCB * 2; tile += waves) {
+                const int cb = tile % NCB, tb0 = (tile / NCB) * 2;
+                u32x4 acc2[2];
+#pragma unroll
+                for (int g = 0; g < 2; ++g)
+                    acc2[g] = g0 == 0 ? acc_bias((const f16 *)(image + L::branch(0) + 64 * C + 64), 16 * cb, u)
+                                      : acc_load(mlp, C, 16 * (tb0 + g) + lane_i, 16 * cb, u);
+                for (int jj = 0; jj < gb; ++jj) {
+                    const uint8_t *const wu = image + L::branch(g0 + jj) + 32 * C + 64 + 512 * cb;
+                    const half16 a0 = weight_half(wu, lane_i, 0), a1 = weight_half(wu, lane_i, 1);
+#pragma unroll
+                    for (int g = 0; g < 2; ++g)
+                        acc2[g] = slice(acc2[g], a0, code_half16(pe + jj * 2048 + (16 * (tb0 + g) + lane_i) * 32), a1,
+                                        code_half16(pe + jj * 2048 + (16 * (tb0 + g) + lane_i) * 32 + 16));
+                }
+#pragma unroll
+                for (int g = 0; g < 2; ++g) {
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const half2 v = as_half2(acc2[g][q]);
+                        const int ch = 16 * cb + 4 * q + u, t = 16 * (tb0 + g) + lane_i;
+                        mlp[t * C + ch] = v[0];
+                        mlp[t * C + ch + 2] = v[1];
+                    }
+                }
+            }
+        }
         __syncthreads();
     }
 
@@ -428,7 +523,7 @@ __device__ void stage(const StageArgs &args) {
     if (OUT == TOKENS_ONLY) return;
 
     // ---- the guide head: 16 channels
-    product<1, KS>(
+    product<1, KS, 1>(
         4, Weights<1, KS, true>{image + L::wh}, Codes{yq, C},
         [&](int tb, int cb, int i, int u) { return acc_bias((const f16 *)(image + L::bh), 0, u); },
         [&](int tb, int cb, int i, int u, u32x4 a) {
@@ -503,7 +598,7 @@ __device__ void stage(const StageArgs &args) {
         return even && X >= 0 && X < wd && Y >= 0 && Y < ht;
     };
     if (CM) {
-        product<(CM >= 16 ? CM / 16 : 1), 4 * C / 32>(
+        product<(CM >= 16 ? CM / 16 : 1), 4 * C / 32, 1>(
             1, Weights<(CM >= 16 ? CM / 16 : 1), 4 * C / 32, true>{image + L::wm},
             [&](int tb, int i, int s, int h) {
                 const int q = s / KS, p = s % KS;
@@ -543,10 +638,10 @@ __device__ void stage(const StageArgs &args) {
 
 // C, heads, MLP branches, channels one level up (merge), channels one level down (expand), channels merged for
 // the next encoder
-extern "C" __global__ __launch_bounds__(32) void rr2_enc1_kernel_native(StageArgs args) {
+extern "C" __global__ __launch_bounds__(256) void rr2_enc1_kernel_native(StageArgs args) {
     stage<64, 2, 8, 32, 0, 96, MERGE, ENCODER>(args);
 }
-extern "C" __global__ __launch_bounds__(128) void rr2_enc2_kernel_native(StageArgs args) {
+extern "C" __global__ __launch_bounds__(256) void rr2_enc2_kernel_native(StageArgs args) {
     stage<96, 4, 12, 0, 0, 128, TOKENS, ENCODER>(args);
 }
 extern "C" __global__ __launch_bounds__(128) void rr2_enc3_kernel_native(StageArgs args) {
@@ -564,13 +659,13 @@ extern "C" __global__ __launch_bounds__(128) void rr2_dec2_kernel_0_native(Stage
 extern "C" __global__ __launch_bounds__(128) void rr2_dec2_kernel_1_native(StageArgs args) {
     stage<96, 4, 12, 0, 0, 0, TOKENS, DECODER_GUIDE>(args);
 }
-extern "C" __global__ __launch_bounds__(64) void rr2_dec1_kernel_0_native(StageArgs args) {
+extern "C" __global__ __launch_bounds__(256) void rr2_dec1_kernel_0_native(StageArgs args) {
     stage<64, 2, 8, 0, 96, 0, EXPAND, TOKENS_ONLY>(args);
 }
-extern "C" __global__ __launch_bounds__(64) void rr2_dec1_kernel_1_native(StageArgs args) {
+extern "C" __global__ __launch_bounds__(256) void rr2_dec1_kernel_1_native(StageArgs args) {
     stage<64, 2, 8, 0, 0, 0, TOKENS, DECODER_GUIDE>(args);
 }
-extern "C" __global__ __launch_bounds__(32) void rr2_dec0_kernel_0_native(StageArgs args) {
+extern "C" __global__ __launch_bounds__(256) void rr2_dec0_kernel_0_native(StageArgs args) {
     stage<32, 2, 4, 0, 64, 0, EXPAND, TOKENS_ONLY>(args);
 }
 extern "C" __global__ __launch_bounds__(256) void rr2_enc4_kernel_native(StageArgs args) {

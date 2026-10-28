@@ -26,6 +26,7 @@ def main():
     ap.add_argument("hsaco")
     ap.add_argument("entry")
     ap.add_argument("--time", type=int, default=0)
+    ap.add_argument("--waves", type=int, default=0, help="launch with this many waves per block (block z)")
     ap.add_argument("--shift-check", action="store_true", help="also list differing offsets")
     args = ap.parse_args()
     info = read_info(args.capture)
@@ -37,7 +38,8 @@ def main():
         dev[base] = h.upload(np.fromfile(os.path.join(args.capture, "pre_%x.bin" % base), np.uint8))
     for offset, base, delta in info["pointers"]:
         params[offset:offset + 8] = (dev[base] + delta).to_bytes(8, "little")
-    h.launch(fn, info["grid"], info["block"], bytes(params))
+    block = info["block"] if not args.waves else (info["block"][0], info["block"][1], args.waves)
+    h.launch(fn, info["grid"], block, bytes(params))
     total = 0
     for base, size in info["regions"].items():
         captured = np.fromfile(os.path.join(args.capture, "post_%x.bin" % base), np.uint8)
@@ -62,7 +64,7 @@ def main():
                     if args.shift_check:
                         print("      ", [(int(i - d), int(captured[i]), int(mine[i])) for i in sel[:8]])
     if args.time:
-        ms = h.time(fn, info["grid"], info["block"], bytes(params), repeat=args.time)
+        ms = h.time(fn, info["grid"], block, bytes(params), repeat=args.time)
         print("%.3f ms per launch" % ms)
     print("IDENTICAL" if total == 0 else "DIFFERENT (%d bytes)" % total)
     return 0 if total == 0 else 1

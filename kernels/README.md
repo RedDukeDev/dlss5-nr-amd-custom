@@ -808,4 +808,11 @@ the offsets for any (C, heads, branches).
 
 Checked with ab_stage.py on a capture of each stage: every byte the translated kernel wrote, identical; the
 RDNA4 code path (DLSSNR_EMULATE_GFX12, which runs it on RDNA3) too. With all fourteen native the harness's final
-image is identical to the translation's and a frame takes 55.7 ms instead of 85.3 (1280x720 to 1920x1080).
+image is identical to the translation's and a frame takes 45.8 ms instead of 85.3 (1280x720 to 1920x1080).
+
+What made them fast, in the order it paid: the block's waves share the tiles of every product, and the
+manifest's `waves=N` launches the stages the PTX gives one or two waves with eight (same grid, the kernel is
+written for any count); a weight tile is read once for several token blocks; the MLP's branches are made a
+group at a time and then summed as one chain per tile with the accumulator in registers (the same slices in
+the same order, one barrier per group instead of two per branch); the heads of a group likewise, their
+projections chained in registers.
