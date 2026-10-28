@@ -429,6 +429,20 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
             }
             logf("\n");
         }
+        // DLSS5NR_GATE_AB_DUMP=<dir>: both results, whole, for looking at a difference (or at a debug buffer a
+        // native kernel wrote past its outputs)
+        {
+            char dir[MAX_PATH] = {};
+            if (GetEnvironmentVariableA("DLSS5NR_GATE_AB_DUMP", dir, sizeof dir)) {
+                for (size_t r = 0; r < reference.size(); ++r) {
+                    char path[MAX_PATH + 64];
+                    snprintf(path, sizeof path, "%s\\translated_%llx.bin", dir, reference[r].base);
+                    if (FILE *out = fopen(path, "wb")) { fwrite(reference[r].data.data(), 1, reference[r].size, out); fclose(out); }
+                    snprintf(path, sizeof path, "%s\\native_%llx.bin", dir, reference[r].base);
+                    if (FILE *out = fopen(path, "wb")) { fwrite(native_result[r].data.data(), 1, native_result[r].size, out); fclose(out); }
+                }
+            }
+        }
         logf("[ab] %s\n", total ? "DIFFERENT" : "IDENTICAL");
         return translated;
     }

@@ -240,9 +240,15 @@ def main():
 
     # The ray reconstruction stages: the manifest (kernels/rr) and the code objects build_kernel.py wrote in
     # kernels/ itself.
-    rr_manifest = os.path.join(kernels, "rr", "kernels_rr.txt")
-    copy(rr_manifest, os.path.join(target, "kernels", "kernels_rr.txt"))
-    for line in open(rr_manifest, encoding="utf-8"):
+    # kernels_rr_enc0.txt is there only where tools/build_rr_enc0.py has made the encoder 0 from the library.
+    rr_lines = []
+    for name in ("kernels_rr.txt", "kernels_rr_enc0.txt"):
+        path = os.path.join(kernels, "rr", name)
+        if os.path.isfile(path):
+            rr_lines += open(path, encoding="utf-8").read().splitlines()
+    with open(os.path.join(target, "kernels", "kernels_rr.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(rr_lines) + "\n")
+    for line in rr_lines:
         fields = line.split("#", 1)[0].split()
         if len(fields) >= 2:
             objects.add(fields[1])

@@ -46,3 +46,8 @@ nvngx_dlss*.dll
 .vs/
 .vscode/
 *.user
+
+# Made at build time from the user's own copy of the library (kernels/tools/gen_enc0.py)
+kernels/rr2_enc0_gen.inc
+kernels/rr2_enc0.ptx
+kernels/rr/kernels_rr_enc0.txt

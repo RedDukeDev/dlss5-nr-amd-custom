@@ -816,3 +816,27 @@ written for any count); a weight tile is read once for several token blocks; the
 group at a time and then summed as one chain per tile with the accumulator in registers (the same slices in
 the same order, one barrier per group instead of two per branch); the heads of a group likewise, their
 projections chained in registers.
+
+### Encoder 0: the one made from the library
+
+`rr2_enc0_kernel` is three stretches of PTX. The middle one (the embedding, then the attention and the MLP) is the
+stage above with input `EMBED`. The first gathers 43 features per pixel from the game's textures in about 4,400
+instructions, branches and texture fetches, and the last gates the guide image with the head and writes it: those two have no
+structure worth re-deriving by hand, so `tools/ptx2hip.py` translates them instruction by instruction (every PTX
+register kept as its raw bits, each instruction with the semantics ZLUDA gives it -- `rr_ptx.h` has them: texel
+fetches through a normalised sampler, texture object 0 reading as zero, denormal-safe approximations, shuffles with
+their range bit). `tools/gen_enc0.py` finds the three stretches, works out which registers pass between them (the
+A fragments of the first eight mmas are the features; the destination registers of the last eight are the head) and
+writes `rr2_enc0_gen.inc`; `rr2_enc0.hip` joins the generated stretches to the stage.
+
+Because the generated code is NVIDIA's network in another form, it is never committed. `tools/build_rr_enc0.py
+[nvngx_dlssd.dll]` makes it at build time from the user's copy of the library -- extracts the PTX, generates,
+builds `rr2_enc0.hsaco` for every architecture, and writes `kernels/rr/kernels_rr_enc0.txt`, the manifest fragment
+that `package.py` and the runtime pick up when it is there (a package built without it keeps the translated
+encoder 0). Compile with `-fgpu-flush-denormals-to-zero` (`rr2_enc0.flags`): the PTX's f32 code is `.ftz`.
+
+Checked in the running process with `DLSS5NR_GATE_AB=rr2_enc0_kernel` (runtime/gate/ab.h: it runs the translated
+kernel, puts the memory back, runs the native one on the same textures and compares): the 92 MB pool identical over
+four consecutive launches, and the harness's final image identical to the translation's. The surfaces the gather
+writes are not compared by the A/B; the image over several frames, which they feed, is. The encoder 0 takes about
+12 ms per frame instead of 18.7 (a quarter of that in the gather, which is as latency-bound as it was).
