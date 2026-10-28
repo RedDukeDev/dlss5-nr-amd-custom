@@ -776,3 +776,36 @@ accumulation is not IEEE (see "Not checked" above). A numpy reference built on
 exact sums therefore finds the first stages of a window in the log only when
 the sums are short; a native kernel that issues the same WMMAs does not have
 the problem, and the log is the truth to compare its tiles with.
+
+## Ray reconstruction (preset F): rr2_stage.hip
+
+Fourteen of the sixteen `rr2_*` network kernels are one templated stage, written from the PTX and the replay
+tools above, with nothing taken from anyone's shaders: encoders 1-5, and decoders 4 to 1 in both kernels plus
+decoder 0's first. Left on the translation: `rr2_enc0_kernel` (a gather of 43 features from the game's textures,
+the largest single kernel), `rr2_dec0_kernel_1` (writes the network's output surfaces), and the small kernels.
+
+A stage is one block per 8x8-token window, the block's waves sharing the tiles of every product:
+
+    input    merge (encoder 1), the level's own tokens (encoders 2-5, decoders' second kernel), or an expansion of
+             the 4x4 tokens one level down plus the encoder's skip (decoders' first kernel)
+    heads    q = Wqk x, v = Wv x, scores = q8(q) q8(q)^T + bias, the cubic softmax, p v, projection
+    MLP      NB branches C -> 32 -> activation -> C, onto a running sum; y = r + m s2
+    output   the tokens; an encoder also gates the guide image by a 16-channel head and merges 2x2 for the next
+             encoder, a decoder blends the guide
+
+Activations live in LDS as e4m3 codes **in position order**: a product's k index is a position, not a channel
+(position p of a block of 32 carries channel `4 * ((c & 15) >> 1) + 2 * ((c >> 4) & 1) + (c & 1)` inverted, see
+`pos_of`), and the weights image stores columns in that order, so a lane's 16 k values are 16 contiguous bytes.
+Every product is a chain of the 32-deep f16-accumulated slices of dlssnr_hip.h; the elementwise steps are
+written to the PTX's f16 operations one by one (contraction off).
+
+The weights image of a stage, in order: the merge or expansion weights and bias; per head Wqk, Wv, the
+attention bias (three of the table's four 32x32 blocks, in the order the PTX loads its C fragments, the fourth
+is a transpose), Wo; bo; per branch Wd, bd, Wu (bu after the first branch's); the 2x2 merge and its bias;
+the 16-channel head and its bias. A weight matrix is cut in 512-byte tiles, one per 16 columns and 32 k; the
+tiles of Wqk and Wv are ordered k step first, all the others column block first. `Image` in rr2_stage.hip has
+the offsets for any (C, heads, branches).
+
+Checked with ab_stage.py on a capture of each stage: every byte the translated kernel wrote, identical; the
+RDNA4 code path (DLSSNR_EMULATE_GFX12, which runs it on RDNA3) too. With all fourteen native the harness's final
+image is identical to the translation's and a frame takes 55.7 ms instead of 85.3 (1280x720 to 1920x1080).
