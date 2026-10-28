@@ -56,6 +56,8 @@ enum hip_forwarder {
     HIPF_hipMemAllocPitch,
     HIPF_hipMemGetAddressRange,
     HIPF_hipMemGetInfo,
+    HIPF_hipMemcpy2DFromArray,
+    HIPF_hipMemcpy2DToArray,
     HIPF_hipMemcpyAsync,
     HIPF_hipMemcpyDtoD,
     HIPF_hipMemcpyDtoDAsync,
@@ -168,6 +170,8 @@ enum hip_forwarder {
     "hipMemAllocPitch", \
     "hipMemGetAddressRange", \
     "hipMemGetInfo", \
+    "hipMemcpy2DFromArray", \
+    "hipMemcpy2DToArray", \
     "hipMemcpyAsync", \
     "hipMemcpyDtoD", \
     "hipMemcpyDtoDAsync", \
@@ -489,6 +493,28 @@ struct args_hipMemGetAddressRange {
 struct args_hipMemGetInfo {
     uint64_t a0;
     uint64_t a1;
+    int32_t ret;
+};
+struct args_hipMemcpy2DFromArray {
+    uint64_t a0;
+    uint64_t a1;
+    uint64_t a2;
+    uint64_t a3;
+    uint64_t a4;
+    uint64_t a5;
+    uint64_t a6;
+    uint64_t a7;
+    int32_t ret;
+};
+struct args_hipMemcpy2DToArray {
+    uint64_t a0;
+    uint64_t a1;
+    uint64_t a2;
+    uint64_t a3;
+    uint64_t a4;
+    uint64_t a5;
+    uint64_t a6;
+    uint64_t a7;
     int32_t ret;
 };
 struct args_hipMemcpyAsync {

@@ -132,12 +132,8 @@ __attribute__((destructor)) static void withdraw(void) {
 
 typedef int32_t (*wine_handle_to_fd_t)(void *handle, unsigned int access, int *fd, unsigned int *options);
 
-static wine_handle_to_fd_t find_handle_to_fd(void) {
-    static wine_handle_to_fd_t found;
-    static int tried;
-    if (tried) return found;
-    tried = 1;
-    found = (wine_handle_to_fd_t)dlsym(RTLD_DEFAULT, "wine_server_handle_to_fd");
+static void *find_wine_symbol(const char *name) {
+    void *found = dlsym(RTLD_DEFAULT, name);
     if (found) return found;
     void *ntdll = dlopen("ntdll.so", RTLD_NOW | RTLD_NOLOAD);
     if (!ntdll) {
@@ -156,9 +152,68 @@ static wine_handle_to_fd_t find_handle_to_fd(void) {
         }
         if (maps) fclose(maps);
     }
-    if (ntdll) found = (wine_handle_to_fd_t)dlsym(ntdll, "wine_server_handle_to_fd");
-    dlssnr_log("wine_server_handle_to_fd %s", found ? "found" : "NOT found");
+    if (ntdll) found = dlsym(ntdll, name);
+    dlssnr_log("%s %s", name, found ? "found" : "NOT found");
     return found;
+}
+
+static wine_handle_to_fd_t find_handle_to_fd(void) {
+    static wine_handle_to_fd_t found;
+    static int tried;
+    if (tried) return found;
+    tried = 1;
+    found = (wine_handle_to_fd_t)find_wine_symbol("wine_server_handle_to_fd");
+    return found;
+}
+
+// A shared Direct3D 12 resource under Wine is a d3dkmt object, and the server keeps the host's descriptor (a dma-buf
+// from Vulkan) with the object, not with the shared handle: wine_server_handle_to_fd on the shared handle answers
+// "object type mismatch". Opening the object (the request win32u makes to find what a handle stands for) gives the
+// server's own handle for it, and that one has the descriptor. The request number is this Wine's: it is the one
+// d3dkmt_object_open has in Proton 11 (win32u's code for it, d3dkmt_object_open, loads 0x135), and any other build
+// is not asked.
+typedef int32_t (*wine_server_call_t)(void *request);
+enum { kRequestD3dkmtObjectOpen = 0x135, kD3dkmtResource = 6 };
+
+static int shared_resource_fd(void *shared) {
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *forced = getenv("DLSSNR_D3DKMT_REQUEST");
+        disabled = forced && forced[0] == '0';
+    }
+    if (disabled) return -1;
+    wine_handle_to_fd_t convert = find_handle_to_fd();
+    wine_server_call_t call = (wine_server_call_t)find_wine_symbol("wine_server_call");
+    if (!convert || !call) return -1;
+    // struct __server_request_info: 64 bytes of request or reply, the count of extra data, the reply data, the pieces.
+    unsigned char info[64 + 16 + 5 * 16];
+    memset(info, 0, sizeof info);
+    unsigned *w = (unsigned *)info;
+    w[0] = kRequestD3dkmtObjectOpen;
+    w[3] = kD3dkmtResource;       // type
+    w[4] = 0;                     // global handle: the shared one is given instead
+    w[5] = (unsigned)(uintptr_t)shared;
+    if (call(info) != 0) {
+        dlssnr_log("d3dkmt_object_open: no object for the handle");
+        return -1;
+    }
+    void *inner = (void *)(uintptr_t)w[3];
+    int fd = -1;
+    if (convert(inner, 0, &fd, NULL) != 0) {
+        dlssnr_log("d3dkmt_object_open: the object has no descriptor");
+        return -1;
+    }
+    // What the request number is meant to give: a dma-buf. Anything else means this is not the Wine it was read from.
+    char link[64], target[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, target, sizeof target - 1);
+    target[n > 0 ? n : 0] = 0;
+    if (strncmp(target, "/dmabuf:", 8) != 0) {
+        dlssnr_log("d3dkmt_object_open: descriptor %d is %s, not a dma-buf", fd, target);
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 #endif /* DLSSNR_WIN_TEST */
@@ -259,12 +314,9 @@ int32_t thunk_special_hipImportExternalMemory(void *args) {
     dlssnr_log("hipImportExternalMemory: type %u, handle %p, size %llu", desc.type, desc.handle.win32.handle, desc.size);
 #ifndef DLSSNR_WIN_TEST
     if (desc.type != kOpaqueFd) {
-        wine_handle_to_fd_t convert = find_handle_to_fd();
-        int fd = -1;
-        // Read and write: the network writes some of the images it imports.
-        int32_t status = convert ? convert(desc.handle.win32.handle, 0x3, &fd, NULL) : (int32_t)0xC0000002;
-        if (status != 0) {
-            dlssnr_log("no descriptor for the handle (status %#x)", (unsigned)status);
+        int fd = shared_resource_fd(desc.handle.win32.handle);
+        if (fd < 0) {
+            dlssnr_log("no descriptor for the handle");
             a->ret = DLSSNR_HIP_NOT_SUPPORTED;
             return 0;
         }

@@ -320,6 +320,18 @@ HIPAPI int32_t hipMemGetInfo(uint64_t a0, uint64_t a1) {
     return a.ret;
 }
 
+HIPAPI int32_t hipMemcpy2DFromArray(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, int32_t a7) {
+    struct args_hipMemcpy2DFromArray a = { a0, a1, a2, a3, a4, a5, a6, (uint64_t)(uint32_t)a7, 0 };
+    if (!dlssnr_call(HIPF_hipMemcpy2DFromArray, &a)) return DLSSNR_HIP_NOT_INITIALIZED;
+    return a.ret;
+}
+
+HIPAPI int32_t hipMemcpy2DToArray(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, int32_t a7) {
+    struct args_hipMemcpy2DToArray a = { a0, a1, a2, a3, a4, a5, a6, (uint64_t)(uint32_t)a7, 0 };
+    if (!dlssnr_call(HIPF_hipMemcpy2DToArray, &a)) return DLSSNR_HIP_NOT_INITIALIZED;
+    return a.ret;
+}
+
 HIPAPI int32_t hipMemcpyAsync(uint64_t a0, uint64_t a1, uint64_t a2, int32_t a3, uint64_t a4) {
     struct args_hipMemcpyAsync a = { a0, a1, a2, (uint64_t)(uint32_t)a3, a4, 0 };
     if (!dlssnr_call(HIPF_hipMemcpyAsync, &a)) return DLSSNR_HIP_NOT_INITIALIZED;

@@ -131,6 +131,38 @@ void probe(ID3D12Device *device, const char *label, ID3D12Resource *resource) {
         return;
     }
 
+    // The shared handle is a d3dkmt object that holds the host's descriptor; opening it (the request win32u makes to
+    // find the object behind a handle) gives the server's own handle for it, and that one has a descriptor.
+    {
+        typedef NT_STATUS(__cdecl * ServerCallFn)(void *);
+        static ServerCallFn server_call = (ServerCallFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_server_call");
+        if (server_call) {
+            for (unsigned type : {6u, 5u, 4u}) {          // D3DKMT_RESOURCE, SYNC, MUTEX
+                alignas(8) unsigned char info[64 + 16 + 5 * 16] = {};
+                unsigned *words = (unsigned *)info;
+                words[0] = 0x135;                          // REQ_d3dkmt_object_open in this Wine
+                words[3] = type;
+                words[4] = 0;
+                words[5] = (unsigned)(ULONG_PTR)handle;
+                const NT_STATUS status = server_call(info);
+                say("  d3dkmt_object_open(type %u): status %#lx, global %#x, internal handle %#x, runtime %u", type, (unsigned long)status,
+                    words[2], words[3], words[4]);
+                if (status < 0) continue;
+                HANDLE inner = (HANDLE)(ULONG_PTR)words[3];
+                say("    internal handle object type \"%s\"", type_name(inner).c_str());
+                for (unsigned access : {0u, 1u, 2u, 3u, 0x100000u, 0x120089u, 0x12019fu, 0x1f01ffu, 0x10000000u, 0x80000000u, 0xc0000000u}) {
+                    int fd = -1;
+                    unsigned int options = 0;
+                    const NT_STATUS r = handle_to_fd(inner, access, &fd, &options);
+                    say("    wine_server_handle_to_fd(access %#x): status %#lx, descriptor %d", access, (unsigned long)r, fd);
+                    if (r >= 0) { describe_fd(fd); break; }
+                }
+            }
+        } else {
+            say("  ntdll does not export wine_server_call");
+        }
+    }
+
     // The access the server wants for a descriptor depends on the object.
     const unsigned int accesses[] = {0, FILE_READ_DATA, FILE_READ_DATA | FILE_WRITE_DATA, SYNCHRONIZE, GENERIC_ALL};
     bool got = false;
@@ -212,6 +244,25 @@ int main(int argc, char **argv) {
     if (FAILED(hr)) say("Creating a shared buffer failed: %#lx", (unsigned long)hr);
     else probe(device, "shared buffer, 4 MB", shared_buffer);
 
+    // Other ways to ask for a shared buffer.
+    {
+        struct Variant { const char *label; D3D12_HEAP_FLAGS heap_flags; D3D12_RESOURCE_FLAGS flags; };
+        const Variant variants[] = {
+            {"shared buffer, no flags", D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_FLAG_NONE},
+            {"shared buffer, cross adapter", D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER},
+            {"shared buffer, cross adapter + UAV", D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
+             D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS},
+        };
+        for (const Variant &v : variants) {
+            D3D12_RESOURCE_DESC d = buffer;
+            d.Flags = v.flags;
+            ID3D12Resource *r = nullptr;
+            const HRESULT h = device->CreateCommittedResource(&heap, v.heap_flags, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+            if (FAILED(h)) say("%s: creating failed %#lx", v.label, (unsigned long)h);
+            else { probe(device, v.label, r); r->Release(); }
+        }
+    }
+
     // A texture, for comparison: what the runtime shares today.
     D3D12_RESOURCE_DESC texture{};
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -227,6 +278,26 @@ int main(int argc, char **argv) {
                                          IID_PPV_ARGS(&shared_texture));
     if (FAILED(hr)) say("Creating a shared texture failed: %#lx", (unsigned long)hr);
     else probe(device, "shared texture, 256 x 256 RGBA16F", shared_texture);
+
+    // A linear texture, the kind cross adapter sharing asks for: memory a kernel can read row by row.
+    {
+        D3D12_RESOURCE_DESC linear = texture;
+        linear.Width = 1024;
+        linear.Height = 256;
+        linear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        linear.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        linear.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        ID3D12Resource *r = nullptr;
+        HRESULT h = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER, &linear,
+                                                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+        if (FAILED(h)) say("linear cross adapter texture: creating failed %#lx", (unsigned long)h);
+        else { probe(device, "linear cross adapter texture 1024x256 RGBA8", r); r->Release(); }
+        linear.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        h = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER, &linear,
+                                            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+        say("linear cross adapter texture with UAV: %#lx", (unsigned long)h);
+        if (SUCCEEDED(h)) r->Release();
+    }
 
     if (hold > 0) {
         say("");

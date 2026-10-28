@@ -121,12 +121,12 @@ ID3D12Resource *make_texture(ID3D12Device *device, uint32_t width, uint32_t heig
 // instead. DLSS5NR_COPY=1 forces that on Windows, =0 forbids it.
 bool g_copy_interop = false;
 
-bool copy_interop_wanted() {
+bool copy_interop_wanted(Network &network, ID3D12Device *device) {
     char value[8];
     const DWORD n = GetEnvironmentVariableA("DLSS5NR_COPY", value, sizeof value);
     if (n && n < sizeof value) return value[0] == '1';
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    return ntdll && GetProcAddress(ntdll, "wine_get_version");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") && !network.can_share(device);
 }
 
 bool make_shared(ID3D12Device *device, SharedImage &image, uint32_t width, uint32_t height, DXGI_FORMAT format,
@@ -404,6 +404,10 @@ void dlss5nr_context::run_worker() {
     }
     native_kernels = network.native_kernels();
     log(2, "network loaded on %s, %u native kernels", network.device_name().c_str(), network.native_kernels());
+    // Decided here, with the network loaded, and before the state is running: the images are made after that.
+    g_copy_interop = copy_interop_wanted(network, device);
+    network.set_copy_mode(g_copy_interop);
+    log(2, "images %s", g_copy_interop ? "copied through host memory" : "shared with CUDA");
     set_message("running");
     state = DLSS5NR_STATE_RUNNING;
 
@@ -788,10 +792,7 @@ DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context 
             c->log(1, "no host memory for waiting inside the frame: the frame will wait at present");
     }
 
-    g_copy_interop = copy_interop_wanted();
-    c->network.set_copy_mode(g_copy_interop);
-    c->log(2, "runtime starting: files in %ls, network %ls, images %s", c->paths.runtime_dir.c_str(),
-           c->paths.snippet.c_str(), g_copy_interop ? "copied through host memory" : "shared with CUDA");
+    c->log(2, "runtime starting: files in %ls, network %ls", c->paths.runtime_dir.c_str(), c->paths.snippet.c_str());
     c->worker = std::thread([c] {
         c->worker_thread_id = GetCurrentThreadId();
         c->run_worker();

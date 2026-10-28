@@ -607,6 +607,53 @@ bool Network::create_feature(uint32_t width, uint32_t height, const NetworkContr
     return true;
 }
 
+bool Network::can_share(ID3D12Device *device) {
+    std::string error;
+    if (!device || !g.context || !g.cu.cuImportExternalMemory || !g.cu.cuExternalMemoryGetMappedMipmappedArray ||
+        !g.cu.cuMipmappedArrayGetLevel || !cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error))
+        return false;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 64;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *texture = nullptr;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&texture))))
+        return false;
+    bool ok = false;
+    HANDLE handle = nullptr;
+    if (SUCCEEDED(device->CreateSharedHandle(texture, nullptr, GENERIC_ALL, nullptr, &handle)) && handle) {
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC memory{};
+        memory.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+        memory.handle.win32.handle = handle;
+        memory.size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        memory.flags = 1;
+        CUexternalMemory external = nullptr;
+        if (g.cu.cuImportExternalMemory(&external, &memory) == CUDA_SUCCESS) {
+            CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mapped{};
+            mapped.arrayDesc.Width = mapped.arrayDesc.Height = 64;
+            mapped.arrayDesc.Format = CU_AD_FORMAT_HALF;
+            mapped.arrayDesc.NumChannels = 4;
+            mapped.arrayDesc.Flags = 0x2;
+            mapped.numLevels = 1;
+            CUmipmappedArray mipmapped = nullptr;
+            CUarray array = nullptr;
+            ok = g.cu.cuExternalMemoryGetMappedMipmappedArray(&mipmapped, external, &mapped) == CUDA_SUCCESS &&
+                 g.cu.cuMipmappedArrayGetLevel(&array, mipmapped, 0) == CUDA_SUCCESS;
+            if (mipmapped) g.cu.cuMipmappedArrayDestroy(mipmapped);
+            g.cu.cuDestroyExternalMemory(external);
+        }
+    }
+    if (handle) CloseHandle(handle);
+    texture->Release();
+    return ok;
+}
+
 bool Network::import(SharedImage &t, std::string &error) {
     if (copy_mode_) return import_copy(t, error);
     if (t.external_memory) return true;
@@ -781,9 +828,15 @@ void Network::record_stage_out(ID3D12GraphicsCommandList *cmd, const SharedImage
 
 bool Network::copy_in(const EvaluateDesc &d, std::string &error) {
     SharedImage *inputs[] = {d.color, d.depth, d.motion};
-    if (!d.staged_by_list && !copier_run(
+    return copy_images_in(inputs, 3, !d.staged_by_list, error);
+}
+
+// record false: the game's list already copied the textures to the staging buffers.
+bool Network::copy_images_in(SharedImage *const *inputs, size_t count, bool record, std::string &error) {
+    if (record && !copier_run(
             [&](ID3D12GraphicsCommandList *cmd) {
-                for (SharedImage *t : inputs) {
+                for (size_t i = 0; i < count; ++i) {
+                    SharedImage *t = inputs[i];
                     ID3D12Resource *texture = t->resource;
                     copier_barrier(cmd, texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     D3D12_TEXTURE_COPY_LOCATION to{}, from{};
@@ -798,7 +851,8 @@ bool Network::copy_in(const EvaluateDesc &d, std::string &error) {
             },
             error))
         return false;
-    for (SharedImage *t : inputs) {
+    for (size_t i = 0; i < count; ++i) {
+        SharedImage *t = inputs[i];
         memcpy(t->host, t->staging_ptr, (size_t)t->row_pitch * t->height);
         CUDA_MEMCPY2D copy{};
         copy.srcMemoryType = CU_MEMORYTYPE_HOST;
@@ -815,7 +869,11 @@ bool Network::copy_in(const EvaluateDesc &d, std::string &error) {
 
 // The output, out of the network's array and into the game's texture.
 bool Network::copy_out(const EvaluateDesc &d, std::string &error) {
-    SharedImage *t = d.output;
+    return copy_image_out(*d.output, d.staged_by_list, error);
+}
+
+bool Network::copy_image_out(SharedImage &image, bool staged_by_list, std::string &error) {
+    SharedImage *t = &image;
     CUDA_MEMCPY2D copy{};
     copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
     copy.srcArray = (CUarray)t->array;
@@ -826,7 +884,7 @@ bool Network::copy_out(const EvaluateDesc &d, std::string &error) {
     copy.Height = t->height;
     if (!cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (out)", error)) return false;
     memcpy(t->staging_ptr, t->host, (size_t)t->row_pitch * t->height);
-    if (d.staged_by_list) {
+    if (staged_by_list) {
         _mm_sfence();   // the buffer is write-combined: what is written must be out before the frame is told
         return true;
     }
@@ -981,6 +1039,8 @@ bool Network::create_upscaler(const UpscalerCreate &c, std::string &error) {
         error = "this network is the neural rendering one";
         return false;
     }
+    // As in create_feature: the context is the process's, and another network may have made it current elsewhere.
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.context), "cuCtxSetCurrent", error)) return false;
     if (o.feature && c == upscaler_) return true;
     if (o.feature) {
         o.ngx_release(o.feature);

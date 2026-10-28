@@ -53,6 +53,8 @@ hipMalloc
 hipMemAllocPitch
 hipMemGetAddressRange
 hipMemGetInfo
+hipMemcpy2DFromArray
+hipMemcpy2DToArray
 hipMemcpyAsync
 hipMemcpyDtoD
 hipMemcpyDtoDAsync

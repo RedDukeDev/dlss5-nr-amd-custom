@@ -420,6 +420,22 @@ static int32_t thunk_hipMemGetInfo(void *args) {
     return 0;
 }
 
+static int32_t thunk_hipMemcpy2DFromArray(void *args) {
+    struct args_hipMemcpy2DFromArray *a = (struct args_hipMemcpy2DFromArray *)args;
+    dlssnr_trace_args(HIPF_hipMemcpy2DFromArray, args);
+    void *fn = dlssnr_real(HIPF_hipMemcpy2DFromArray);
+    a->ret = fn ? ((int32_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int32_t))fn)(a->a0, a->a1, a->a2, a->a3, a->a4, a->a5, a->a6, (int32_t)a->a7) : DLSSNR_HIP_NOT_SUPPORTED;
+    return 0;
+}
+
+static int32_t thunk_hipMemcpy2DToArray(void *args) {
+    struct args_hipMemcpy2DToArray *a = (struct args_hipMemcpy2DToArray *)args;
+    dlssnr_trace_args(HIPF_hipMemcpy2DToArray, args);
+    void *fn = dlssnr_real(HIPF_hipMemcpy2DToArray);
+    a->ret = fn ? ((int32_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int32_t))fn)(a->a0, a->a1, a->a2, a->a3, a->a4, a->a5, a->a6, (int32_t)a->a7) : DLSSNR_HIP_NOT_SUPPORTED;
+    return 0;
+}
+
 static int32_t thunk_hipMemcpyAsync(void *args) {
     struct args_hipMemcpyAsync *a = (struct args_hipMemcpyAsync *)args;
     dlssnr_trace_args(HIPF_hipMemcpyAsync, args);
@@ -915,6 +931,8 @@ const dlssnr_entry dlssnr_funcs[HIPF_COUNT] = {
     thunk_hipMemAllocPitch,
     thunk_hipMemGetAddressRange,
     thunk_hipMemGetInfo,
+    thunk_hipMemcpy2DFromArray,
+    thunk_hipMemcpy2DToArray,
     thunk_hipMemcpyAsync,
     thunk_hipMemcpyDtoD,
     thunk_hipMemcpyDtoDAsync,

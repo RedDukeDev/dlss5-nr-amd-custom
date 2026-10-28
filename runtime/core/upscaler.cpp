@@ -69,6 +69,21 @@ constexpr uint32_t kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kWrite = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 constexpr uint32_t kCommon = D3D12_RESOURCE_STATE_COMMON;
 
+// Where the textures cannot be shared with CUDA (Wine: a shared handle is not a file descriptor ROCm can
+// import) the network copies them through host memory instead (Network::set_copy_mode), as the neural
+// rendering does. DLSS5NR_COPY=1 forces that on Windows, =0 forbids it.
+bool g_copy = false;
+
+// Under Wine the textures are shared when the bridge can get the descriptor behind a shared handle (the probe tries
+// one), and copied when it cannot.
+bool copy_wanted(Network &net, ID3D12Device *device) {
+    char value[8];
+    const DWORD n = GetEnvironmentVariableA("DLSS5NR_COPY", value, sizeof value);
+    if (n && n < sizeof value) return value[0] == '1';
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") && !net.can_share(device);
+}
+
 bool make_image(ID3D12Device *device, SharedImage &image, uint32_t w, uint32_t h, DXGI_FORMAT format, bool writable) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -81,12 +96,14 @@ bool make_image(ID3D12Device *device, SharedImage &image, uint32_t w, uint32_t h
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                               IID_PPV_ARGS(&image.resource))))
+    if (FAILED(device->CreateCommittedResource(&heap, g_copy ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_SHARED, &desc,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&image.resource))))
         return false;
-    HANDLE handle = nullptr;
-    if (FAILED(device->CreateSharedHandle(image.resource, nullptr, GENERIC_ALL, nullptr, &handle))) return false;
-    image.nt_handle = handle;
+    if (!g_copy) {
+        HANDLE handle = nullptr;
+        if (FAILED(device->CreateSharedHandle(image.resource, nullptr, GENERIC_ALL, nullptr, &handle))) return false;
+        image.nt_handle = handle;
+    }
     image.width = w;
     image.height = h;
     image.dxgi_format = format;
@@ -188,6 +205,10 @@ bool build(dlss5nr_upscaler &u, const dlss5nr_upscaler_create_info &info, std::s
     set_network_log(&network_log);
 
     if (!u.net.load(paths, error)) return false;
+    g_copy = copy_wanted(u.net, u.device);
+    u.net.set_copy_mode(g_copy);
+    if (!g_copy && GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version"))
+        log_to_host(2, "Wine: the textures are shared with CUDA");
     u.native_kernels = u.net.native_kernels();
     u.create.render_width = info.render_width;
     u.create.render_height = info.render_height;
@@ -244,7 +265,7 @@ bool build(dlss5nr_upscaler &u, const dlss5nr_upscaler_create_info &info, std::s
     // The GPU waits for the GPU where it can. DLSS5NR_UPSCALER_CPU_WAIT=1 forces the CPU to.
     char forced[8] = {};
     const bool cpu_forced = GetEnvironmentVariableA("DLSS5NR_UPSCALER_CPU_WAIT", forced, sizeof forced) && forced[0] == '1';
-    if (!cpu_forced && SUCCEEDED(u.device->CreateSharedHandle(u.fence, nullptr, GENERIC_ALL, nullptr, &u.fence_handle))) {
+    if (!cpu_forced && !g_copy && SUCCEEDED(u.device->CreateSharedHandle(u.fence, nullptr, GENERIC_ALL, nullptr, &u.fence_handle))) {
         std::string why;
         u.gpu_sync = u.net.import_fence(u.fence_handle, &u.semaphore, why);
         if (!u.gpu_sync) log_to_host(1, "the GPU cannot wait for the GPU here (%s): the CPU waits", why.c_str());
@@ -381,7 +402,13 @@ bool run(dlss5nr_upscaler &u, ID3D12CommandQueue *queue, const dlss5nr_upscaler_
         queue->Wait(u.fence, after);
     } else {
         u.wait_cpu(before);
+        if (g_copy) {
+            SharedImage *staged[12];
+            for (int i = 0; i < count; ++i) staged[i] = inputs[i].image;
+            if (!u.net.copy_images_in(staged, (size_t)count, true, error)) return false;
+        }
         if (!u.net.evaluate_upscaler(desc, error, true)) return false;
+        if (g_copy && !u.net.copy_image_out(u.output, false, error)) return false;
     }
 
     // 3. the network's output into the game's

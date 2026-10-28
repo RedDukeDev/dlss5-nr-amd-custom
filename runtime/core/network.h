@@ -170,6 +170,10 @@ public:
     // queue of this class's own. Set before the first import.
     void set_copy_mode(bool on) { copy_mode_ = on; }
 
+    // Whether a texture of this device can be shared with CUDA here: made shared, imported and mapped as an array, then
+    // let go. Under Wine that depends on the build (the bridge asks the server for the descriptor behind the handle).
+    bool can_share(ID3D12Device *device);
+
     // Imports a texture the game thread created. Idempotent.
     bool import(SharedImage &image, std::string &error);
     // Copy mode, for a frame that waits inside its command list: the copies of
@@ -180,6 +184,12 @@ public:
     static void record_stage_in(ID3D12GraphicsCommandList *cmd, const SharedImage &image);
     static void record_stage_out(ID3D12GraphicsCommandList *cmd, const SharedImage &image);
     void release(SharedImage &image);
+    // Copy mode, for the upscalers (their frames wait on the CPU): the textures into the network's
+    // arrays, and the output back into its texture. record false: the staging buffers are already
+    // filled by a list of the caller's.
+    bool copy_mode() const { return copy_mode_; }
+    bool copy_images_in(SharedImage *const *images, size_t count, bool record, std::string &error);
+    bool copy_image_out(SharedImage &image, bool staged_by_list, std::string &error);
 
     // Runs the network once and waits for it: when this returns true the
     // output holds the result.

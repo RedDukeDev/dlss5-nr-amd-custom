@@ -42,14 +42,23 @@ be used: a file read from Windows code is opened by the wineserver, so `/proc/se
 the wineserver's. A variable in the environment would not do either: a game started
 by another Windows program gets that program's environment.)
 
-The images are not shared with ROCm. A shared Direct3D 12 handle under Wine is a
-`DxgkSharedResource`, not a file descriptor (`runtime/tests/interop_probe.cpp` asks
-the question: `wine_server_handle_to_fd` answers with an object type mismatch), so
-the runtime copies instead (`Network::set_copy_mode`): the inputs to host memory and
-into CUDA arrays before each evaluation, the output back after it. It is switched on
-when the process is under Wine, or with `DLSS5NR_COPY=1`, and nothing changes
-otherwise. `hipImportExternalMemory`, the one function the bridge writes by hand, is
-therefore not called any more.
+The images are shared with ROCm, where this Wine allows it. A shared Direct3D 12 handle under Wine is a
+`DxgkSharedResource`, and `wine_server_handle_to_fd` on it answers with an object type mismatch
+(`runtime/tests/interop_probe.cpp` asks the question). But the server keeps the host's descriptor, a dma-buf
+from Vulkan, with the d3dkmt object behind the handle: the request `d3dkmt_object_open` (the one win32u makes to
+find that object) gives the server's own handle for it, and `wine_server_handle_to_fd` on that one, with access 0,
+gives the dma-buf. The bridge makes the request (`shared_resource_fd` in `bridge/core.c`) and hands the descriptor
+to `hipImportExternalMemory`; ROCm then maps it as a mipmapped array whose pixels are the texture's (tiling
+included, checked against a known pattern). The request number, 0x135, is the one of Proton 11 (GE-Proton11): the
+bridge checks that what comes back is a dma-buf, and `DLSSNR_D3DKMT_REQUEST=0` switches the request off.
+
+What cannot be shared is a Direct3D 12 buffer (vkd3d-proton makes no handle for one) and a fence. So the
+Direct3D 12 buffers of the frame generation are ROCm's own memory, and the CPU does the waiting between the
+queue and ROCm. Where the textures cannot be shared either (another Wine, or `DLSS5NR_COPY=1`), the runtime copies
+them through host memory (`Network::set_copy_mode`): the inputs to host memory and into CUDA arrays before each
+evaluation, the output back after it. The runtime tries one small shared texture at start (`Network::can_share`)
+and copies only when that fails; `DLSS5NR_COPY=1` forces the copies on any system and `=0` forbids them.
+`hipImportExternalMemory`, the one function the bridge writes by hand, is called for every shared texture.
 
 ## Files
 

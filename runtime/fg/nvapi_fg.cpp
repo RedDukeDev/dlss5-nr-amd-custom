@@ -23,6 +23,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <share.h>
+#include <emmintrin.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -37,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +57,17 @@ QueryInterface_t g_real = nullptr;
 FILE *g_log = nullptr;
 std::mutex g_lock;
 std::wstring g_dir;
+
+// Where the library's memory cannot be shared with HIP (Wine: a shared handle is not a file descriptor ROCm can
+// import, cuImportExternalMemory answers "not supported"), what the library makes lives in HIP's own memory instead,
+// and only the textures the host and the library hand each other are copied, through host memory: the inputs
+// into HIP before the kernels, the outputs out of it before the host reads them. FG_NVAPI_COPY=1 forces this on
+// Windows, =0 forbids it.
+bool g_copy = false;
+// Under copy mode, the textures the host and the library hand each other (the mirrors) are still shared with HIP when
+// the platform can do it: Wine's shared handle then gives the dma-buf behind the texture, which ROCm maps as an array.
+// Buffers cannot be shared here (vkd3d-proton makes no handle for one), but those only the kernels use.
+bool g_share = false;
 
 // The first steps of the work, to see where a hang is: a handful of lines, not one per frame.
 bool trace_step() {
@@ -75,6 +89,44 @@ void say(const char *format, ...) {
     line[std::min<int>(n, (int)sizeof line - 2)] = 0;
     fprintf(g_log, "%s\n", line);
     fflush(g_log);
+}
+
+// Where the time of an evaluation goes, summed and written to the log every five seconds: the copy mode stalls the
+// host thread, and this says on what.
+enum Phase { kPhEvaluate, kPhConvIn, kPhBatch, kPhInputs, kPhLaunch, kPhOutputs, kPhSync, kPhConvOut, kPhInGpu, kPhInMem, kPhInHip, kPhCount };
+std::atomic<long long> g_in_bytes{0};
+struct Profile {
+    std::atomic<long long> ticks[kPhCount];
+    std::atomic<long long> frames;
+    std::atomic<long long> last{0};
+} g_profile;
+
+struct Timed {
+    Phase phase;
+    LARGE_INTEGER start;
+    explicit Timed(Phase p) : phase(p) { QueryPerformanceCounter(&start); }
+    ~Timed() {
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        g_profile.ticks[phase] += end.QuadPart - start.QuadPart;
+    }
+};
+
+void profile_report() {
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    long long last = g_profile.last.load();
+    if (!last) { g_profile.last = now.QuadPart; return; }
+    if (now.QuadPart - last < 5 * freq.QuadPart || !g_profile.last.compare_exchange_strong(last, now.QuadPart)) return;
+    const long long frames = g_profile.frames.exchange(0);
+    if (!frames) return;
+    static const char *names[kPhCount] = {"evaluate", "conv-in", "batches", "inputs", "launch", "outputs", "sync", "conv-out", "in-gpu", "in-memcpy", "in-hip"};
+    char text[400];
+    int n = snprintf(text, sizeof text, "profile: %lld evaluations, %.1f MB in each, ms each:", frames, g_in_bytes.exchange(0) / 1048576.0 / frames);
+    for (int i = 0; i < kPhCount; ++i)
+        n += snprintf(text + n, sizeof text - n, " %s %.2f", names[i], g_profile.ticks[i].exchange(0) * 1000.0 / freq.QuadPart / frames);
+    say("%s", text);
 }
 
 // ---- the CUDA driver, through the gate (nvcuda.dll) -------------------------------------------------------------
@@ -120,6 +172,14 @@ struct Cu {
     CUresult (*cuMemcpy2D)(const CUDA_MEMCPY2D *);
     CUresult (*cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
+    // Copy mode only.
+    CUresult (*cuMemAlloc)(CUdeviceptr *, size_t);
+    CUresult (*cuMemFree)(CUdeviceptr);
+    CUresult (*cuMemsetD8)(CUdeviceptr, unsigned char, size_t);
+    CUresult (*cuArray3DCreate)(CUarray *, const CUDA_ARRAY3D_DESCRIPTOR *);
+    CUresult (*cuArrayDestroy)(CUarray);
+    CUresult (*cuMemAllocHost)(void **, size_t);     // optional: pinned memory goes to HIP without a staging copy
+    CUresult (*cuMemFreeHost)(void *);
 } cu;
 
 bool g_cu_ready = false;
@@ -132,8 +192,13 @@ void *g_stream = nullptr;
 // The gate is the nvcuda.dll the runtime loads; when only this module is in the process, it loads the one beside it.
 bool cuda_ready() {
     if (g_cu_ready) return true;
-    HMODULE h = GetModuleHandleW(L"nvcuda.dll");
-    if (!h) h = LoadLibraryExW((g_dir + L"nvcuda.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    // The one beside this module, by its full path: the gate if the runtime has loaded it already, else the gate now.
+    // Not whichever nvcuda.dll the process has by name: under Wine that is Wine's own, which has no cuInit.
+    // The gate forwards its exports to zluda_real.dll by name, and Wine looks for the target among the modules already
+    // loaded (Windows searches for it): so ZLUDA is loaded first, as the runtime does.
+    LoadLibraryExW((g_dir + L"zluda_real.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    HMODULE h = LoadLibraryExW((g_dir + L"nvcuda.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!h) h = GetModuleHandleW(L"nvcuda.dll");
     if (!h) { say("nvcuda.dll is not loaded and not beside this module"); return false; }
 #define L(name, optional)                                                                                    \
     do {                                                                                                     \
@@ -172,7 +237,19 @@ bool cuda_ready() {
     L(cuMemcpy2D, true);
     L(cuMemcpyDtoH, true);
     L(cuMemcpyHtoD, true);
+    L(cuMemAlloc, true);
+    L(cuMemFree, true);
+    L(cuMemsetD8, true);
+    L(cuArray3DCreate, true);
+    L(cuArrayDestroy, true);
+    L(cuMemAllocHost, true);
+    L(cuMemFreeHost, true);
 #undef L
+    if (g_copy && (!cu.cuMemAlloc || !cu.cuMemFree || !cu.cuMemsetD8 || !cu.cuArray3DCreate || !cu.cuArrayDestroy ||
+                   !cu.cuMemcpy2D)) {
+        say("copying through host memory needs cuMemAlloc, cuMemFree, cuMemsetD8, cuArray3DCreate, cuArrayDestroy and cuMemcpy2D");
+        return false;
+    }
     g_cu_ready = true;
     return true;
 }
@@ -210,6 +287,7 @@ bool attach_context(CUcontext wanted = nullptr) {
 // untouched and unrecorded.
 
 thread_local int t_scope = 0;
+thread_local int t_internal = 0;   // this module's own resources are being made: they are not the library's, nor anyone's to record
 
 // A resource tells us when it is destroyed: it holds a reference to this, and releases it with its last one.
 struct Alive {
@@ -278,9 +356,29 @@ struct Image {
     CUsurfObject surface = 0;
     CUtexObject texture = 0;
     bool failed = false;
+
+    // Copy mode: the array is HIP's own (external is null), and a mirror moves through a buffer the host can see.
+    uint32_t width = 0, height = 0, texel = 0;
+    ComPtr<ID3D12Resource> staging;                 // readback (an input mirror) or upload (an output mirror)
+    void *staging_ptr = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    std::vector<uint8_t> host_vector;               // ordinary memory: ROCm copies wrongly to and from mapped memory
+    uint8_t *host = nullptr;                        // the above, or pinned memory when the driver gives it
+    size_t host_size = 0;
+    bool host_pinned = false;
+    CUdeviceptr stage_dev = 0;                      // linear device memory the host copy lands in before it is laid into the array
+    uint64_t copy_value = 0;                        // the slot fence value after which the upload buffer is free
 };
 std::unordered_map<ID3D12Resource *, Image> g_images;
 std::mutex g_world;
+
+// Copy mode: which way each mirror goes, and whether the other side holds something newer.
+struct MirrorSync {
+    bool output = false;
+    bool d3d_dirty = false;    // an input the conversion refreshed: not in the array yet
+    bool hip_dirty = false;    // an output a kernel wrote: not in the texture yet
+};
+std::map<ID3D12Resource *, MirrorSync> g_sync;
 
 constexpr uint32_t kTagBase = 0x7f000000u;
 struct Handle {
@@ -339,11 +437,22 @@ void record_resource(ID3D12Resource *resource) {
 HRESULT STDMETHODCALLTYPE hk_CreateCommitted(ID3D12Device *self, const D3D12_HEAP_PROPERTIES *heap, D3D12_HEAP_FLAGS flags,
                                              const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state,
                                              const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out) {
-    if (!t_scope) return o_CreateCommitted(self, heap, flags, desc, state, clear, riid, out);
+    if (!t_scope) {
+        const HRESULT made = o_CreateCommitted(self, heap, flags, desc, state, clear, riid, out);
+        // Copy mode: a kernel may be handed the address of a buffer that something else made (the library's own threads,
+        // Streamline), and an address HIP does not know faults the GPU. Every buffer is known, then.
+        if (g_copy && !t_internal && SUCCEEDED(made) && out && *out && desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            ComPtr<ID3D12Resource> resource;
+            if (SUCCEEDED(static_cast<IUnknown *>(*out)->QueryInterface(IID_PPV_ARGS(resource.GetAddressOf()))))
+                record_resource(resource.Get());
+        }
+        return made;
+    }
     // The memory of what the library makes is imported into HIP, which needs it shared. The library's textures
     // are, and its buffers may not be.
     D3D12_HEAP_FLAGS shared = flags;
-    if (heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    if (!g_copy && heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
+        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
         shared = flags | D3D12_HEAP_FLAG_SHARED;
     HRESULT r = o_CreateCommitted(self, heap, shared, desc, state, clear, riid, out);
     if (FAILED(r) && shared != flags) r = o_CreateCommitted(self, heap, flags, desc, state, clear, riid, out);
@@ -466,6 +575,17 @@ bool import_buffer(Buffer &b) {
     if (b.pointer) return true;
     if (b.tried) return false;
     b.tried = true;
+    if (g_copy) {
+        // HIP's own memory, zeroed as a committed resource is. Nothing else touches it: the library fills and reads
+        // its buffers with kernels.
+        if (cu.cuMemAlloc(&b.pointer, (size_t)b.size) != CUDA_SUCCESS) {
+            say("cuMemAlloc(%llu bytes) failed", (unsigned long long)b.size);
+            b.pointer = 0;
+            return false;
+        }
+        cu.cuMemsetD8(b.pointer, 0, (size_t)b.size);
+        return true;
+    }
     if (!import_memory(b.resource, &b.external)) return false;
     CUDA_EXTERNAL_MEMORY_BUFFER_DESC desc{};
     desc.size = b.size;
@@ -568,6 +688,39 @@ void make_surface_normalised(Image &image) {
     cu.cuMemcpyHtoD(image.surface + 32, &texture[8], 4);
 }
 
+// Whether a small shared texture can be imported into HIP and mapped as an array here.
+bool share_possible(ID3D12Device *device) {
+    if (!cu.cuImportExternalMemory || !cu.cuExternalMemoryGetMappedMipmappedArray || !cu.cuMipmappedArrayGetLevel) return false;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 64;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> texture;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(texture.GetAddressOf()))))
+        return false;
+    CUexternalMemory external = nullptr;
+    if (!import_memory(texture.Get(), &external)) return false;
+    CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mapped{};
+    mapped.arrayDesc.Width = mapped.arrayDesc.Height = 64;
+    mapped.arrayDesc.Format = CU_AD_FORMAT_HALF;
+    mapped.arrayDesc.NumChannels = 4;
+    mapped.arrayDesc.Flags = 0x2;
+    mapped.numLevels = 1;
+    CUmipmappedArray mipmapped = nullptr;
+    CUarray array = nullptr;
+    const bool ok = cu.cuExternalMemoryGetMappedMipmappedArray(&mipmapped, external, &mapped) == CUDA_SUCCESS &&
+                    cu.cuMipmappedArrayGetLevel(&array, mipmapped, 0) == CUDA_SUCCESS;
+    if (mipmapped && cu.cuMipmappedArrayDestroy) cu.cuMipmappedArrayDestroy(mipmapped);
+    cu.cuDestroyExternalMemory(external);
+    return ok;
+}
+
 // The array, and a texture and a surface object over it, for a texture the library made.
 Image *image_of(ID3D12Resource *resource, DXGI_FORMAT view_format) {
     auto found = g_images.find(resource);
@@ -589,16 +742,44 @@ Image *image_of(ID3D12Resource *resource, DXGI_FORMAT view_format) {
         image.failed = true;
         return nullptr;
     }
-    if (!import_memory(resource, &image.external)) { image.failed = true; return nullptr; }
-    CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mapped{};
-    mapped.arrayDesc.Width = (size_t)desc.Width;
-    mapped.arrayDesc.Height = desc.Height;
-    mapped.arrayDesc.Format = format;
-    mapped.arrayDesc.NumChannels = channels;
-    mapped.arrayDesc.Flags = 0x2;   // CUDA_ARRAY3D_SURFACE_LDST
-    mapped.numLevels = desc.MipLevels ? desc.MipLevels : 1;
-    CUresult r = cu.cuExternalMemoryGetMappedMipmappedArray(&image.mipmapped, image.external, &mapped);
-    if (r == CUDA_SUCCESS) r = cu.cuMipmappedArrayGetLevel(&image.array, image.mipmapped, 0);
+    CUresult r;
+    if (g_copy && !(g_share && g_sync.count(resource))) {
+        image.width = (uint32_t)desc.Width;
+        image.height = desc.Height;
+        const int unit = (int)format;
+        image.texel = channels * ((unit == 1 || unit == 8) ? 1u : (unit == 2 || unit == 9 || unit == 0x10) ? 2u : 4u);
+        CUDA_ARRAY3D_DESCRIPTOR own{};
+        own.Width = (size_t)desc.Width;
+        own.Height = desc.Height;
+        own.Format = format;
+        own.NumChannels = channels;
+        own.Flags = 0x2;   // CUDA_ARRAY3D_SURFACE_LDST
+        r = cu.cuArray3DCreate(&image.array, &own);
+        if (r == CUDA_SUCCESS) {
+            // Zeroed, as a committed resource is.
+            std::vector<uint8_t> zeros((size_t)image.width * image.texel * image.height);
+            CUDA_MEMCPY2D fill{};
+            fill.srcMemoryType = CU_MEMORYTYPE_HOST;
+            fill.srcHost = zeros.data();
+            fill.srcPitch = (size_t)image.width * image.texel;
+            fill.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            fill.dstArray = image.array;
+            fill.WidthInBytes = (size_t)image.width * image.texel;
+            fill.Height = image.height;
+            r = cu.cuMemcpy2D(&fill);
+        }
+    } else {
+        if (!import_memory(resource, &image.external)) { image.failed = true; return nullptr; }
+        CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mapped{};
+        mapped.arrayDesc.Width = (size_t)desc.Width;
+        mapped.arrayDesc.Height = desc.Height;
+        mapped.arrayDesc.Format = format;
+        mapped.arrayDesc.NumChannels = channels;
+        mapped.arrayDesc.Flags = 0x2;   // CUDA_ARRAY3D_SURFACE_LDST
+        mapped.numLevels = desc.MipLevels ? desc.MipLevels : 1;
+        r = cu.cuExternalMemoryGetMappedMipmappedArray(&image.mipmapped, image.external, &mapped);
+        if (r == CUDA_SUCCESS) r = cu.cuMipmappedArrayGetLevel(&image.array, image.mipmapped, 0);
+    }
     if (r != CUDA_SUCCESS) {
         say("mapping a texture of %llux%u (format %d) -> %d", (unsigned long long)desc.Width, desc.Height, (int)use, r);
         image.failed = true;
@@ -682,12 +863,18 @@ void texture_statistics(ID3D12Resource *resource, char *out, size_t out_size) {
 
 void destroy_buffer(Buffer &b) {
     if (b.external) cu.cuDestroyExternalMemory(b.external);
+    else if (g_copy && b.pointer && cu.cuMemFree) cu.cuMemFree(b.pointer);
 }
 void destroy_image(Image &i) {
     if (i.surface && cu.cuSurfObjectDestroy) cu.cuSurfObjectDestroy(i.surface);
     if (i.texture && cu.cuTexObjectDestroy) cu.cuTexObjectDestroy(i.texture);
     if (i.mipmapped && cu.cuMipmappedArrayDestroy) cu.cuMipmappedArrayDestroy(i.mipmapped);
     if (i.external) cu.cuDestroyExternalMemory(i.external);
+    else if (g_copy && i.array && cu.cuArrayDestroy) cu.cuArrayDestroy(i.array);
+    if (i.stage_dev && cu.cuMemFree) cu.cuMemFree(i.stage_dev);
+    i.stage_dev = 0;
+    if (i.host_pinned && cu.cuMemFreeHost) cu.cuMemFreeHost(i.host);
+    i.host_pinned = false;
 }
 
 // What the library has destroyed since the last call goes with it. Called with g_world held.
@@ -732,10 +919,22 @@ uint32_t object_for_descriptor(SIZE_T descriptor, bool surface) {
 }
 
 // Replaces, in a kernel's arguments, what means nothing to HIP: GPU virtual addresses, and the tags.
+// Copy mode: where an address of Direct3D 12 that no buffer owns is sent, so that the kernel does not fault the GPU.
+CUdeviceptr g_scratch = 0;
+constexpr size_t kScratchSize = 64u << 20;
+CUdeviceptr scratch_pointer() {
+    if (!g_scratch && cu.cuMemAlloc && cu.cuMemAlloc(&g_scratch, kScratchSize) == CUDA_SUCCESS) cu.cuMemsetD8(g_scratch, 0, kScratchSize);
+    return g_scratch;
+}
+thread_local const char *t_kernel = "?";   // the kernel whose arguments are being translated, for the report
+thread_local bool t_dump_once = false;      // the first launch of each kernel has its arguments written out
+
 bool translate_arguments(std::vector<uint8_t> &args, std::vector<ID3D12Resource *> *images = nullptr) {
-    static const bool dump = _wgetenv(L"FG_NVAPI_DUMP_PARAMS") != nullptr;
+    static const bool dump_always = _wgetenv(L"FG_NVAPI_DUMP_PARAMS") != nullptr;
+    const bool dump = dump_always || t_dump_once;
     std::lock_guard<std::mutex> lock(g_world);
     purge_dead();
+    if (dump) say("  %s: %zu bytes of arguments, %zu buffers known", t_kernel, args.size(), g_buffers.size());
     for (size_t o = 0; o + 8 <= args.size(); o += 8) {
         uint64_t v;
         memcpy(&v, &args[o], 8);
@@ -755,9 +954,22 @@ bool translate_arguments(std::vector<uint8_t> &args, std::vector<ID3D12Resource 
             continue;
         }
         auto next = g_buffers.upper_bound(v);
-        if (next == g_buffers.begin()) continue;
+        if (next == g_buffers.begin() || v >= std::prev(next)->second.va + std::prev(next)->second.size) {
+            // What Vulkan gives Direct3D 12 resources lies at the top of the 64 bit space (0xffff'8000'0000'0000 and
+            // above): a kernel handed one that no buffer owns would fault on it.
+            static std::atomic<int> reported{0};
+            if (v >= 0xffff800000000000ull) {
+                if (reported.fetch_add(1) < 60)
+                    say("%s: argument +%zu = 0x%llx is an address of Direct3D 12 that no buffer owns (%zu buffers)%s", t_kernel,
+                        o, (unsigned long long)v, g_buffers.size(), g_copy ? ": sent to scratch memory" : "");
+                if (g_copy) {
+                    const CUdeviceptr scratch = scratch_pointer();
+                    if (scratch) memcpy(&args[o], &scratch, 8);
+                }
+            }
+            continue;
+        }
         Buffer &b = std::prev(next)->second;
-        if (v >= b.va + b.size) continue;
         if (!import_buffer(b)) { say("a buffer the kernel uses could not be imported (0x%llx)", (unsigned long long)b.va); return false; }
         const uint64_t moved = b.pointer + (v - b.va);
         if (dump) say("      -> buffer of %llu bytes at 0x%llx, now 0x%llx", (unsigned long long)b.size, (unsigned long long)b.va, (unsigned long long)moved);
@@ -1148,9 +1360,160 @@ void sync_launches() {
     cu.cuCtxSynchronize();
 }
 
+// ---- copy mode: the textures that cross between the host and the library ------------------------------------------------
+
+// The buffer a mirror moves through, and ordinary memory the size of it.
+bool make_staging(ID3D12Device *device, ID3D12Resource *texture, Image &image, bool upload) {
+    struct Internal { Internal() { ++t_internal; } ~Internal() { --t_internal; } } internal;
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    UINT64 total = 0, row_bytes = 0;
+    UINT rows = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &image.footprint, &rows, &row_bytes, &total);
+    if (row_bytes != (UINT64)image.width * image.texel) {
+        say("a mirror's rows are %llu bytes, the array's %u: not copied", (unsigned long long)row_bytes, image.width * image.texel);
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                               upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(image.staging.GetAddressOf()))) ||
+        FAILED(image.staging->Map(0, nullptr, &image.staging_ptr))) {
+        say("the staging buffer of a mirror could not be made");
+        image.staging.Reset();
+        return false;
+    }
+    image.host_size = (size_t)image.footprint.Footprint.RowPitch * image.height;
+    if (image.host_pinned) cu.cuMemFreeHost(image.host);
+    image.host_pinned = false;
+    void *pinned = nullptr;
+    if (cu.cuMemAllocHost && cu.cuMemFreeHost && cu.cuMemAllocHost(&pinned, image.host_size) == CUDA_SUCCESS && pinned) {
+        image.host = static_cast<uint8_t *>(pinned);
+        image.host_pinned = true;
+    } else {
+        image.host_vector.resize(image.host_size);
+        image.host = image.host_vector.data();
+    }
+    return true;
+}
+
+struct CopyList {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+};
+std::vector<CopyList> g_copy_pool[2];
+
+// The input mirrors a conversion refreshed that this batch's kernels use go into their arrays. The queue is idle up to
+// here (run_batch has waited for it). Each texture is copied into its staging buffer by a list of its own, all handed
+// over at once, and the host moves one into HIP while the GPU is still copying the next.
+void inputs_into_arrays(ID3D12CommandQueue *queue, const Batch &b) {
+    std::vector<ID3D12Resource *> used;
+    for (const Launch &l : b.launches)
+        for (ID3D12Resource *r : l.images)
+            if (std::find(used.begin(), used.end(), r) == used.end()) used.push_back(r);
+    std::lock_guard<std::mutex> lock(g_world);
+    struct Job { ID3D12Resource *texture; Image *image; MirrorSync *sync; uint64_t value; };
+    std::vector<Job> jobs;
+    ComPtr<ID3D12Device> device;
+    queue->GetDevice(IID_PPV_ARGS(device.GetAddressOf()));
+    for (ID3D12Resource *r : used) {
+        auto sync = g_sync.find(r);
+        if (sync == g_sync.end() || sync->second.output || !sync->second.d3d_dirty) continue;
+        auto image = g_images.find(r);
+        if (image == g_images.end() || image->second.failed || image->second.external) continue;   // shared: nothing to copy
+        if (!image->second.staging && !make_staging(device.Get(), r, image->second, false)) continue;
+        jobs.push_back({r, &image->second, &sync->second, 0});
+    }
+    if (jobs.empty()) return;
+
+    const D3D12_COMMAND_LIST_TYPE type = queue->GetDesc().Type;
+    std::vector<CopyList> &pool = g_copy_pool[type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? 1 : 0];
+    while (pool.size() < jobs.size()) {
+        CopyList c;
+        if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(c.allocator.GetAddressOf()))) ||
+            FAILED(device->CreateCommandList(0, type, c.allocator.Get(), nullptr, IID_PPV_ARGS(c.list.GetAddressOf())))) {
+            say("a list for reading a mirror could not be made");
+            return;
+        }
+        c.list->Close();
+        pool.push_back(std::move(c));
+    }
+    {
+        Timed t(kPhInGpu);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            Job &j = jobs[i];
+            ID3D12GraphicsCommandList *cmd = pool[i].list.Get();
+            pool[i].allocator->Reset();
+            cmd->Reset(pool[i].allocator.Get(), nullptr);
+            dlss5nr::transition(cmd, j.texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = j.image->staging.Get();
+            to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            to.PlacedFootprint = j.image->footprint;
+            from.pResource = j.texture;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            dlss5nr::transition(cmd, j.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            cmd->Close();
+            ID3D12CommandList *lists[] = {cmd};
+            queue->ExecuteCommandLists(1, lists);
+            j.value = ++g_value;
+            queue->Signal(g_fence.Get(), j.value);
+        }
+    }
+    for (Job &j : jobs) {
+        {
+            Timed t(kPhInGpu);
+            wait_on_cpu(j.value);
+        }
+        g_in_bytes += (long long)j.image->host_size;
+        {
+            Timed t(kPhInMem);
+            memcpy(j.image->host, j.image->staging_ptr, j.image->host_size);
+        }
+        Timed hip(kPhInHip);
+        Image &im = *j.image;
+        if (!im.stage_dev && cu.cuMemAlloc(&im.stage_dev, im.host_size) != CUDA_SUCCESS) im.stage_dev = 0;
+        if (im.stage_dev && cu.cuMemcpyHtoD(im.stage_dev, im.host, im.host_size) != CUDA_SUCCESS) {
+            cu.cuMemFree(im.stage_dev);
+            im.stage_dev = 0;
+        }
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = im.stage_dev ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
+        copy.srcDevice = im.stage_dev;
+        copy.srcHost = im.host;
+        copy.srcPitch = j.image->footprint.Footprint.RowPitch;
+        copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.dstArray = j.image->array;
+        copy.WidthInBytes = (size_t)j.image->width * j.image->texel;
+        copy.Height = j.image->height;
+        const CUresult r = cu.cuMemcpy2D(&copy);
+        if (r != CUDA_SUCCESS) say("copying a mirror into its array -> %d", r);
+        else j.sync->d3d_dirty = false;
+    }
+}
+
+// What the kernels of a batch used of the output mirrors is now newer than the texture.
+void outputs_written(const Batch &b) {
+    std::lock_guard<std::mutex> lock(g_world);
+    for (const Launch &l : b.launches)
+        for (ID3D12Resource *r : l.images) {
+            auto sync = g_sync.find(r);
+            if (sync != g_sync.end() && sync->second.output) sync->second.hip_dirty = true;
+        }
+}
+
 void run_batch(void *user, ID3D12CommandQueue *queue) {
     std::unique_ptr<std::shared_ptr<Batch>> holder(static_cast<std::shared_ptr<Batch> *>(user));
     Batch &b = **holder;
+    Timed whole(kPhBatch);
+    profile_report();
     TRACE("run_batch: %zu launches, queue type %d", b.launches.size(), (int)queue->GetDesc().Type);
     std::lock_guard<std::mutex> lock(g_run);
     b.done = true;
@@ -1169,10 +1532,15 @@ void run_batch(void *user, ID3D12CommandQueue *queue) {
             wait_on_cpu(before);
         }
     }
-    for (const Launch &launch : b.launches) {
-        if (!launch_one(launch)) { ++g_failed; break; }
-        ++g_launched;
+    if (g_copy) { Timed t(kPhInputs); inputs_into_arrays(queue, b); }
+    {
+        Timed t(kPhLaunch);
+        for (const Launch &launch : b.launches) {
+            if (!launch_one(launch)) { ++g_failed; break; }
+            ++g_launched;
+        }
     }
+    if (g_copy) { Timed t(kPhOutputs); outputs_written(b); }
     ++g_batches;
     TRACE("run_batch: launched, waiting");
     if (g_fence) {
@@ -1183,9 +1551,11 @@ void run_batch(void *user, ID3D12CommandQueue *queue) {
             cu.cuSignalExternalSemaphoresAsync(&g_semaphore, &signal, 1, nullptr);
             queue->Wait(g_fence.Get(), after);
         } else {
+            Timed t(kPhSync);
             sync_launches();
         }
     } else {
+        Timed t(kPhSync);
         sync_launches();
     }
 }
@@ -1211,7 +1581,15 @@ NvAPI_Status __cdecl my_LaunchCuKernelChain(void *list, const LaunchParams *kern
                 named != g_function_name.end() ? named->second.c_str() : "?", kernels[i].grid.x, kernels[i].grid.y,
                 kernels[i].grid.z, kernels[i].block.x, kernels[i].block.y, kernels[i].block.z, kernels[i].param_size);
         }
-        if (!translate_arguments(prepared[i].args, &prepared[i].images)) return NVAPI_ERROR;
+        {
+            auto named = g_function_name.find(kernels[i].function);
+            t_kernel = named != g_function_name.end() ? named->second.c_str() : "?";
+            static std::set<std::string> seen;
+            t_dump_once = seen.insert(t_kernel).second;
+        }
+        const bool translated = translate_arguments(prepared[i].args, &prepared[i].images);
+        t_dump_once = false;
+        if (!translated) return NVAPI_ERROR;
     }
 
     const uint64_t mark = g_mark ? g_mark(cmd) : 0;
@@ -1674,7 +2052,13 @@ Mirror *mirror_for(ID3D12Device *device, const char *key, Kind kind, const D3D12
     if (!typed_store(device, want)) want = kind == kColour ? DXGI_FORMAT_R8G8B8A8_UNORM : want;
     Mirror &m = g_mirrors[key];
     if (m.resource && m.width == game.Width && m.height == game.Height && m.format == want) return &m;
-    if (m.resource) g_retired[g_retire_turn % 3].push_back(std::move(m.resource));
+    if (m.resource) {
+        {
+            std::lock_guard<std::mutex> lock(g_world);
+            g_sync.erase(m.resource.Get());
+        }
+        g_retired[g_retire_turn % 3].push_back(std::move(m.resource));
+    }
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};
@@ -1687,8 +2071,8 @@ Mirror *mirror_for(ID3D12Device *device, const char *key, Kind kind, const D3D12
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> created;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                               IID_PPV_ARGS(created.GetAddressOf())))) {
+    if (FAILED(device->CreateCommittedResource(&heap, g_copy && !g_share ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_SHARED, &desc,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(created.GetAddressOf())))) {
         say("could not make the mirror of %s (%llux%u, format %d)", key, (unsigned long long)game.Width, game.Height, (int)want);
         return nullptr;
     }
@@ -1742,11 +2126,68 @@ bool session_ready(ID3D12Device *device) {
 
 #include "fg_capture.inc"
 
+// Copy mode: the output mirrors the kernels wrote, out of their arrays and into their textures, recorded at the head of
+// the list that converts them for the game. The kernels are done: run_batch waited for them.
+void outputs_from_arrays(ID3D12GraphicsCommandList *cmd, const std::vector<Pass> &passes) {
+    CUcontext previous = nullptr;
+    if (cuda_ready()) cu.cuCtxGetCurrent(&previous);
+    struct Restore { CUcontext context; ~Restore() { if (context && context != g_ctx) cu.cuCtxSetCurrent(context); } } restore{previous};
+    if (!attach_context()) { say("the context for copying the outputs could not be made"); return; }
+    ComPtr<ID3D12Device> device;
+    cmd->GetDevice(IID_PPV_ARGS(device.GetAddressOf()));
+    std::lock_guard<std::mutex> lock(g_world);
+    for (const Pass &p : passes) {
+        auto sync = g_sync.find(p.mirror.Get());
+        if (sync == g_sync.end() || !sync->second.output || !sync->second.hip_dirty) continue;
+        auto found = g_images.find(p.mirror.Get());
+        if (found == g_images.end() || found->second.failed || found->second.external) continue;   // shared: nothing to copy
+        Image &image = found->second;
+        if (!image.staging && !make_staging(device.Get(), p.mirror.Get(), image, true)) continue;
+        if (image.copy_value && g_slot_fence->GetCompletedValue() < image.copy_value) {
+            static HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            g_slot_fence->SetEventOnCompletion(image.copy_value, event);
+            WaitForSingleObject(event, 20000);
+        }
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.srcArray = image.array;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = image.host;
+        copy.dstPitch = image.footprint.Footprint.RowPitch;
+        copy.WidthInBytes = (size_t)image.width * image.texel;
+        copy.Height = image.height;
+        const CUresult r = cu.cuMemcpy2D(&copy);
+        if (r != CUDA_SUCCESS) { say("copying an output out of its array -> %d", r); continue; }
+        memcpy(image.staging_ptr, image.host, image.host_size);
+        _mm_sfence();   // the buffer is write-combined: what is written must be out before the GPU reads it
+        dlss5nr::transition(cmd, p.mirror.Get(), kCommon, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+        to.pResource = p.mirror.Get();
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = image.staging.Get();
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint = image.footprint;
+        cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        dlss5nr::transition(cmd, p.mirror.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kCommon);
+        image.copy_value = g_slot_value + 1;   // the value this list signals
+        sync->second.hip_dirty = false;
+    }
+}
+
 // Runs when the game's list reaches the queue: the copies, on lists of this module's, on the game's queue.
 void run_conversion(void *user, ID3D12CommandQueue *queue) {
     std::unique_ptr<Conversion> conversion(static_cast<Conversion *>(user));
+    Timed whole(conversion->to_game ? kPhConvOut : kPhConvIn);
     TRACE("run_conversion: %s, %zu passes, queue type %d", conversion->to_game ? "out" : "in", conversion->passes.size(), (int)queue->GetDesc().Type);
     std::lock_guard<std::mutex> lock(g_session_lock);
+    if (g_copy && !conversion->to_game) {
+        // The mirrors the list below refreshes: the kernels must read them from the textures again.
+        std::lock_guard<std::mutex> world(g_world);
+        for (const Pass &p : conversion->passes) {
+            auto sync = g_sync.find(p.mirror.Get());
+            if (sync != g_sync.end()) sync->second.d3d_dirty = true;
+        }
+    }
     const D3D12_COMMAND_LIST_TYPE type = queue->GetDesc().Type;
     const int set = type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? 1 : 0;
     Slot &slot = g_slots[set][g_slot_next[set]++ % kSlots];
@@ -1769,6 +2210,7 @@ void run_conversion(void *user, ID3D12CommandQueue *queue) {
     slot.allocator->Reset();
     slot.list->Reset(slot.allocator.Get(), nullptr);
     ID3D12GraphicsCommandList *cmd = slot.list.Get();
+    if (g_copy && conversion->to_game) outputs_from_arrays(cmd, conversion->passes);
     for (Pass &p : conversion->passes) {
         std::string error;
         ID3D12Resource *source = conversion->to_game ? p.mirror.Get() : p.game.Get();
@@ -1834,6 +2276,10 @@ extern "C" __declspec(dllexport) int32_t fgnv_evaluate(ID3D12GraphicsCommandList
             Mirror *mirror = mirror_for(device.Get(), role.key, role.kind, desc);
             if (!mirror) return NVSDK_NGX_Result_Fail;
             const uint32_t state = g_state ? g_state(list, game, kRead) : kRead;
+            if (g_copy) {
+                std::lock_guard<std::mutex> world(g_world);
+                g_sync[mirror->resource.Get()].output = role.output;
+            }
             Pass pass{ComPtr<ID3D12Resource>(game), mirror->resource, state, variant_of(role.kind)};
             (role.output ? *out : *in).passes.push_back(std::move(pass));
             swapped.push_back({role.key, game});
@@ -1860,8 +2306,13 @@ extern "C" __declspec(dllexport) int32_t fgnv_evaluate(ID3D12GraphicsCommandList
 
     TRACE("fgnv_evaluate: list %p type %d, entering the library", (void *)list, (int)list->GetType());
     fgnv_scope(1);
-    const int32_t result = evaluate(list, handle, parameters, progress);
+    int32_t result;
+    {
+        Timed t(kPhEvaluate);
+        result = evaluate(list, handle, parameters, progress);
+    }
     fgnv_scope(0);
+    ++g_profile.frames;
     TRACE("fgnv_evaluate: the library returned %#x", (unsigned)result);
 
     for (const Swap &s : swapped) parameters->Set(s.key, s.original);
@@ -1885,6 +2336,15 @@ extern "C" __declspec(dllexport) int fgnv_attach(ID3D12Device *device, RecordBou
     g_mark = mark;
     g_state = state;
     if (!attach_context()) return 0;
+    if (g_copy) {
+        static bool decided = false;
+        if (!decided) {
+            decided = true;
+            const wchar_t *no = _wgetenv(L"FG_NVAPI_SHARE");
+            g_share = !(no && no[0] == L'0') && share_possible(device);
+            say("the mirrors are %s", g_share ? "shared with HIP (no copies)" : "copied through host memory");
+        }
+    }
 
     vtable_patch(device, kSlotCreateCommitted, (void *)hk_CreateCommitted, (void **)&o_CreateCommitted);
     vtable_patch(device, kSlotCreatePlaced, (void *)hk_CreatePlaced, (void **)&o_CreatePlaced);
@@ -1895,7 +2355,7 @@ extern "C" __declspec(dllexport) int fgnv_attach(ID3D12Device *device, RecordBou
 
     std::lock_guard<std::mutex> lock(g_run);
     if (!g_fence) {
-        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(g_fence.GetAddressOf())))) {
+        if (FAILED(device->CreateFence(0, g_copy ? D3D12_FENCE_FLAG_NONE : D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(g_fence.GetAddressOf())))) {
             say("could not create the fence");
             return 0;
         }
@@ -1906,7 +2366,7 @@ extern "C" __declspec(dllexport) int fgnv_attach(ID3D12Device *device, RecordBou
         // the surface objects this module creates, stays behind it. The frame generation's thread and the upscaler's
         // wait for each other that way: both wait on the CPU, which holds no stream.
         // FG_NVAPI_GPU_SYNC=1 turns the GPU wait back on, for the harness, where nothing else uses HIP.
-        const bool gpu_wanted = _wgetenv(L"FG_NVAPI_GPU_SYNC") != nullptr;
+        const bool gpu_wanted = _wgetenv(L"FG_NVAPI_GPU_SYNC") != nullptr && !g_copy;
         if (!gpu_wanted) SetEnvironmentVariableA("DLSS5NR_UPSCALER_CPU_WAIT", "1");
         if (gpu_wanted && cu.cuImportExternalSemaphore && cu.cuWaitExternalSemaphoresAsync && cu.cuSignalExternalSemaphoresAsync &&
             SUCCEEDED(device->CreateSharedHandle(g_fence.Get(), nullptr, GENERIC_ALL, nullptr, &handle))) {
@@ -1946,6 +2406,7 @@ extern "C" __declspec(dllexport) void fgnv_purge() {
     g_images.clear();
     g_handles.clear();
     g_tag_of.clear();
+    g_sync.clear();
 }
 
 extern "C" __declspec(dllexport) void fgnv_report() {
@@ -1974,6 +2435,16 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
                 SetEnvironmentVariableW(L"__NGX_LOG_PATH_OVERRIDE", parent.c_str());
                 if (!GetEnvironmentVariableW(L"__NGX_LOG_LEVEL", existing, 8)) SetEnvironmentVariableW(L"__NGX_LOG_LEVEL", L"1");
             }
+        }
+        {
+            char forced[8];
+            const DWORD n = GetEnvironmentVariableA("FG_NVAPI_COPY", forced, sizeof forced);
+            if (n && n < sizeof forced) g_copy = forced[0] == '1';
+            else {
+                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                g_copy = ntdll && GetProcAddress(ntdll, "wine_get_version");
+            }
+            say("the library's memory is %s", g_copy ? "HIP's own, the mirrors copied through host memory" : "shared with HIP");
         }
         g_native_enabled = _wgetenv(L"FG_NVAPI_NO_NATIVE") == nullptr;
         if (const wchar_t *m = _wgetenv(L"FG_NVAPI_NATIVE_MASK")) g_native_mask = _wtoi(m);
