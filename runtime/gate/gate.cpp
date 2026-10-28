@@ -67,6 +67,7 @@ void logf(const char *fmt, ...) {
 #include "native_hook.h"
 #include "capture.h"
 #include "ab.h"
+#include "swap.h"
 
 namespace {
 
@@ -265,6 +266,32 @@ __declspec(dllexport) CUresult cuModuleGetFunction(CUfunction *out, CUmodule mod
     const CUresult r = fn(out, module, name);
     // A kernel the translation does not have is otherwise reported only as the caller's own generic error.
     if (r != 0) logf("[module] cuModuleGetFunction(%s) -> %d\n", name ? name : "?", r);
+    // DLSS5NR_GATE_SWAP_*: the replacement module of one kernel, loaded the first time the original is named
+    if (r == 0 && out && name && swap::state().wanted && !swap::state().replacement && strcmp(name, swap::state().name) == 0) {
+        swap::State &sw = swap::state();
+        FILE *file = fopen(sw.ptx, "rb");
+        if (file) {
+            fseek(file, 0, SEEK_END);
+            const long size = ftell(file);
+            fseek(file, 0, SEEK_SET);
+            char *image = (char *)calloc((size_t)size + 1, 1);
+            const bool whole = image && fread(image, 1, (size_t)size, file) == (size_t)size;
+            fclose(file);
+            CUmodule mine = nullptr;
+            auto load = (CUresult(*)(CUmodule *, const void *))real("cuModuleLoadData");
+            const CUresult loaded = whole && load ? load(&mine, image) : -1;
+            CUfunction fnr = nullptr;
+            const CUresult got = loaded == 0 ? fn(&fnr, mine, name) : -1;
+            logf("[swap] %s from %s (%ld bytes): module %d, function %d%s", name, sw.ptx, size, loaded, got, "\n");
+            free(image);
+            if (got == 0) {
+                sw.original = *out;
+                sw.replacement = fnr;
+            }
+        } else {
+            logf("[swap] cannot read %s\n", sw.ptx);
+        }
+    }
     if (r == 0 && out && name) {
         EnterCriticalSection(&g_lock);
         if (g_name_count < sizeof g_names / sizeof g_names[0]) {
@@ -327,6 +354,45 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
     }
     // DLSS5NR_GATE_CAPTURE: this launch's arguments and memory, before and after (capture.h)
     capture::Scope capturing(name_of(f), gx, gy, gz, bx, by, bz, extra);
+    // DLSS5NR_GATE_SWAP_*: this launch runs the replacement, with a debug buffer after its arguments (swap.h)
+    {
+        swap::State &sw = swap::state();
+        if (sw.replacement && f == sw.original && extra && ++sw.seen == sw.launch && capture::hip().ready) {
+            const unsigned char *buffer = nullptr;
+            size_t size = 0;
+            for (int k = 0; extra[k] && k < 16; k += 2) {
+                if ((size_t)extra[k] == 1) buffer = (const unsigned char *)extra[k + 1];
+                if ((size_t)extra[k] == 2) size = *(const size_t *)extra[k + 1];
+            }
+            HMODULE hip = GetModuleHandleW(L"amdhip64_7.dll");
+            auto device_alloc = (int (*)(void **, size_t))GetProcAddress(hip, "hipMalloc");
+            auto to_device = (int (*)(void *, const void *, size_t))GetProcAddress(hip, "hipMemcpyHtoD");
+            auto fill = (int (*)(void *, int, size_t))GetProcAddress(hip, "hipMemset");
+            static unsigned char args2[8192];
+            size_t size2 = (size + 7) & ~(size_t)7;
+            if (buffer && device_alloc && to_device && fill && size2 + 8 <= sizeof args2 && sw.debug_bytes >= 8 &&
+                device_alloc(&sw.debug, sw.debug_bytes) == 0) {
+                fill(sw.debug, 0, sw.debug_bytes);
+                to_device(sw.debug, sw.block, 8);
+                memset(args2, 0, sizeof args2);
+                memcpy(args2, buffer, size);
+                memcpy(args2 + size2, &sw.debug, 8);
+                size2 += 8;
+                void *extra2[5] = {(void *)1, args2, (void *)2, &size2, nullptr};
+                const CUresult r = fn((CUfunction)sw.replacement, gx, gy, gz, bx, by, bz, shared, stream, nullptr, extra2);
+                capture::hip().sync();
+                std::vector<unsigned char> host(sw.debug_bytes);
+                capture::hip().to_host(host.data(), sw.debug, sw.debug_bytes);
+                if (FILE *out = fopen(sw.out, "wb")) {
+                    fwrite(host.data(), 1, host.size(), out);
+                    fclose(out);
+                }
+                logf("[swap] %s launch %d ran the replacement -> %d, %zu bytes of debug in %s\n", name_of(f), sw.launch, r, sw.debug_bytes, sw.out);
+                return r;
+            }
+            logf("[swap] %s: could not prepare the replacement launch\n", name_of(f));
+        }
+    }
     // DLSS5NR_GATE_AB: the translated kernel and the native one, one after the other on the same memory (ab.h)
     if (ab::enabled(name_of(f)) && extra && capture::hip().ready) {
         const unsigned char *buffer = nullptr;
