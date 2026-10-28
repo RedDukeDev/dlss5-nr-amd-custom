@@ -1,3 +1,16 @@
-# Native ray reconstruction stages (preset F): see rr2_stage.hip and README.
+# Native ray reconstruction stages (preset F): see rr2_stage.hip.
 # <ptx kernel>  <code object>  block=x,y,z  args=<bytes>  entry=<symbol>
 rr2_enc1_kernel rr2_stage.hsaco block=32,1,1 args=104 entry=rr2_enc1_kernel_native
+rr2_enc2_kernel rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_enc2_kernel_native
+rr2_enc3_kernel rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_enc3_kernel_native
+rr2_enc4_kernel rr2_stage.hsaco block=32,1,8 args=104 entry=rr2_enc4_kernel_native
+rr2_enc5_kernel rr2_stage.hsaco block=32,1,8 args=104 entry=rr2_enc5_kernel_native
+rr2_dec4_kernel_0 rr2_stage.hsaco block=32,1,8 args=104 entry=rr2_dec4_kernel_0_native
+rr2_dec4_kernel_1 rr2_stage.hsaco block=32,1,8 args=104 entry=rr2_dec4_kernel_1_native
+rr2_dec3_kernel_0 rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_dec3_kernel_0_native
+rr2_dec3_kernel_1 rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_dec3_kernel_1_native
+rr2_dec2_kernel_0 rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_dec2_kernel_0_native
+rr2_dec2_kernel_1 rr2_stage.hsaco block=32,1,4 args=104 entry=rr2_dec2_kernel_1_native
+rr2_dec1_kernel_0 rr2_stage.hsaco block=32,1,2 args=104 entry=rr2_dec1_kernel_0_native
+rr2_dec1_kernel_1 rr2_stage.hsaco block=32,1,2 args=104 entry=rr2_dec1_kernel_1_native
+rr2_dec0_kernel_0 rr2_stage.hsaco block=32,1,1 args=104 entry=rr2_dec0_kernel_0_native
