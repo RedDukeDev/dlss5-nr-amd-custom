@@ -66,6 +66,7 @@ void logf(const char *fmt, ...) {
 // After logf, which it calls: see the note at the top of native_hook.h.
 #include "native_hook.h"
 #include "capture.h"
+#include "ab.h"
 
 namespace {
 
@@ -326,6 +327,45 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
     }
     // DLSS5NR_GATE_CAPTURE: this launch's arguments and memory, before and after (capture.h)
     capture::Scope capturing(name_of(f), gx, gy, gz, bx, by, bz, extra);
+    // DLSS5NR_GATE_AB: the translated kernel and the native one, one after the other on the same memory (ab.h)
+    if (ab::enabled(name_of(f)) && extra && capture::hip().ready) {
+        const unsigned char *buffer = nullptr;
+        size_t size = 0;
+        for (int k = 0; extra[k] && k < 16; k += 2) {
+            if ((size_t)extra[k] == 1) buffer = (const unsigned char *)extra[k + 1];
+            if ((size_t)extra[k] == 2) size = *(const size_t *)extra[k + 1];
+        }
+        std::vector<ab::Region> before = ab::regions_of(buffer, size);
+        ab::take(before);
+        CUresult translated = fn(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+        std::vector<ab::Region> reference = before;
+        ab::take(reference);
+        ab::restore(before);
+        const bool ran = native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra);
+        std::vector<ab::Region> native_result = before;
+        ab::take(native_result);
+        logf("[ab] %s: native %s, translated -> %d\n", name_of(f), ran ? "ran" : "did not run", translated);
+        size_t total = 0;
+        for (size_t r = 0; r < reference.size(); ++r) {
+            size_t differing = 0, first = 0;
+            for (size_t i = 0; i < reference[r].size; ++i)
+                if (reference[r].data[i] != native_result[r].data[i]) {
+                    if (!differing) first = i;
+                    ++differing;
+                }
+            total += differing;
+            logf("[ab]   allocation %llx (%zu bytes): %zu bytes differ", reference[r].base, reference[r].size, differing);
+            if (differing) {
+                logf(", first at +%zu", first);
+                for (auto &p : reference[r].pointers)
+                    if (p.second <= first) logf(" (argument +%zu is at +%zu)", p.first, p.second);
+                logf(": translated %02x native %02x", reference[r].data[first], native_result[r].data[first]);
+            }
+            logf("\n");
+        }
+        logf("[ab] %s\n", total ? "DIFFERENT" : "IDENTICAL");
+        return translated;
+    }
     if (!profile::on()) {
         const double started = trace_times::now_ms();
         if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) {
