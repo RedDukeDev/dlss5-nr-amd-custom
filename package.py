@@ -238,6 +238,16 @@ def main():
             objects.add(fields[1])
             copy(os.path.join(upscaler_kernels, fields[1]), os.path.join(target, "kernels", fields[1]))
 
+    # The ray reconstruction stages: the manifest (kernels/rr) and the code objects build_kernel.py wrote in
+    # kernels/ itself.
+    rr_manifest = os.path.join(kernels, "rr", "kernels_rr.txt")
+    copy(rr_manifest, os.path.join(target, "kernels", "kernels_rr.txt"))
+    for line in open(rr_manifest, encoding="utf-8"):
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2:
+            objects.add(fields[1])
+            copy(os.path.join(kernels, fields[1]), os.path.join(target, "kernels", fields[1]))
+
     if args.optiscaler:
         for name in os.listdir(args.optiscaler):
             source = os.path.join(args.optiscaler, name)

@@ -1,0 +1,3 @@
+# Native ray reconstruction stages (preset F): see rr2_stage.hip and README.
+# <ptx kernel>  <code object>  block=x,y,z  args=<bytes>  entry=<symbol>
+rr2_enc1_kernel rr2_stage.hsaco block=32,1,1 args=104 entry=rr2_enc1_kernel_native

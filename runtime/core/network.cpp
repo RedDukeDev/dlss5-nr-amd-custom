@@ -385,11 +385,11 @@ static bool check_manifest(const std::wstring &manifest, const std::wstring &run
 bool Network::load(const NetworkPaths &paths, std::string &error) {
     Own &o = *own_;
     const std::wstring zluda_dir = paths.runtime_dir + L"\\zluda\\";
-    // The native kernels each network has: a manifest in kernels\. Ray reconstruction has none yet
-    // (its rr2_* kernels run translated), and an empty name means "not expected".
+    // The native kernels each network has: a manifest in kernels\. Ray reconstruction's rr2_* stages that
+    // have no native version run translated (an empty name would mean "not expected").
     const wchar_t *manifest_name = paths.kind == Kind::NeuralRendering   ? L"kernels.txt"
                                    : paths.kind == Kind::SuperResolution ? L"kernels_sr.txt"
-                                                                         : L"";
+                                                                         : L"kernels_rr.txt";
     const std::wstring kernels = paths.runtime_dir + L"\\kernels\\" + manifest_name;
     const bool expects_natives = manifest_name[0] != 0;
     const std::wstring cache = paths.data_dir + L"\\ComputeCache";
