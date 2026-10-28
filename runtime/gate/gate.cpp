@@ -65,6 +65,7 @@ void logf(const char *fmt, ...) {
 
 // After logf, which it calls: see the note at the top of native_hook.h.
 #include "native_hook.h"
+#include "capture.h"
 
 namespace {
 
@@ -323,6 +324,8 @@ __declspec(dllexport) CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigne
         static const bool have = GetEnvironmentVariableA("DLSS5NR_GATE_SKIP", skip, sizeof skip) > 0;
         if (have && strcmp(skip, name_of(f)) == 0) return 0;
     }
+    // DLSS5NR_GATE_CAPTURE: this launch's arguments and memory, before and after (capture.h)
+    capture::Scope capturing(name_of(f), gx, gy, gz, bx, by, bz, extra);
     if (!profile::on()) {
         const double started = trace_times::now_ms();
         if (native::try_launch(name_of(f), gx, gy, gz, bx, by, bz, shared, stream, extra)) {

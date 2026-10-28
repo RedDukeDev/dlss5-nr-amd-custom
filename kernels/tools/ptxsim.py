@@ -218,6 +218,8 @@ class Kernel:
             return ("imm", int(t.rstrip("UuSs"), 0))
         if re.match(r"^0f[0-9a-fA-F]{8}$", t):
             return ("imm", int(t[2:], 16))
+        if re.match(r"^0d[0-9a-fA-F]{16}$", t):
+            return ("imm", int(t[2:], 16))
         if t == self.param_name or t in self.shared:
             return ("sym", t)
         return ("reg", t)
@@ -466,7 +468,7 @@ class Machine:
     @staticmethod
     def width(ty):
         return {"b16": 16, "u16": 16, "s16": 16, "f16": 16, "b32": 32, "u32": 32, "s32": 32,
-                "f32": 32, "f16x2": 32, "b64": 64, "u64": 64, "s64": 64, "pred": 1}[ty]
+                "f32": 32, "f16x2": 32, "b64": 64, "u64": 64, "s64": 64, "f64": 64, "pred": 1}[ty]
 
     @staticmethod
     def signed(v, width):
@@ -680,7 +682,7 @@ class Machine:
             self.put(a[0], r.astype(np.int64).view(np.uint64), m, w)
             return
 
-        if head in ("abs", "fma") and ty == "f16x2":
+        if head in ("abs", "neg", "fma") and ty == "f16x2":
             self._f16x2(head, a, m)
             return
 
@@ -737,6 +739,33 @@ class Machine:
             r = {"eq": x == y, "ne": x != y, "lt": x < y, "le": x <= y,
                  "gt": x > y, "ge": x >= y}[cmp]
             self.put(a[0], r.astype(np.uint64), m, 1)
+            return
+
+        if head == "abs" and parts[-1] in ("s32", "s64"):
+            w = self.width(ty)
+            self.put(a[0], np.abs(self.signed(self.val(a[1]), w)).astype(np.int64).view(np.uint64), m, w)
+            return
+
+        if head == "bfi":
+            # bfi.b32 d, insert, base, position, length: `length` bits of `insert` replace base's from `position`.
+            w = self.width(ty)
+            ins_, base = self.val(a[1]), self.val(a[2])
+            pos, length = (self.val(a[3]) & np.uint64(255)).astype(np.int64), (self.val(a[4]) & np.uint64(255)).astype(np.int64)
+            ones = np.where(length >= w, np.uint64((1 << w) - 1), (np.uint64(1) << length.astype(np.uint64)) - np.uint64(1))
+            field = np.where(pos >= w, np.uint64(0), ones << np.minimum(pos, 63).astype(np.uint64))
+            field &= np.uint64((1 << w) - 1)
+            value = (ins_ << np.minimum(pos, 63).astype(np.uint64)) & field
+            self.put(a[0], (base & ~field) | value, m, w)
+            return
+
+        if head == "vote" and "ballot" in parts:
+            # vote.sync.ballot.b32 d, p, mask: every lane of a warp gets the bits of its active lanes' predicate.
+            pred = self.val(a[1]).astype(bool) & m
+            out = np.zeros(self.nl, dtype=np.uint64)
+            for warp in range(self.nl // 32):
+                bits = pred[32 * warp:32 * warp + 32]
+                out[32 * warp:32 * warp + 32] = np.uint64(sum(1 << i for i in range(32) if bits[i]))
+            self.put(a[0], out, m, 32)
             return
 
         if head == "selp":
@@ -918,6 +947,9 @@ class Machine:
             v = self.val(a[1]) & np.uint64(0x7FFF7FFF)
             self.put(a[0], v, m, 32)
             return
+        if head == "neg":
+            self.put(a[0], self.val(a[1]) ^ np.uint64(0x80008000), m, 32)
+            return
         yl, yh = split_f16x2(self.val(a[2]))
         if head == "min":
             rl, rh = np.fmin(xl, yl), np.fmin(xh, yh)
@@ -959,6 +991,9 @@ class Machine:
             self.put(a[0], pack_f16x2(lo, hi), m, 32)
         elif to == "f32" and frm == "f16":
             self.put(a[0], f64_to_f32_bits(f16_bits_to_f64(src)), m, 32)
+        elif to == "f16" and frm == "f64":
+            f = src.astype(np.uint64).view(np.float64)
+            self.put(a[0], f64_to_f16_bits(f), m, 16)
         elif to == "f16" and frm == "f32":
             f = (src & MASK32).astype(np.uint32).view(np.float32).astype(np.float64)
             self.put(a[0], f64_to_f16_bits(f), m, 16)

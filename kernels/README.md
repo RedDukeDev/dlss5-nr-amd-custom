@@ -744,3 +744,35 @@ and never loaded it. Only the tokens at the image's edge came out wrong.
 Every exchange of the RDNA4 path (`rows_sigma`, `exchange`) is therefore pinned
 with an empty `asm volatile` that consumes its result where the kernel asks for
 it. An RDNA4 card would have shown the same failure.
+
+## Capturing a launch and replaying it on the GPU
+
+A native kernel is checked against the translated one on the same bytes. The
+gate (runtime/gate/capture.h) captures one launch of any kernel from a running
+network:
+
+    DLSS5NR_GATE_CAPTURE=<kernel name> DLSS5NR_GATE_CAPTURE_DIR=<dir> \
+        [DLSS5NR_GATE_CAPTURE_LAUNCH=<n>] [DLSS5NR_GATE_CAPTURE_BYTES=<n>]
+
+It writes the argument buffer, a description of every allocation the arguments
+point into, and those allocations before and after the launch. Unlike
+capture_launch.py it needs no research proxy: it works in the runtime's own
+process, for the upscaler and ray reconstruction harnesses alike
+(`dlss5up_harness --kind rr`).
+
+replay_gpu.py runs the capture again from the kernel's PTX, through ZLUDA, on
+the whole grid, with the pointers rebased onto fresh memory. For the ray
+reconstruction's encoder 1 (a 43,000 line kernel, 22 MB of output) the replay
+differs from the capture in 0 bytes: the PTX text and ZLUDA are what made it.
+
+That makes the PTX something to experiment on rather than to read. With
+`--mma-log BX,BY out.npz` the tool patches in a store after every mma of one
+block and returns the hardware's own result for each 16x8 tile, in program
+order. This is what the interpreter cannot give: ptxsim.py lacked instructions
+the ray reconstruction's kernels use (now added: integer abs, bfi, vote,
+f64 constants, neg on f16x2), and an exact-sum model of the mma differs from
+RDNA3's WMMA in about one tile element in twenty -- the rounding inside one
+accumulation is not IEEE (see "Not checked" above). A numpy reference built on
+exact sums therefore finds the first stages of a window in the log only when
+the sums are short; a native kernel that issues the same WMMAs does not have
+the problem, and the log is the truth to compare its tiles with.
