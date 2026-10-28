@@ -240,9 +240,9 @@ def main():
 
     # The ray reconstruction stages: the manifest (kernels/rr) and the code objects build_kernel.py wrote in
     # kernels/ itself.
-    # kernels_rr_enc0.txt is there only where tools/build_rr_enc0.py has made the encoder 0 from the library.
+    # kernels_rr_generated.txt is there only where tools/build_rr_generated.py has made encoder 0 and the last decoder from the library.
     rr_lines = []
-    for name in ("kernels_rr.txt", "kernels_rr_enc0.txt"):
+    for name in ("kernels_rr.txt", "kernels_rr_generated.txt"):
         path = os.path.join(kernels, "rr", name)
         if os.path.isfile(path):
             rr_lines += open(path, encoding="utf-8").read().splitlines()

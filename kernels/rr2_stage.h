@@ -49,7 +49,7 @@ struct StageArgs {
 static_assert(sizeof(StageArgs) == 104, "the parameter is 104 bytes, by value");
 
 enum Input { MERGE, TOKENS, EXPAND, EMBED };
-enum Output { ENCODER, DECODER_GUIDE, TOKENS_ONLY, HEAD_ONLY };
+enum Output { ENCODER, DECODER_GUIDE, TOKENS_ONLY, HEAD_ONLY, MLP_ONLY };
 
 // ------------------------------------------------------------ small pieces
 
@@ -572,6 +572,9 @@ __device__ void stage(uint8_t *lds, const Args &args) {
         __syncthreads();
     }
 
+    // MLP_ONLY: the caller takes r (acc) and the MLP sum (mlp) as they are
+    if (OUT == MLP_ONLY) return;
+
     // ---- y = r + m * s2, as codes in position order over Ra
     uint8_t *const yq = xa;
     for (int k = tid; k < 64 * C; k += threads) {
@@ -585,7 +588,7 @@ __device__ void stage(uint8_t *lds, const Args &args) {
     for (int k = tid; k < 64 * C / 16; k += threads) {
         const int t = k / (C / 16), part = k % (C / 16), p = part / 2, h = part % 2;
         const int X = x0 + (t & 7), Y = y0 + (t >> 3);
-        if (X >= 0 && X < wd && Y >= 0 && Y < ht)
+        if (args.tokens && X >= 0 && X < wd && Y >= 0 && Y < ht)
             *(u32x4 *)(args.tokens + (((size_t)p * ht + Y) * wd + X) * 32 + 16 * h) = *(const u32x4 *)(yq + t * C + 32 * p + 16 * h);
     }
 

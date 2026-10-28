@@ -221,8 +221,8 @@ class Emitter:
     def address(self, tok, names):
         """C expression of the pointer of [reg+off] / [symbol+off]."""
         inner = tok.strip()[1:-1].replace(" ", "")
-        m = re.fullmatch(r"([^+\-]+)(?:([+\-]-?\d+))?", inner) or re.fullmatch(r"(.+?)(?:\+(-?\d+))?", inner)
-        base, off = m.group(1), int(m.group(2) or 0)
+        m = re.fullmatch(r"([^+\-]+)(?:\+(-?\d+)|(-\d+))?", inner)
+        base, off = m.group(1), int(m.group(2) or m.group(3) or 0)
         if base == self.param:
             return "(P + %d)" % off
         return "((const uint8_t *)(uintptr_t)(%s) + (%d))" % (self.read(base, "u64", names), off)
@@ -336,8 +336,12 @@ class Emitter:
         if base == "setp":
             cmp = mods[0]
             ty = T
-            kind = {"s32": "s32", "u32": "u32", "s16": "s16", "u16": "u16", "s64": "s64", "u64": "u64", "f32": "f32", "b32": "u32"}[ty]
-            x, y = R(a[1], kind, names), R(a[2], kind, names)
+            kind = {"s32": "s32", "u32": "u32", "s16": "s16", "u16": "u16", "s64": "s64", "u64": "u64", "f32": "f32", "b32": "u32", "f16": "f16"}[ty]
+            if kind == "f16":
+                x, y = "(float)u2h(%s)" % R(a[1], "h", names), "(float)u2h(%s)" % R(a[2], "h", names)
+                kind = "f32"
+            else:
+                x, y = R(a[1], kind, names), R(a[2], kind, names)
             cpp = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
                    "equ": "==", "neu": "!=", "ltu": "<", "leu": "<=", "gtu": ">", "geu": ">="}
             if kind == "f32":
@@ -360,8 +364,13 @@ class Emitter:
                 "add": lambda: "%s + %s" % (x(1), x(2)), "sub": lambda: "%s - %s" % (x(1), x(2)), "mul": lambda: "%s * %s" % (x(1), x(2)),
                 "fma": lambda: "__builtin_fmaf(%s, %s, %s)" % (x(1), x(2), x(3)), "min": lambda: "fmin_ptx(%s, %s)" % (x(1), x(2)),
                 "max": lambda: "fmax_ptx(%s, %s)" % (x(1), x(2)), "abs": lambda: "__builtin_fabsf(%s)" % x(1), "neg": lambda: "-%s" % x(1),
-                "div": lambda: "div_approx(%s, %s)" % (x(1), x(2)), "rcp": lambda: "rcp_approx(%s)" % x(1), "sqrt": lambda: "sqrt_approx(%s)" % x(1),
-                "lg2": lambda: "lg2_approx(%s)" % x(1), "ex2": lambda: "ex2_approx(%s)" % x(1),
+                "div": lambda: "div_approx(%s, %s)" % (x(1), x(2)),
+                # ZLUDA wraps the approximate forms in denormal-safe helpers only without .ftz; with it the
+                # instruction is the hardware's
+                "rcp": lambda: ("__builtin_amdgcn_rcpf(%s)" if ftz else "rcp_approx(%s)") % x(1),
+                "sqrt": lambda: ("__builtin_amdgcn_sqrtf(%s)" if ftz else "sqrt_approx(%s)") % x(1),
+                "lg2": lambda: ("__builtin_amdgcn_logf(%s)" if ftz else "lg2_approx(%s)") % x(1),
+                "ex2": lambda: ("__builtin_amdgcn_exp2f(%s)" if ftz else "ex2_approx(%s)") % x(1),
             }[base]()
             if ftz and base in ("add", "sub", "mul", "fma", "min", "max", "neg"):
                 e = "ftz(%s)" % e
@@ -369,7 +378,10 @@ class Emitter:
         if base in ("add", "sub", "mul", "min", "max", "fma") and T in ("f16", "f16x2"):
             if T == "f16":
                 x = lambda i: "u2h(%s)" % R(a[i], "h", names)
-                e = {"add": "%s + %s", "sub": "%s - %s", "mul": "%s * %s"}[base] % (x(1), x(2))
+                if base in ("min", "max"):
+                    e = "__builtin_elementwise_%s((_Float16)%s, (_Float16)%s)" % (base, x(1), x(2))
+                else:
+                    e = {"add": "%s + %s", "sub": "%s - %s", "mul": "%s * %s"}[base] % (x(1), x(2))
                 return [S(a[0], names, "h", "h2u((_Float16)(%s))" % e)]
             x = lambda i: "u2h2(%s)" % R(a[i], "u32", names)
             if base == "fma":
@@ -379,6 +391,13 @@ class Emitter:
             else:
                 e = "%s %s %s" % (x(1), {"add": "+", "sub": "-", "mul": "*"}[base], x(2))
             return [S(a[0], names, "u32", "h22u(%s)" % e)]
+        if base == "tanh" and T in ("f16", "f32"):
+            if T == "f16":
+                return [S(a[0], names, "h", "h2u(tanh_f16(u2h(%s)))" % R(a[1], "h", names))]
+            return [S(a[0], names, "f32", "tanh_f32(%s)" % R(a[1], "f32", names))]
+        if base == "ex2" and T == "f16":
+            # the scalar half form reaches LLVM as llvm.exp2.f16, which is the hardware's half exponential
+            return [S(a[0], names, "h", "h2u(__builtin_elementwise_exp2(u2h(%s)))" % R(a[1], "h", names))]
         if base in ("ld", "st"):
             return self.memory(base, mods, a, names)
         if base == "tex":
@@ -406,7 +425,9 @@ class Emitter:
         if to == "e4m3x2" and frm == "f16x2":
             return [S(a[0], names, "u16", "cvt_e4m3x2(%s)" % R(a[1], "u32", names))]
         if to == "f16" and frm == "f32":
-            e = "(_Float16)%s" % (("clamp_f16(%s)" if sat else "%s") % R(a[1], "f32", names))
+            # opaque32: the f32 result is rounded before the conversion, as ZLUDA's code does; without it the compiler
+            # folds a multiplication into the conversion and rounds once, which differs in the last half bit
+            e = "(_Float16)opaque32(%s)" % (("clamp_f16(%s)" if sat else "%s") % R(a[1], "f32", names))
             return [S(a[0], names, "h", "h2u(%s)" % e)]
         if to == "f32" and frm == "f16":
             return [S(a[0], names, "f32", "(float)u2h(%s)" % R(a[1], "h", names))]
@@ -474,6 +495,9 @@ class Emitter:
         co = [c.strip() for c in m.group(2).split(",")]
         vals = split_args(a[1].strip()[1:-1])
         n = len(vals)
+        if mods[0] == "p":   # sust.p.2d.v4.b32: pixel coordinates, the values converted to the format by the hardware
+            v = ", ".join(R(x, "f32", names) for x in vals)
+            return ["sust_p(%s, %s, %s, %s);" % (handle, R(co[0], "s32", names), R(co[1], "s32", names), v)]
         v = ", ".join("(uint16_t)%s" % R(x, "u16", names) for x in vals)
         return ["sust_b16(%s, %s, %s, %d, %s);" % (handle, R(co[0], "s32", names), R(co[1], "s32", names), n, v)]
 

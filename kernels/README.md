@@ -829,7 +829,7 @@ their range bit). `tools/gen_enc0.py` finds the three stretches, works out which
 A fragments of the first eight mmas are the features; the destination registers of the last eight are the head) and
 writes `rr2_enc0_gen.inc`; `rr2_enc0.hip` joins the generated stretches to the stage.
 
-Because the generated code is NVIDIA's network in another form, it is never committed. `tools/build_rr_enc0.py
+Because the generated code is NVIDIA's network in another form, it is never committed. `tools/build_rr_generated.py
 [nvngx_dlssd.dll]` makes it at build time from the user's copy of the library -- extracts the PTX, generates,
 builds `rr2_enc0.hsaco` for every architecture, and writes `kernels/rr/kernels_rr_enc0.txt`, the manifest fragment
 that `package.py` and the runtime pick up when it is there (a package built without it keeps the translated
@@ -840,3 +840,26 @@ kernel, puts the memory back, runs the native one on the same textures and compa
 four consecutive launches, and the harness's final image identical to the translation's. The surfaces the gather
 writes are not compared by the A/B; the image over several frames, which they feed, is. The encoder 0 takes about
 12 ms per frame instead of 18.7 (a quarter of that in the gather, which is as latency-bound as it was).
+
+### The last decoder kernel, the same way
+
+`rr2_dec0_kernel_1` is the shared stage up to the end of its MLP and then about a thousand instructions that form
+y = r + m s2 and the network's outputs (tanh, exponentials, five surface writes). `tools/gen_dec0_1.py` translates
+that tail; what it takes from the stage is registers -- the destination registers of the last sixteen mmas (the MLP
+sum m) and the sixty-four f16 registers that hold the residual r in the same fragment layout, filled from the
+stage's LDS by `pack_fragments`, the pairing of each r register with its m element read off the tail's own
+dataflow -- and a few index registers recomputed by a prologue of their defining instructions. The stage has a new
+output, `MLP_ONLY`, that stops after the MLP and leaves r and m in LDS. `tools/build_rr_generated.py` now builds both
+generated kernels and writes `kernels/rr/kernels_rr_generated.txt`.
+
+With the encoder 0 and this one native, 16 of the network's kernels are, and the translated ones left are the small
+ones (post, downsample, exposure, history: well under a millisecond between them). The final image over nine
+frames is identical to the translation's, and a frame is 35 ms instead of 80.
+
+**A trap the generated code fell into**: PTX rounds `mul.ftz.f32` to f32 and then `cvt.rn.f16.f32` rounds that to
+half, and ZLUDA keeps both roundings; the HIP compiler folds a multiplication into the conversion that follows it and
+rounds once, even with contraction off, which differs in the last half bit on about one case in 25,000. 53 pixels of
+the output. `opaque32` (rr_ptx.h) hides the f32 value from the compiler where a conversion to half reads it, and the
+generated code uses it. The check that found it, instruction by instruction, ran ZLUDA's translation of a PTX
+snippet and the HIP rendering on a million inputs and compared the bits (rr_captures/opcheck.py was a scratch
+tool; the useful idea is to do that for any new class of instruction before trusting it).

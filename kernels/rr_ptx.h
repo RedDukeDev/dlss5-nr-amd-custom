@@ -39,6 +39,11 @@ __device__ inline dlssnr::half2 u2h2(uint32_t v) { return dlssnr::as_half2(v); }
 __device__ inline uint32_t h22u(dlssnr::half2 v) { return dlssnr::as_u32(v); }
 
 __device__ inline float ftz(float v) { return v; }   // the compile flag flushes
+// Keeps the compiler from seeing through a value: a float rounded to f32 stays rounded to f32 before whatever follows.
+__device__ inline float opaque32(float v) {
+    asm volatile("" : "+v"(v));
+    return v;
+}
 __device__ inline float fmin_ptx(float a, float b) { return __builtin_fminf(a, b); }
 __device__ inline float fmax_ptx(float a, float b) { return __builtin_fmaxf(a, b); }
 
@@ -172,4 +177,16 @@ __device__ inline void sust_b16(uint64_t handle, int32_t x_bytes, int32_t y, int
     if (pixel_bytes != 2 * count || x_bytes % pixel_bytes != 0) __builtin_trap();
     float4v data = {(float)u2h(v0), (float)u2h(v1), (float)u2h(v2), (float)u2h(v3)};
     dlssnr::store2d(image, x_bytes / pixel_bytes, y, data);
+}
+
+// ---------------------------------------------------------------- tanh (OCML's, as ZLUDA calls it) and sust.p
+extern "C" __device__ _Float16 __ocml_tanh_f16(_Float16);
+extern "C" __device__ float __ocml_tanh_f32(float);
+__device__ inline _Float16 tanh_f16(_Float16 v) { return __ocml_tanh_f16(v); }
+__device__ inline float tanh_f32(float v) { return __ocml_tanh_f32(v); }
+
+// sust.p: pixel coordinates; the format converts the four values
+__device__ inline void sust_p(uint64_t handle, int32_t x, int32_t y, float v0, float v1 = 0.f, float v2 = 0.f, float v3 = 0.f) {
+    float4v data = {v0, v1, v2, v3};
+    dlssnr::store2d(handle & ~(uint64_t)7, x, y, data);
 }
