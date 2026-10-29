@@ -672,10 +672,14 @@ bool is_unorm_format(DXGI_FORMAT f) {
 // image as normalised, and the two descriptors differ in two words only, the hardware format (1) and the channel type
 // the kernels' loads and stores consult (8). The surface takes them from the texture; ZLUDA's raw stores and loads
 // decode and encode by that channel type, so a raw store of bytes keeps working.
+//
+// ZLUDA keeps the log2 of the pixel size in the bottom three bits of a surface object (the handle is the page's
+// address with them set), so the page is at the handle without them.
 void make_surface_normalised(Image &image) {
     if (!cu.cuMemcpyDtoH || !cu.cuMemcpyHtoD) return;
+    const CUdeviceptr page = (CUdeviceptr)(image.surface & ~(uint64_t)7);
     uint32_t surface[12] = {}, texture[12] = {};
-    if (cu.cuMemcpyDtoH(surface, image.surface, sizeof surface) != CUDA_SUCCESS ||
+    if (cu.cuMemcpyDtoH(surface, page, sizeof surface) != CUDA_SUCCESS ||
         cu.cuMemcpyDtoH(texture, image.texture, sizeof texture) != CUDA_SUCCESS)
         return;
     for (int w = 0; w < 12; ++w)
@@ -684,8 +688,8 @@ void make_surface_normalised(Image &image) {
             say("the descriptors of a normalised image differ in word %d too: not adapting its surface", w);
             return;
         }
-    cu.cuMemcpyHtoD(image.surface + 4, &texture[1], 4);
-    cu.cuMemcpyHtoD(image.surface + 32, &texture[8], 4);
+    cu.cuMemcpyHtoD(page + 4, &texture[1], 4);
+    cu.cuMemcpyHtoD(page + 32, &texture[8], 4);
 }
 
 // Whether a small shared texture can be imported into HIP and mapped as an array here.
@@ -804,7 +808,7 @@ Image *image_of(ID3D12Resource *resource, DXGI_FORMAT view_format) {
     if (_wgetenv(L"FG_NVAPI_DUMP_SRD") && cu.cuMemcpyDtoH) {
         // The image descriptors of the two objects, side by side: where they differ is what a store has to know.
         uint32_t s[24] = {}, x[24] = {};
-        cu.cuMemcpyDtoH(s, image.surface, sizeof s);
+        cu.cuMemcpyDtoH(s, (CUdeviceptr)(image.surface & ~(uint64_t)7), sizeof s);
         cu.cuMemcpyDtoH(x, image.texture, sizeof x);
         char line[600];
         int n = snprintf(line, sizeof line, "descriptors, format %d (%u x %d):", (int)use, channels, (int)format);
