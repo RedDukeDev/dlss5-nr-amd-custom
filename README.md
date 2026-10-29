@@ -1,5 +1,7 @@
 # DLSS 5 Neural Rendering on AMD - Featuring asyncronous mode (almost no performance loss!) and Linux support
 
+<img width="1536" height="1024" alt="dlss5-nr-amd-custom" src="https://github.com/user-attachments/assets/7edfd671-d3f4-46e7-abd2-70636220dfcb" />
+
 DLSS 5 Neural Rendering, NVIDIA's own network, running in Direct3D 12, Direct3D 11 and Vulkan games on
 AMD Radeon GPUs through OptiScaler.
 
