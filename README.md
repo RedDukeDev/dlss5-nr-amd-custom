@@ -16,6 +16,10 @@ game's frame.
 Also, instead of waiting for the dlss network to finish, this implementation is able to run it in an asyncrous way, resulting in a huge perfomance gain over existing implementations.
 More infos in [DESIGN.md](docs/DESIGN.md)
 
+The upscaler side (super resolution and ray reconstruction) builds on [d4r](https://github.com/countervolts/d4r)
+by countervolts (GPL-3): its native super resolution kernels and its command-list module are used here. See
+[THIRD_PARTY.md](THIRD_PARTY.md).
+
 ## Layout
 
 | folder | what | licence |
@@ -25,6 +29,7 @@ More infos in [DESIGN.md](docs/DESIGN.md)
 | [`linux/`](linux/) | extra code for Linux support, read the "Linux" section in this redme | MIT |
 | [`optiscaler/`](optiscaler/) | submodule: the fork of OptiScaler that calls the runtime | GPL-3.0 |
 | [`third_party/ZLUDA`](third_party/) | submodule: the fork of ZLUDA the network runs on | MIT / Apache-2.0 |
+| [`third_party/d4r`](third_party/) | submodule: d4r, the source of the native super resolution kernels (only to build them) | GPL-3.0 |
 | [`docs/`](docs/) | [design](docs/DESIGN.md) | MIT |
 
 How the pieces fit, and why the network runs beside the game rather than
@@ -304,8 +309,8 @@ problem.
   package or from a game that ships them. (310.8.0.0 of the neural rendering network, the version
   before, still runs, but the translation cache of the package is made for 310.9.16.0.) They have to
   be the original signed files: builds patched to run on older NVIDIA cards cannot be translated.
-- **Super resolution kernels:** `python kernels\build_sr_kernels.py` (the AMD HIP SDK and a d4r
-  checkout, see its header) writes `kernels\sr\`, which `package.py` takes.
+- **Super resolution kernels:** `python kernels\build_sr_kernels.py` (the AMD HIP SDK and the
+  `third_party/d4r` submodule, see its header) writes `kernels\sr\`, which `package.py` takes.
 - **Frame generation kernels:** `python kernels\build_fg_kernels.py`.
 - **Ray reconstruction kernels:** `python kernels\build_rr_kernels.py` builds `rr2_stage.hsaco`, the stage
   fourteen of the network's kernels share, and, from `third_party\nvngx_dlssd.dll`, the first encoder and the last

@@ -12,6 +12,22 @@ colours moved towards neutral. We learned of it through the OptiScaler-DLSSNR
 fork that adopted it. It is their design, reimplemented here; no code was
 copied.
 
+## d4r
+
+The upscaler side of this project started from d4r by countervolts (https://github.com/countervolts/d4r, GPL-3):
+it showed that NVIDIA's DLSS upscalers can run on AMD through ZLUDA with a command-list split around the
+upscale, and its hand-written kernels are what the native super resolution layers are. What we use of it:
+
+- **Super resolution kernels:** the eleven `dltss_pwin_*_layer` kernels (preset K) and the five Swin blocks
+  (presets L and M) are d4r's WMMA code. `kernels/build_sr_kernels.py` builds them from the `third_party/d4r` submodule
+  (the `windows` branch); the compiled kernels in the release package are built from
+  GPL-3 code and stay under that licence.
+- **Command-list module:** `zluda/d4r_commands` in the OptiScaler fork (the split of the game's command list
+  at a boundary, `record_boundary`, resource states, retirement) is d4r's, used by the DLSS upscaler feature
+  and the frame generation stand-in. The fork is GPL-3 too.
+
+The shared pieces around them (ZLUDA fork, gate, NGX host, NVAPI stand-in, runtime) are ours.
+
 ## OkLab
 
 The OkLab conversion uses the matrices published by Bjorn Ottosson
