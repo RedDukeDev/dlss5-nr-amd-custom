@@ -42,5 +42,8 @@
   `kernels/tools/replay_gpu.py` replays a capture on the GPU from the PTX and logs every matrix multiply.
 - The manifest takes `waves=N` to launch a native kernel with more waves per block than the PTX used. Ship the gate and
   the manifests together: an older gate ignores the line and leaves the kernel translated.
+- `runtime/tools/fill_cache.py` loads every module of the upscaler and frame generation libraries through ZLUDA and
+  translates the ones a cache lacks. It found the modules of ray reconstruction's older presets (D and E), which the
+  cache of this release first missed: the game translated them at start-up and froze for minutes.
 - `runtime/tools/rekey_cache.py` carries translations over to a newer ZLUDA for modules that have no texture or surface
   instructions.

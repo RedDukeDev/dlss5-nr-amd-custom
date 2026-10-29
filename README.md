@@ -362,11 +362,19 @@ of them. You can choose which targets to build by editing
 The rows are keyed by the ZLUDA commit, so moving to a newer ZLUDA does not need the hours of a full run when the
 commits in between left the lowering of most instructions alone. What they changed is stated in the commit
 messages; the modules that matter are the ones with texture or surface instructions (the upscalers and the frame
-generation), which have to be translated again, with `prepare_cache.py --only` into a cache of their own.
-`runtime\tools\rekey_cache.py <old> <new>` then carries the rows of every other module over, replacing the version
-they are keyed by. Check the result by running each harness (`dlss5up_harness` for `sr` and `rr`,
-`dlss5nr_harness`, `dlss5nr_fg_harness` with `FG_HARNESS_DIST=1`) against a copy of the package, without
-`DLSS5NR_ALLOW_TRANSLATION`: a module that is missing fails at once, a module that is wrong shows in the picture.
+generation), which have to be translated again. `runtime\tools\rekey_cache.py <old> <new>` carries the rows of every
+other module over, replacing the version they are keyed by.
+
+Then run `python runtime\tools\fill_cache.py <cache dir> <work dir>` on a copy of the result. It loads every module of
+the three upscaler and frame generation libraries through ZLUDA and translates the ones the cache does not answer;
+a second run must report `+0 rows` everywhere. This step is not optional: the key holds a revision that differs from
+module to module, and a library holds several networks (ray reconstruction has presets D and E on one network and F on
+another), so a package checked with the presets one harness uses can lack the modules of another. ZLUDA then
+translates them in the game, on the render thread and for the card's own target, and the game freezes for minutes.
+Last, run each harness (`dlss5up_harness` for `sr` and `rr`, `dlss5nr_harness`, `dlss5nr_fg_harness` with
+`FG_HARNESS_DIST=1`) against a copy of the package without `DLSS5NR_ALLOW_TRANSLATION`, and check that the cache holds
+as many rows afterwards as before: a module that is missing fails at once or adds a row, a module that is wrong shows
+in the picture.
 
 ## Contributing
 
