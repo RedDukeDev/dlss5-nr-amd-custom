@@ -5,3 +5,7 @@
 [submodule "third_party/ZLUDA"]
 	path = third_party/ZLUDA
 	url = https://github.com/RedDukeDev/ZLUDA.git
+[submodule "third_party/d4r"]
+	path = third_party/d4r
+	url = https://github.com/countervolts/d4r.git
+	branch = windows
