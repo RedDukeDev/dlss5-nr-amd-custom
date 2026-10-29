@@ -40,7 +40,7 @@ DXVK (dxvk\\, 64-bit) goes into dxvk\\ beside OptiScaler.dll, for setup_windows.
 beside a Direct3D 9 or 10 game.
 
 The runtime (runtime\\build\\bin) and the native kernels (kernels\\, built with
-build_kernels.py) must be built first. Only the kernels the manifest names are
+build_kernels.py, build_fg_kernels.py and build_rr_kernels.py) must be built first. Only the kernels the manifest names are
 packaged. The native super resolution layers (kernels\\sr, built with
 build_sr_kernels.py) and their manifest, kernels_sr.txt, go with them. NVIDIA's libraries, in
 third_party\\, go into OptiScaler\\dlss5nr\\ as they are. The upscalers' NGX hosts (zluda\\ngx_sr,
@@ -49,6 +49,7 @@ they can run beside the neural rendering.
 """
 import argparse
 import filecmp
+import hashlib
 import os
 import shutil
 import sys
@@ -246,6 +247,21 @@ def main():
         path = os.path.join(kernels, "rr", name)
         if os.path.isfile(path):
             rr_lines += open(path, encoding="utf-8").read().splitlines()
+    generated = os.path.join(kernels, "rr", "kernels_rr_generated.txt")
+    if not os.path.isfile(generated):
+        print("warning: encoder 0 and the last decoder of the ray reconstruction are not built "
+              "(python kernels\\build_rr_kernels.py): they run translated, which is a good deal slower")
+    else:
+        # The generated kernels are made from one build of the library: shipping another one beside them would
+        # run code written for kernels that are no longer there.
+        recorded = next((l.split()[-1] for l in rr_lines if l.startswith("# library sha256")), None)
+        library = os.path.join(ROOT, "third_party", "nvngx_dlssd.dll")
+        if recorded and os.path.isfile(library):
+            with open(library, "rb") as f:
+                actual = hashlib.sha256(f.read()).hexdigest()
+            if actual != recorded:
+                sys.exit("kernels/rr was generated from another nvngx_dlssd.dll than third_party's: run "
+                         "python kernels\\build_rr_kernels.py again")
     with open(os.path.join(target, "kernels", "kernels_rr.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(rr_lines) + "\n")
     for line in rr_lines:

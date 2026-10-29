@@ -36,7 +36,9 @@ With OptiScaler the runtime goes in a `dlss5nr` folder inside OptiScaler's own
             nvapi64.dll           ZLUDA's NVAPI stand-in
             nvngx.dll             our NGX host
         kernels\
-            kernels.txt           which native kernel stands in for which
+            kernels.txt           which native kernel stands in for which (neural rendering)
+            kernels_sr.txt        the same for super resolution
+            kernels_rr.txt        the same for ray reconstruction
             *.hsaco               the native kernels
         cache\                    created: the translation cache and the logs
 ```
@@ -170,3 +172,22 @@ The logs are in `cache\`:
 
 The network reports its fatal errors to the NGX log and then ends the
 process. When a game closes on its own, look there.
+
+### Looking inside a kernel (development)
+
+The gate can check and observe a kernel in the running process; all of it is off unless the variable is set, and
+the log is `gate.log`.
+
+- `DLSS5NR_GATE_PROFILE=1`, `DLSS5NR_GATE_TRACE=1`: the GPU time of every kernel, native or translated (the trace
+  waits for each launch, so its times are about twice the frame's own);
+- `DLSS5NR_GATE_AB=<kernel>` (with `_LAUNCHES=n`, `_DUMP=<dir>`): runs the translated kernel, puts the memory back,
+  runs the native one on the same inputs and reports the bytes that differ;
+- `DLSS5NR_GATE_CAPTURE=<kernel>` (with `_DIR`, `_LAUNCH`, `_BYTES`): writes a launch's arguments and memory before
+  and after, for `kernels/tools/replay_gpu.py` and `ab_stage.py`;
+- `DLSS5NR_GATE_SWAP_KERNEL=<kernel>` with `_PTX`, `_DEBUG`, `_BLOCK`, `_LAUNCH`, `_OUT`: runs a patched copy of the
+  kernel's PTX for one launch and writes the debug buffer it fills (`kernels/tools/instrument_ptx.py`);
+- `DLSS5NR_GATE_SKIP=<kernel>`: does not launch it.
+
+A manifest line may carry `waves=N`, which launches that native kernel with N waves per block instead of the PTX's.
+A gate older than the manifest ignores such a line and leaves its kernel translated, which is slower and shows
+nowhere but in `gate.log`: ship the two together.

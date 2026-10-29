@@ -306,6 +306,13 @@ problem.
   be the original signed files: builds patched to run on older NVIDIA cards cannot be translated.
 - **Super resolution kernels:** `python kernels\build_sr_kernels.py` (the AMD HIP SDK and a d4r
   checkout, see its header) writes `kernels\sr\`, which `package.py` takes.
+- **Frame generation kernels:** `python kernels\build_fg_kernels.py`.
+- **Ray reconstruction kernels:** `python kernels\build_rr_kernels.py` builds `rr2_stage.hsaco`, the stage
+  fourteen of the network's kernels share, and, from `third_party\nvngx_dlssd.dll`, the first encoder and the last
+  decoder, whose gather of features and whose outputs are translated from the library's own code at build time
+  (they are never in the repository: see `kernels\README.md`). Without the library only the stage is built and
+  those two kernels run translated. `package.py` refuses a package whose generated kernels were made from another
+  build of the library than the one it ships.
 - **Package:** `python package.py --zluda <ZLUDA build> --optiscaler <OptiScaler
   build>` puts everything, the network and the translation cache included,
   into `dist\`.
@@ -348,10 +355,18 @@ The script builds the cache for the generic targets of RDNA2, RDNA3 and
 RDNA4, and, for the neural rendering network only, for gfx1100 and gfx1101, since those cards get
 some custom optimizations. `--only fb_046,fb_047` translates just the modules whose numbers (those of
 the library: name it too) it lists, which is how a cache is refilled after a change that touched a few
-of them; a module whose PTX did not change keeps its row, but the rows are keyed by the ZLUDA commit,
-so a new commit means rows to re-key (their `zluda_version` column) or a full run. You can choose which targets to build by editing
+of them. You can choose which targets to build by editing
 `NATIVE_TARGETS` and `GENERIC_TARGETS` in the script, or with `--targets`
 (which builds every target it names without those optimizations).
+
+The rows are keyed by the ZLUDA commit, so moving to a newer ZLUDA does not need the hours of a full run when the
+commits in between left the lowering of most instructions alone. What they changed is stated in the commit
+messages; the modules that matter are the ones with texture or surface instructions (the upscalers and the frame
+generation), which have to be translated again, with `prepare_cache.py --only` into a cache of their own.
+`runtime\tools\rekey_cache.py <old> <new>` then carries the rows of every other module over, replacing the version
+they are keyed by. Check the result by running each harness (`dlss5up_harness` for `sr` and `rr`,
+`dlss5nr_harness`, `dlss5nr_fg_harness` with `FG_HARNESS_DIST=1`) against a copy of the package, without
+`DLSS5NR_ALLOW_TRANSLATION`: a module that is missing fails at once, a module that is wrong shows in the picture.
 
 ## Contributing
 
