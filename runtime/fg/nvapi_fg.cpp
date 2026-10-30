@@ -451,9 +451,20 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommitted(ID3D12Device *self, const D3D12_HEA
     // The memory of what the library makes is imported into HIP, which needs it shared. The library's textures
     // are, and its buffers may not be.
     D3D12_HEAP_FLAGS shared = flags;
+    D3D12_RESOURCE_DESC padded;
     if (!g_copy && heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
-        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
         shared = flags | D3D12_HEAP_FLAG_SHARED;
+        // CreateSharedHandle refuses a small shared buffer on some devices (E_INVALIDARG; measured in Cyberpunk 2077
+        // through Streamline: 2 MB is refused, 7.4 MB accepted, the limit between is not known), so a small buffer is
+        // made this large. The library only addresses what it asked for.
+        constexpr UINT64 kShareableMinimum = 8u << 20;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc->Width < kShareableMinimum) {
+            padded = *desc;
+            padded.Width = kShareableMinimum;
+            desc = &padded;
+        }
+    }
     HRESULT r = o_CreateCommitted(self, heap, shared, desc, state, clear, riid, out);
     if (FAILED(r) && shared != flags) r = o_CreateCommitted(self, heap, flags, desc, state, clear, riid, out);
     if (SUCCEEDED(r) && out && *out) {
@@ -546,7 +557,15 @@ bool shared_handle(ID3D12Resource *resource, HANDLE *out) {
     ComPtr<ID3D12Device> device;
     if (FAILED(resource->GetDevice(IID_PPV_ARGS(device.GetAddressOf())))) return false;
     const HRESULT r = device->CreateSharedHandle(resource, nullptr, GENERIC_ALL, nullptr, out);
-    if (FAILED(r)) say("CreateSharedHandle failed: 0x%08x", (unsigned)r);
+    if (FAILED(r)) {
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        D3D12_HEAP_PROPERTIES got{};
+        D3D12_HEAP_FLAGS got_flags = D3D12_HEAP_FLAG_NONE;
+        resource->GetHeapProperties(&got, &got_flags);
+        say("CreateSharedHandle failed: 0x%08x (dimension %d, %llux%u, format %d, flags 0x%x, heap flags 0x%x)", (unsigned)r,
+            (int)desc.Dimension, (unsigned long long)desc.Width, desc.Height, (int)desc.Format, (unsigned)desc.Flags,
+            (unsigned)got_flags);
+    }
     return SUCCEEDED(r);
 }
 
@@ -733,8 +752,9 @@ Image *image_of(ID3D12Resource *resource, DXGI_FORMAT view_format) {
     image.alive = watch(resource);
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1) {
-        say("a texture the library uses is not a plain 2D one (dimension %d, %u layers)", (int)desc.Dimension,
-            (unsigned)desc.DepthOrArraySize);
+        say("a texture the library uses is not a plain 2D one (dimension %d, %u layers, %llux%u, view format %d, format %d, flags 0x%x)",
+            (int)desc.Dimension, (unsigned)desc.DepthOrArraySize, (unsigned long long)desc.Width, desc.Height, (int)view_format,
+            (int)desc.Format, (unsigned)desc.Flags);
         image.failed = true;
         return nullptr;
     }
