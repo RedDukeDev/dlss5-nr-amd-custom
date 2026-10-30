@@ -89,19 +89,38 @@ bool make_image(ID3D12Device *device, SharedImage &image, uint32_t w, uint32_t h
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = w;
-    desc.Height = h;
+    // CreateSharedHandle refuses with E_INVALIDARG a shared resource under about 2 MB on some devices (measured in
+    // Cyberpunk 2077, through Streamline: 512x512 RGBA16F is accepted, 512x512 R32_FLOAT and R16_FLOAT, and 64x64,
+    // are not). The one texel of the exposure is that small, so no allocation is below this; the network still
+    // imports it at the size asked for (the first texel is at the start whatever the layout).
+    constexpr uint32_t kMinimumSide = 1024;
+    desc.Width = std::max(w, kMinimumSide);
+    desc.Height = std::max(h, kMinimumSide);
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(device->CreateCommittedResource(&heap, g_copy ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_SHARED, &desc,
-                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&image.resource))))
+    HRESULT hr = device->CreateCommittedResource(&heap, g_copy ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_SHARED, &desc,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&image.resource));
+    if (FAILED(hr)) {
+        log_to_host(0, "texture %ux%u format %d: CreateCommittedResource failed 0x%08x (device removed reason 0x%08x)", w, h,
+                    (int)format, (unsigned)hr, (unsigned)device->GetDeviceRemovedReason());
         return false;
+    }
     if (!g_copy) {
         HANDLE handle = nullptr;
-        if (FAILED(device->CreateSharedHandle(image.resource, nullptr, GENERIC_ALL, nullptr, &handle))) return false;
+        hr = device->CreateSharedHandle(image.resource, nullptr, GENERIC_ALL, nullptr, &handle);
+        if (FAILED(hr)) {
+            D3D12_HEAP_PROPERTIES got{};
+            D3D12_HEAP_FLAGS got_flags = D3D12_HEAP_FLAG_NONE;
+            image.resource->GetHeapProperties(&got, &got_flags);
+            const D3D12_RESOURCE_DESC made = image.resource->GetDesc();
+            log_to_host(0, "texture %ux%u format %d: CreateSharedHandle failed 0x%08x (heap flags 0x%x, resource %llux%u, flags 0x%x, device %p)",
+                        w, h, (int)format, (unsigned)hr, (unsigned)got_flags, (unsigned long long)made.Width, made.Height,
+                        (unsigned)made.Flags, (void *)device);
+            return false;
+        }
         image.nt_handle = handle;
     }
     image.width = w;
