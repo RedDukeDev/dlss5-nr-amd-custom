@@ -235,6 +235,9 @@ script prints. `--bridge=y|n` answers the question from the command line, and `r
 
 Note: some games, like for example Hogwarts Legacy, may need OverlayMenu=false in OptiScaler.ini to work on Linux
 
+Note for Ubuntu Users: Ubuntu 26.04's own ROCm 7.1 packages install libamdhip64.so.7 into /usr/lib/x86_64-linux-gnu. Steam's container replaces the host /usr, so that copy isn't usable from the game. 
+A workarond for that is placing the self-contained TheRock tarball in /opt/rocm.
+
 ## Settings
 
 All in the *Neural Rendering* tab of the menu, also shown in the *Custom* tab:
