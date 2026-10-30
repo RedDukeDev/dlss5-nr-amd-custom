@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <share.h>
 #include <emmintrin.h>
+#include <intrin.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -1970,6 +1971,47 @@ NvAPI_Status __cdecl my_GetGraphicsCapabilities(void *device, uint32_t structVer
     return NVAPI_OK;
 }
 
+// The architecture NVIDIA's libraries are told they run on. ZLUDA's NVAPI answers one for everybody (Ada, and Blackwell for
+// the neural rendering); here it is chosen for each library by what the process asks for: DLSS5NR_ARCH_UPSCALER (super
+// resolution and ray reconstruction), DLSS5NR_ARCH_FG and DLSS5NR_ARCH_NEURAL, a number, decimal or 0x-prefixed hex (Ada
+// is 0x190, Blackwell 0x1B0). A library whose variable is not set keeps ZLUDA's answer.
+constexpr uint32_t kNvapiGetArchInfo = 0xd8265d24;
+typedef NvAPI_Status(__cdecl *GetArchInfoFn)(void *, uint32_t *);
+GetArchInfoFn g_real_arch_info = nullptr;
+
+uint32_t architecture_from_environment(const wchar_t *name) {
+    wchar_t value[32];
+    const DWORD n = GetEnvironmentVariableW(name, value, 32);
+    if (!n || n >= 32) return 0;
+    return (uint32_t)wcstoul(value, nullptr, 0);
+}
+
+__declspec(noinline) NvAPI_Status __cdecl my_GetArchInfo(void *gpu, uint32_t *info) {
+    const NvAPI_Status status = g_real_arch_info ? g_real_arch_info(gpu, info) : NVAPI_ERROR;
+    if (status != NVAPI_OK || !info) return status;
+    // The module that asked, by the return address: the architecture is not the same for each library.
+    HMODULE caller = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)_ReturnAddress(), &caller) ||
+        !GetModuleFileNameW(caller, path, MAX_PATH))
+        return status;
+    std::wstring name = path;
+    name = name.substr(name.find_last_of(L"\\/") + 1);
+    for (wchar_t &c : name) c = (wchar_t)towlower(c);
+    const wchar_t *variable = nullptr;
+    if (name.find(L"dlssnr") != std::wstring::npos) variable = L"DLSS5NR_ARCH_NEURAL";
+    else if (name.find(L"dlssg") != std::wstring::npos) variable = L"DLSS5NR_ARCH_FG";
+    else if (name.find(L"dlss") != std::wstring::npos) variable = L"DLSS5NR_ARCH_UPSCALER";
+    if (!variable) return status;
+    const uint32_t wanted = architecture_from_environment(variable);
+    if (wanted && info[1] != wanted) {
+        say("architecture for %ls: 0x%x, told 0x%x", name.c_str(), (unsigned)info[1], (unsigned)wanted);
+        info[1] = wanted;
+    }
+    return status;
+}
+
 struct Override {
     uint32_t id;
     void *function;
@@ -1996,6 +2038,10 @@ const Override kOverrides[] = {
 } // namespace
 
 extern "C" __declspec(dllexport) void *nvapi_QueryInterface(uint32_t id) {
+    if (id == kNvapiGetArchInfo && g_real) {
+        if (!g_real_arch_info) g_real_arch_info = (GetArchInfoFn)g_real(id);
+        if (g_real_arch_info) return (void *)my_GetArchInfo;
+    }
     for (const Override &o : kOverrides)
         if (o.id == id) { say("QueryInterface(0x%08x): answered here", id); return o.function; }
     void *real = g_real ? g_real(id) : nullptr;

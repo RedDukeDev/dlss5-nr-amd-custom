@@ -157,6 +157,14 @@ In OptiScaler the library can be driven by the game's own DLSS-G (`FGInput=Nvngx
 generation, XeFG (the game's depth and motion vectors come from its tags) or the upscaler. The FSR-FG swapchain
 paces the frames and the library makes them, with no Streamline of OptiScaler's.
 
+The architecture NVIDIA's libraries are told they run on is chosen for each of them by the stand-in NVAPI, from the
+module that asks (`NvAPI_GPU_GetArchInfo`): `DLSS5NR_ARCH_UPSCALER` for super resolution and ray reconstruction,
+`DLSS5NR_ARCH_FG` for the frame generation and `DLSS5NR_ARCH_NEURAL` for the neural rendering, a number (Ada is `0x190`,
+Blackwell `0x1B0`). A library whose variable is unset keeps ZLUDA's answer (Ada, and Blackwell for the neural rendering,
+which refuses to run below it). OptiScaler sets them from `DeclaredGpu` in `[ZludaDlss]`, `[FrameGen]` and
+`[NeuralRendering]`, Blackwell by default; with Blackwell the frame generation offers up to five generated frames (6X),
+with Ada one.
+
 Every launch of the library goes on one stream of the stand-in's own, native or translated: the upscalers of the
 same process run with a default stream per thread (`ZLUDA_PER_THREAD_STREAM`), and launches split between that and
 HIP's null stream do not wait for each other (the generated frame comes out black, with no error).
