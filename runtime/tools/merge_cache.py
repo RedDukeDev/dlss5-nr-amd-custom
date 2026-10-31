@@ -38,7 +38,7 @@ def main():
     if mine != theirs:
         raise SystemExit("the caches come from different ZLUDA builds (%s and %s)" % (sorted(mine), sorted(theirs)))
 
-    backup = os.path.join(os.path.dirname(into.rstrip("\/")), "zluda2.db.before-merge")
+    backup = os.path.join(os.path.dirname(into.rstrip("\\/")), "zluda2.db.before-merge")
     shutil.copyfile(destination, backup)
     connection = sqlite3.connect(destination)
     before = connection.execute("SELECT COUNT(*) FROM modules").fetchone()[0]

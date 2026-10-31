@@ -96,7 +96,9 @@ Beside the neural rendering's files the `dlss5nr` folder then holds `nvngx_dlss.
 beside the neural rendering). `kernels\kernels_sr.txt` lists the native kernels
 (`kernels\build_sr_kernels.py` in the repository, from d4r's sources): the eleven layers of preset K and the five Swin
 blocks of presets L and M. One cache holds all the networks' translations
-(`tools\prepare_cache.py` for each, merged).
+(`tools\prepare_cache.py` for each, merged). The shipped cache serves five targets: `gfx10-3-generic`
+(RDNA2), `gfx11-generic` (RDNA3), `gfx12-generic` (RDNA4) for every module, plus the exact `gfx1100` and
+`gfx1101` for the neural rendering's; `prepare_cache.py --native` names the exact ones.
 
 What was measured on an RX 7900 XT, 960x540 to 1920x1080:
 

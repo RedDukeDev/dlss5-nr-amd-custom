@@ -123,6 +123,14 @@ EXIT_TRANSLATED_FOR_ANOTHER_GPU = 2
 # the real figure, which is how this number gets corrected.
 PEAK_PER_JOB_MB = 2600
 
+# What the translations seen so far really held, at most. The modules are translated largest first, so what the
+# first of them reached is a ceiling for the rest: once a few have finished, the figure above (the worst case a
+# library could have) gives way to this one, and more translations run at once. See assumed_peak_mb.
+OBSERVED_PEAK_MB = 0
+FINISHED_UNITS = 0
+UNITS_TO_LEARN_FROM = 8
+FLOOR_PER_JOB_MB = 800
+
 # What to leave for everything else. This runs for a long time and nobody should
 # have to stop using the machine for it.
 RESERVE_MB = 3000
@@ -270,6 +278,13 @@ def process_memory_mb(handle):
             counters.PeakPagefileUsage // mb)
 
 
+def assumed_peak_mb():
+    """What a translation about to start is taken to claim, at most."""
+    if FINISHED_UNITS >= UNITS_TO_LEARN_FROM and OBSERVED_PEAK_MB:
+        return min(PEAK_PER_JOB_MB, max(FLOOR_PER_JOB_MB, int(OBSERVED_PEAK_MB * 1.5)))
+    return PEAK_PER_JOB_MB
+
+
 def room_for_another(running):
     """Whether to start one more translation right now.
 
@@ -289,8 +304,9 @@ def room_for_another(running):
     free_mb = free_physical_mb()
     if not free_mb:
         return len(running) < 2          # no reading available: stay cautious
-    still_to_claim = sum(max(0, PEAK_PER_JOB_MB - unit.memory_mb()) for unit in running)
-    return free_mb - RESERVE_MB - still_to_claim >= PEAK_PER_JOB_MB
+    peak = assumed_peak_mb()
+    still_to_claim = sum(max(0, peak - unit.memory_mb()) for unit in running)
+    return free_mb - RESERVE_MB - still_to_claim >= peak
 
 
 def describe_exit(code):
@@ -454,6 +470,7 @@ class Unit:
         self.log = None
         self.started = 0.0
         self.retry = False
+        self.peak_seen = 0
 
     def environment(self, base):
         environment = dict(base)
@@ -558,10 +575,14 @@ def run_units(units, driver, ceiling, base_environment):
             time.sleep(0.25)
 
             for unit in list(running):
+                unit.peak_seen = max(unit.peak_seen, unit.memory_mb())
                 outcome = unit.finished()
                 if outcome is None:
                     continue
                 running.remove(unit)
+                global OBSERVED_PEAK_MB, FINISHED_UNITS
+                OBSERVED_PEAK_MB = max(OBSERVED_PEAK_MB, unit.peak_seen)
+                FINISHED_UNITS += 1
                 ok, note = outcome
                 done += 1
                 if not ok:
@@ -675,6 +696,8 @@ def main():
     parser.add_argument("--targets", help="comma-separated GPU targets for every library, overriding the "
                                           "defaults (neural rendering: the exact RDNA3 parts and the generic "
                                           "families; the upscalers: the generic families)")
+    parser.add_argument("--native", help="comma-separated exact GPU targets of the neural rendering, replacing "
+                                         "the default ones (gfx1100,gfx1101): to build only what a cache lacks")
     parser.add_argument("--jobs", type=int, default=0,
                         help="how many translations at once; 0 (the default) decides from the "
                              "machine, 1 reproduces the old strictly sequential behaviour")
@@ -714,6 +737,8 @@ def main():
               "would change the shipped code unnoticed" % ", ".join(stray))
 
     override = [x.strip() for x in arguments.targets.split(",") if x.strip()] if arguments.targets else None
+    native_targets = NATIVE_TARGETS if arguments.native is None else [
+        x.strip() for x in arguments.native.split(",") if x.strip()]
 
     # Per library: the exact parts (fused) and the generic families the neural rendering gets, the
     # generic families alone for the upscalers.
@@ -727,7 +752,7 @@ def main():
         if override is not None:
             native, generic = [], override
         elif stem.lower() == "nvngx_dlssnr":
-            native, generic = NATIVE_TARGETS, GENERIC_TARGETS
+            native, generic = native_targets, GENERIC_TARGETS
         else:
             native, generic = [], GENERIC_TARGETS
         modules = extract_modules(network, os.path.join(modules_dir, stem))
