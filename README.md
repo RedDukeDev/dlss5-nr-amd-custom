@@ -1,4 +1,4 @@
-# DLSS 5 Neural Rendering on AMD - Featuring asyncronous mode (almost no performance loss!) and Linux support
+# DLSS 5 Neural Rendering on AMD - Featuring asynchronous mode (almost no performance loss!) and Linux support
 
 <img width="1536" height="1024" alt="dlss5-nr-amd-custom" src="https://github.com/user-attachments/assets/7edfd671-d3f4-46e7-abd2-70636220dfcb" />
 
@@ -15,20 +15,22 @@ replaced by hand-written HIP kernels that produce the same bytes. A runtime
 drives it beside the game, and a fork of OptiScaler hands the runtime the
 game's frame.
 
-Also, instead of waiting for the dlss network to finish, this implementation is able to run it in an asyncrous way, resulting in a huge perfomance gain over existing implementations.
+Also, instead of waiting for the dlss network to finish, this implementation is able to run it in an asynchronous way, resulting in a huge performance gain over existing implementations.
 More infos in [DESIGN.md](docs/DESIGN.md)
 
 The upscaler side (super resolution and ray reconstruction) builds on [d4r](https://github.com/countervolts/d4r)
 by countervolts (GPL-3): its native super resolution kernels and its command-list module are used here. See
 [THIRD_PARTY.md](THIRD_PARTY.md).
 
+Do ***NOT*** use this mod for multiplayer games, the anticheats can see it as a tampering attempt, resulting in a ban.
+
 ## Layout
 
-| folder | what | licence |
+| folder | what | license |
 |---|---|---|
 | [`kernels/`](kernels/) | the native HIP kernels, their verification tools and the research proxy they were built with | MIT |
 | [`runtime/`](runtime/) | `dlss5nr_runtime.dll` and its C interface, the gate in front of ZLUDA, our NGX host, the cache preparation tool, a test harness | MIT |
-| [`linux/`](linux/) | extra code for Linux support, read the "Linux" section in this redme | MIT |
+| [`linux/`](linux/) | extra code for Linux support, read the "Linux" section in this readme | MIT |
 | [`optiscaler/`](optiscaler/) | submodule: the fork of OptiScaler that calls the runtime | GPL-3.0 |
 | [`third_party/ZLUDA`](third_party/) | submodule: the fork of ZLUDA the network runs on | MIT / Apache-2.0 |
 | [`third_party/d4r`](third_party/) | submodule: d4r, the source of the native super resolution kernels (only to build them) | GPL-3.0 |
@@ -47,9 +49,9 @@ async mode off ("Wait for the network" on).
 With async mode (enabled by default) this huge performance loss is almost gone
 
 Hardware-specific status:
-- **RDNA4** This implementration has been tested on RDNA3, it already should be able of take advantage of RDNA4 hardware FP8 features, but there bay still be some issues. Please report any problem you encounter.
+- **RDNA4** This implementation has been tested on RDNA3, it already should be able of take advantage of RDNA4 hardware FP8 features, but there bay still be some issues. Please report any problem you encounter.
 - **RDNA3** Should be fine, but current code has some custom optimizations for gfx1100 and gfx1101 targets, different RDNA3 gpus can behave slightly differently.
-- **RDNA2** RDNA2 gpus should be in theory able to run dlss5 too, but the performance impact is huge. Async mode could make dlss5 osable there, but there also can be too much artifacts to be enjoyable, 
+- **RDNA2** RDNA2 gpus should be in theory able to run dlss5 too, but the performance impact is huge. Async mode could make dlss5 usable there, but there also can be too much artifacts to be enjoyable, 
 
 ## Requirements
 
@@ -58,7 +60,7 @@ Hardware-specific status:
   DXVK, which is included (see *Older Direct3D* below)
 - A 64-bit game, or a 32-bit Direct3D 9 or 11 one through the bridge (see *32-bit games* below)
 - The AMD HIP SDK for Windows, if using Windows.
-- ROCm if using Linux.
+- ROCm if using Linux. The last build from TheRock is recommended, see "Linux" section below
 
 ## How to use it
 
@@ -113,7 +115,7 @@ An HDR10 image is not supported in this mode; SDR and scRGB are.
 
 ## Direct3D 11
 
-A Direct3D 11 game goes through OptiScaler's Direct3D 11 to 12 bridge: the colour, depth and motion
+A Direct3D 11 game goes through OptiScaler's Direct3D 11 to 12 bridge: the color, depth and motion
 vectors are copied to textures shared with a Direct3D 12 device, the runtime works there, and the
 result is copied back. It costs the game about 0.2 to 0.3 ms a frame at 1080p. It works with the
 game's upscaler, whichever of OptiScaler's Direct3D 11 backends is selected (the native FSR 2.2 and
@@ -167,7 +169,7 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
 
 ### DXVK comes with the package
 
-DXVK 3.1.1 (zlib licence; the exact files and their hashes are listed in `dxvk/README.txt`) is in the
+DXVK 3.1.1 (zlib license; the exact files and their hashes are listed in `dxvk/README.txt`) is in the
 `dxvk` folder of the package, so there is nothing to download. `setup_windows.bat` takes care of it:
 
 1. Run it in the game's folder as usual. It asks whether the game is an old one, Direct3D 9 or 10 (answer 1,
@@ -219,7 +221,7 @@ bridge32/build.py` builds the client and the helper; `bridge32/README.txt` is th
 ## Linux 
 
 The project also supports DX12 games running on Linux using Proton. 
-The setup_linux.sh script should altready copy the required files, 
+The setup_linux.sh script should already copy the required files, 
 but you also have to change the launch options to include the launch.sh script included into the "linux" folder.
 On steam, add %command% after the linux.sh path
 
@@ -235,8 +237,9 @@ script prints. `--bridge=y|n` answers the question from the command line, and `r
 
 Note: some games, like for example Hogwarts Legacy, may need OverlayMenu=false in OptiScaler.ini to work on Linux
 
-Note for Ubuntu Users: Ubuntu 26.04's own ROCm 7.1 packages install libamdhip64.so.7 into /usr/lib/x86_64-linux-gnu. Steam's container replaces the host /usr, so that copy isn't usable from the game. 
-A workarond for that is placing the self-contained TheRock tarball in /opt/rocm.
+### Note for ROCm install: 
+Many users reported issues with the version of ROCm installed in their systems, i reccomend using the last version from [TheRock](https://github.com/ROCm/TheRock).
+For ArchLinux and derivates, like CachyOs, you can use the packages by luciddream, from the AUR (example: https://aur.archlinux.org/packages/rocm-gfx120x-bin. MAKE SURE TO PICK THE RIGHT VERSION FOR YOUR OWN HARDWARE)
 
 ## Settings
 
@@ -398,7 +401,7 @@ Any PR posted without a proper explanation will be rejected
 Yes, i'm aware of that project, but that's totally unrelated to mine. 
 Since there's no code available, i really can't tell how the two projects differ.
 
-### Can the asyncronous approach be used on Nvidia too?
+### Can the asynchronous approach be used on Nvidia too?
 
 Likely, but i'm not currently able to test that.
 Feel free to re-implement the idea on nvidia-related projects
