@@ -523,8 +523,10 @@ int wmain(int argc, wchar_t **argv) {
         p->Set("DLSSG.OrthoProjection", 0u);
     }
     p->Set("DLSSG.BackbufferFormat", (unsigned)g_format);
-    p->Set("DLSSG.MultiFrameCountMax", 1u);
-    p->Set("DLSSG.MultiFrameCount", 1u);
+    // FG_HARNESS_MULTI=<n>: n generated frames for each real one (the library is evaluated n times a frame, index 1 to n)
+    const unsigned multi = _wgetenv(L"FG_HARNESS_MULTI") ? (unsigned)_wtoi(_wgetenv(L"FG_HARNESS_MULTI")) : 1u;
+    p->Set("DLSSG.MultiFrameCountMax", multi);
+    p->Set("DLSSG.MultiFrameCount", multi);
     p->Set("CreationNodeMask", 1u);
     p->Set("VisibilityNodeMask", 1u);
 
@@ -662,7 +664,7 @@ int wmain(int argc, wchar_t **argv) {
             set_subrect(p, "UI", width, height);
         }
         p->Set("DLSSG.Reset", frame == 0 ? 1 : 0);
-        p->Set("DLSSG.MultiFrameCount", 1u);
+        p->Set("DLSSG.MultiFrameCount", multi);
         p->Set("DLSSG.MultiFrameIndex", 1u);
         p->Set("DLSSG.MvecScaleX", 1.0f);
         p->Set("DLSSG.MvecScaleY", 1.0f);
@@ -746,10 +748,53 @@ int wmain(int argc, wchar_t **argv) {
                     for (int c = 0; c < 3; ++c) mean[c] += shot[i * 4 + c];
                 const double n = (double)width * height;
                 printf("          output mean rgb %.1f %.1f %.1f\n", mean[0] / n, mean[1] / n, mean[2] / n);
+                if (multi > 1) {
+                    double sx = 0, dn = 0;
+                    for (uint32_t y = 0; y < height; ++y)
+                        for (uint32_t x = 0; x < width; ++x) {
+                            const uint8_t *px = &shot[((size_t)y * width + x) * 4];
+                            if (px[0] > 220 && px[1] > 200 && px[2] < 110) { sx += x; ++dn; }
+                        }
+                    printf("          index 1 of %u: disc at x=%.0f (%.0f pixels)\n", multi, dn ? sx / dn : -1.0, dn);
+                }
                 wchar_t name[MAX_PATH];
-                swprintf(name, MAX_PATH, L"%sfg_out_%d.png", dir.c_str(), frame);
+                swprintf(name, MAX_PATH, L"%lsfg_out_%d.png", dir.c_str(), frame);
                 write_png(name, shot.data(), width, height);
             }
+        }
+        for (unsigned index = 2; index <= multi; ++index) {
+            p->Set("DLSSG.MultiFrameIndex", index);
+            p->Set("DLSSG.Reset", 0);
+            if (!gpu.open()) return 1;
+            const auto again = std::chrono::steady_clock::now();
+            for (ID3D12Resource *in : {color.Get(), hudless.Get(), depth.Get(), motion.Get()})
+                barrier(gpu.list.Get(), in, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier(gpu.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            r = session_evaluate(gpu.list.Get(), feature, p, nullptr,
+                                 (int32_t(*)(ID3D12GraphicsCommandList *, const void *, NVSDK_NGX_Parameter *, void *))ngx_evaluate);
+            for (ID3D12Resource *in : {color.Get(), hudless.Get(), depth.Get(), motion.Get()})
+                barrier(gpu.list.Get(), in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            barrier(gpu.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            if (!NVSDK_NGX_SUCCEED(r)) { printf("[FAIL] EvaluateFeature, frame %d index %u -> 0x%08x\n", frame, index, r); return 1; }
+            if (!gpu.run()) return 1;
+            std::vector<uint8_t> shot;
+            if (read_back(gpu, output.Get(), shot)) {
+                shot = from_format(std::move(shot));
+                double sx = 0, n = 0, mean = 0;
+                for (uint32_t y = 0; y < height; ++y)
+                    for (uint32_t x = 0; x < width; ++x) {
+                        const uint8_t *px = &shot[((size_t)y * width + x) * 4];
+                        mean += px[0] + px[1] + px[2];
+                        if (px[0] > 220 && px[1] > 200 && px[2] < 110) { sx += x; ++n; }
+                    }
+                printf("          index %u of %u: %.2f ms, disc at x=%.0f (%.0f pixels), mean %.1f\n", index, multi,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - again).count(),
+                       n ? sx / n : -1.0, n, mean / ((double)width * height * 3));
+                wchar_t name[MAX_PATH];
+                swprintf(name, MAX_PATH, L"%lsfg_out_%d_%u.png", dir.c_str(), frame, index);
+                write_png(name, shot.data(), width, height);
+            }
+            p->Set("DLSSG.MultiFrameIndex", 1u);
         }
         fflush(stdout);
         if (frame >= 2) { total += ms; ++timed; }

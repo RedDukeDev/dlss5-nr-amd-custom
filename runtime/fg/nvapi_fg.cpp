@@ -1986,14 +1986,20 @@ uint32_t architecture_from_environment(const wchar_t *name) {
     return (uint32_t)wcstoul(value, nullptr, 0);
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define ARCH_CALLER_ADDRESS() __builtin_return_address(0)
+#else
+#define ARCH_CALLER_ADDRESS() _ReturnAddress()
+#endif
+
 __declspec(noinline) NvAPI_Status __cdecl my_GetArchInfo(void *gpu, uint32_t *info) {
     const NvAPI_Status status = g_real_arch_info ? g_real_arch_info(gpu, info) : NVAPI_ERROR;
-    if (status != NVAPI_OK || !info) return status;
+    if (status != NVAPI_OK || !info) { say("architecture query failed: %d", (int)status); return status; }
     // The module that asked, by the return address: the architecture is not the same for each library.
     HMODULE caller = nullptr;
     wchar_t path[MAX_PATH] = {};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCWSTR)_ReturnAddress(), &caller) ||
+                            (LPCWSTR)ARCH_CALLER_ADDRESS(), &caller) ||
         !GetModuleFileNameW(caller, path, MAX_PATH))
         return status;
     std::wstring name = path;
@@ -2008,6 +2014,47 @@ __declspec(noinline) NvAPI_Status __cdecl my_GetArchInfo(void *gpu, uint32_t *in
     if (wanted && info[1] != wanted) {
         say("architecture for %ls: 0x%x, told 0x%x", name.c_str(), (unsigned)info[1], (unsigned)wanted);
         info[1] = wanted;
+    }
+    return status;
+}
+
+// Which of the machine's GPUs is the D3D12 device's, as NVIDIA's libraries find out: NvAPI_GPU_GetLogicalGpuInfo gives the
+// adapter's LUID (pOSAdapterId, at +8 of NV_LOGICAL_GPU_DATA), and a library compares it with its device's before it asks
+// that GPU's architecture. ZLUDA's answer is the CUDA device's LUID, which is the same on Windows. Under Wine the HIP
+// runtime under CUDA has no DXGI LUID to give, and a library whose LUID matches no GPU keeps an architecture of its own
+// (the frame generation takes a default that lets it make one frame only). The device's own LUID is what is wanted.
+// The lower case file name of the module that holds an address ("" when it cannot be told).
+std::wstring module_name_of(void *address) {
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)address, &module) ||
+        !GetModuleFileNameW(module, path, MAX_PATH))
+        return L"";
+    std::wstring name = path;
+    name = name.substr(name.find_last_of(L"\\/") + 1);
+    for (wchar_t &c : name) c = (wchar_t)towlower(c);
+    return name;
+}
+
+constexpr uint32_t kNvapiGetLogicalGpuInfo = 0x842b066e;
+typedef NvAPI_Status(__cdecl *GetLogicalGpuInfoFn)(void *, uint8_t *);
+GetLogicalGpuInfoFn g_real_logical_gpu_info = nullptr;
+ComPtr<ID3D12Device> g_luid_device;
+
+__declspec(noinline) NvAPI_Status __cdecl my_GetLogicalGpuInfo(void *logical, uint8_t *data) {
+    const NvAPI_Status status = g_real_logical_gpu_info ? g_real_logical_gpu_info(logical, data) : NVAPI_ERROR;
+    if (status != NVAPI_OK || !data || !g_luid_device) return status;
+    // Only the frame generation library compares it with the D3D12 device's: the others (the upscalers, the neural
+    // rendering) have no D3D12 device of the game's to match, and ask with the CUDA device's LUID, which is what they get.
+    if (module_name_of(ARCH_CALLER_ADDRESS()).find(L"dlssg") == std::wstring::npos) return status;
+    void *adapter_id = *(void **)(data + 8);
+    if (!adapter_id) return status;
+    const LUID luid = g_luid_device->GetAdapterLuid();
+    if (memcmp(adapter_id, &luid, sizeof luid)) {
+        say("the GPU's LUID: %08lx%08lx, told the device's %08lx%08lx", (unsigned long)((LUID *)adapter_id)->HighPart,
+            (unsigned long)((LUID *)adapter_id)->LowPart, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
+        memcpy(adapter_id, &luid, sizeof luid);
     }
     return status;
 }
@@ -2038,6 +2085,10 @@ const Override kOverrides[] = {
 } // namespace
 
 extern "C" __declspec(dllexport) void *nvapi_QueryInterface(uint32_t id) {
+    if (id == kNvapiGetLogicalGpuInfo && g_real) {
+        if (!g_real_logical_gpu_info) g_real_logical_gpu_info = (GetLogicalGpuInfoFn)g_real(id);
+        if (g_real_logical_gpu_info) return (void *)my_GetLogicalGpuInfo;
+    }
     if (id == kNvapiGetArchInfo && g_real) {
         if (!g_real_arch_info) g_real_arch_info = (GetArchInfoFn)g_real(id);
         if (g_real_arch_info) return (void *)my_GetArchInfo;
@@ -2405,6 +2456,7 @@ extern "C" __declspec(dllexport) int fgnv_attach(ID3D12Device *device, RecordBou
     g_record_boundary = record;
     g_mark = mark;
     g_state = state;
+    g_luid_device = device;
     if (!attach_context()) return 0;
     if (g_copy) {
         static bool decided = false;
