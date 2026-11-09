@@ -39,10 +39,10 @@ The OkLab conversion uses the matrices published by Bjorn Ottosson
 
 ## DXVK
 
-`dxvk/x64` holds the 64-bit `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll` of DXVK 3.1.1
-(https://github.com/doitsujin/dxvk, zlib licence, in `dxvk/LICENSE`), unmodified, as released.
+`third_party/dxvk/x64` holds the 64-bit `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll` of DXVK 3.1.1
+(https://github.com/doitsujin/dxvk, zlib licence, in `third_party/dxvk/LICENSE`), unmodified, as released.
 They are shipped so that Direct3D 9 and 10 games can run on Vulkan and use the neural rendering;
-`dxvk/README.txt` says where they come from and how to check them.
+`third_party/dxvk/README.txt` says where they come from and how to check them.
 
 ## Dear ImGui
 

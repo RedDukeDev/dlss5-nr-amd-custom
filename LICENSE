@@ -20,6 +20,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-This licence covers kernels/, runtime/ and docs/. The optiscaler/ submodule is
+This licence covers kernels/, runtime/ and docs/. The third_party/optiscaler submodule is
 a fork of OptiScaler and is licensed under the GNU GPL version 3, as its
 upstream is. third_party/ZLUDA keeps its own licence (MIT or Apache-2.0).

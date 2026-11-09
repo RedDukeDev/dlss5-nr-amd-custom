@@ -12,7 +12,7 @@ the runtime there.
              its nvapi64.dll comes along
 --optiscaler the OptiScaler fork's build output (OptiScaler.dll and its files),
              copied to the top of the package. Its setup_linux.sh and setup_windows.bat
-             are then replaced by the ones in optiscaler\\, the version this repository
+             are then replaced by the ones in third_party\\optiscaler\\, the version this repository
              points to: the build output keeps the copies it was last built with.
 --runtime    where dlss5nr_runtime.dll, zluda\\nvcuda.dll (the gate) and zluda\\nvngx.dll
              come from: runtime\\build\\bin, the Visual Studio build, unless it is
@@ -107,7 +107,7 @@ def package_dxvk(out):
     has no support for those of its own). setup_windows.bat copies what a game needs from here
     beside its executable, and Remove_OptiScaler.bat takes it away again. 64-bit only: so is
     OptiScaler."""
-    dxvk = os.path.join(ROOT, "dxvk")
+    dxvk = os.path.join(ROOT, "third_party", "dxvk")
     target = os.path.join(out, "dxvk")
     for name in ("d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"):
         copy(os.path.join(dxvk, "x64", name), os.path.join(target, "x64", name))
@@ -279,10 +279,10 @@ def main():
                 shutil.copytree(source, os.path.join(args.out, name), dirs_exist_ok=True)
             else:
                 shutil.copy2(source, os.path.join(args.out, name))
-        # The setup scripts come from optiscaler\\, the version this repository points to: the
+        # The setup scripts come from third_party\\optiscaler\\, the version this repository points to: the
         # build output keeps the copies it was last linked with.
         for script in ("setup_linux.sh", "setup_windows.bat"):
-            setup = os.path.join(ROOT, "optiscaler", script)
+            setup = os.path.join(ROOT, "third_party", "optiscaler", script)
             if os.path.isfile(setup):
                 shutil.copy2(setup, os.path.join(args.out, script))
 

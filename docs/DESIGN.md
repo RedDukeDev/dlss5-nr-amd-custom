@@ -6,9 +6,9 @@ why each piece has the shape it has.
 ## The pieces
 
 ```
-game ── OptiScaler (fork, optiscaler/) ──┐
-                                         │  C API (runtime/include/dlss5nr.h)
-                                         ▼
+game ── OptiScaler (fork, third_party/optiscaler/) ──┐
+                                                     │  C API (runtime/include/dlss5nr.h)
+                                                     ▼
                               dlss5nr_runtime.dll (runtime/core)
                                │            │
              D3D12: capture,   │            │  worker thread
@@ -338,6 +338,6 @@ composites against nothing and returns black.
 
 ## Licences
 
-`kernels/`, `runtime/` and `docs/` are MIT. `optiscaler/` is a fork of
+`kernels/`, `runtime/` and `docs/` are MIT. `third_party/optiscaler/` is a fork of
 OptiScaler and is GPL-3.0, like its upstream. `third_party/ZLUDA` keeps its
 own MIT/Apache-2.0 licence.

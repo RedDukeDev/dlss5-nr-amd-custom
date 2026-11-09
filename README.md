@@ -31,8 +31,9 @@ Do ***NOT*** use this mod for multiplayer games, the anticheats can see it as a 
 | [`kernels/`](kernels/) | the native HIP kernels, their verification tools and the research proxy they were built with | MIT |
 | [`runtime/`](runtime/) | `dlss5nr_runtime.dll` and its C interface, the gate in front of ZLUDA, our NGX host, the cache preparation tool, a test harness | MIT |
 | [`linux/`](linux/) | extra code for Linux support, read the "Linux" section in this readme | MIT |
-| [`optiscaler/`](optiscaler/) | submodule: the fork of OptiScaler that calls the runtime | GPL-3.0 |
+| [`third_party/optiscaler`](third_party/) | submodule: the fork of OptiScaler that calls the runtime | GPL-3.0 |
 | [`third_party/ZLUDA`](third_party/) | submodule: the fork of ZLUDA the network runs on | MIT / Apache-2.0 |
+| [`third_party/dxvk`](third_party/dxvk/) | DXVK as released (64-bit DLLs), shipped so Direct3D 9 and 10 games can use the runtime | zlib |
 | [`third_party/d4r`](third_party/) | submodule: d4r, the source of the native super resolution kernels (only to build them) | GPL-3.0 |
 | [`docs/`](docs/) | [design](docs/DESIGN.md) | MIT |
 

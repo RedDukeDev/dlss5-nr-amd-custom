@@ -3,7 +3,7 @@ rem Builds the frame generation harness with d4r's command hooks and MinHook com
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 cd /d %~dp0
 rem The OptiScaler fork to take d4r's hooks from: the submodule, or a working copy (set OPTI first).
-if not defined OPTI set OPTI=%~dp0..\..\optiscaler
+if not defined OPTI set OPTI=%~dp0..\..\third_party\optiscaler
 if not exist out mkdir out
 if not exist out\hook mkdir out\hook
 cl /nologo /O2 /MT /W3 /c /Fo:out\hook\ "%OPTI%\external\MinHook\src\hook.c" "%OPTI%\external\MinHook\src\buffer.c" "%OPTI%\external\MinHook\src\trampoline.c" "%OPTI%\external\MinHook\src\hde\hde64.c" /I"%OPTI%\external\MinHook\include" /I"%OPTI%\external\MinHook\src" || exit /b 1
