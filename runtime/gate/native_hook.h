@@ -94,6 +94,16 @@ struct Entry {
     //                       prep runs once per key; keys beyond N are prepared on every launch
     //   d4r_block_z         block z the native kernel is built for (more waves per window)
     //   d4r_grid_x          persistent kernels: this many workgroups in x
+    //   <entry>_post1 ..    phase kernels launched after this one, on the same stream and with the same
+    //                       arguments (preset K's bottleneck layer, dec5, runs as four). Each has u32
+    //                       globals d4r_postK_grid_x / _grid_y (0 = the launch's grid) and d4r_postK_block_x /
+    //                       _y / _z (0 = 32, 1, 1)
+    struct Post {
+        hipFunction_t fn = nullptr;
+        unsigned gx = 0, gy = 0, bx = 32, by = 1, bz = 1;
+    };
+    Post post[8];
+    unsigned post_count = 0;
     hipFunction_t prep = nullptr;
     unsigned prep_blocks = 0, block_z = 0, grid_x = 0, prep_slots = 0;
     long prep_key_offset = -1;
@@ -234,6 +244,25 @@ inline void read_prep_description(Entry &e, hipModule_t module) {
     read_u32_global(module, "d4r_block_z", e.block_z);
     read_u32_global(module, "d4r_grid_x", e.grid_x);
     if (e.prep_slots > 16) e.prep_slots = 16;
+    for (unsigned k = 1; k <= 8; ++k) {
+        char post_name[160];
+        snprintf(post_name, sizeof post_name, "%s_post%u", e.entry, k);
+        hipFunction_t post = nullptr;
+        if (r.module_get_function(&post, module, post_name) != 0 || !post) break;
+        Entry::Post &p = e.post[e.post_count++];
+        p.fn = post;
+        const struct { const char *field; unsigned *value; unsigned fallback; } fields[] = {
+            {"grid_x", &p.gx, 0}, {"grid_y", &p.gy, 0}, {"block_x", &p.bx, 32}, {"block_y", &p.by, 1},
+            {"block_z", &p.bz, 1}};
+        for (const auto &f : fields) {
+            char symbol[96];
+            snprintf(symbol, sizeof symbol, "d4r_post%u_%s", k, f.field);
+            unsigned value = 0;
+            read_u32_global(module, symbol, value);
+            *f.value = value ? value : f.fallback;
+        }
+    }
+    if (e.post_count) logf("[native] %s: %u phase kernels after it\n", e.kernel, e.post_count);
     if (e.prep || e.block_z || e.grid_x)
         logf("[native] %s: prep %u blocks, key at %ld, %u slots, block z %u, grid x %u\n", e.kernel,
              e.prep_blocks, e.prep_key_offset, e.prep_slots, e.block_z, e.grid_x);
@@ -426,6 +455,7 @@ inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, 
                 }
             }
         }
+        const unsigned launch_gx = gx, launch_gy = gy, launch_gz = gz;
         if (e.waves) bz = e.waves;
         if (e.block_z) bz = e.block_z;
         if (e.grid_x) { gx = e.grid_x; gy = 1; gz = 1; }
@@ -436,6 +466,20 @@ inline bool try_launch(const char *name, unsigned gx, unsigned gy, unsigned gz, 
                  launched);
             e.dead = true;
             return false;
+        }
+        // The phase kernels, back to back on the same stream. A grid of 0 keeps the launch's value (and the
+        // launch's z only then: a phase kernel with a grid of its own is two-dimensional)
+        for (unsigned k = 0; k < e.post_count; ++k) {
+            const Entry::Post &p = e.post[k];
+            const bool own_grid = p.gx != 0 || p.gy != 0;
+            const hipError_t phased = runtime().module_launch(
+                p.fn, p.gx ? p.gx : launch_gx, p.gy ? p.gy : launch_gy, own_grid ? 1 : launch_gz, p.bx, p.by, p.bz, 0,
+                effective_stream((hipStream_t)stream), nullptr, rebuilt);
+            if (phased != 0) {
+                logf("[native] %s: phase kernel %u -> %d, translation from here on\n", name, k + 1, phased);
+                e.dead = true;
+                return false;
+            }
         }
         ++e.launches;
         return true;
