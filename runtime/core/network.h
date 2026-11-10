@@ -192,8 +192,9 @@ public:
     bool copy_image_out(SharedImage &image, bool staged_by_list, std::string &error);
 
     // Runs the network once and waits for it: when this returns true the
-    // output holds the result.
-    bool evaluate(const EvaluateDesc &desc, std::string &error);
+    // output holds the result. synchronise false: the passes are only queued on the CUDA side, to be
+    // waited for with a fence (signal_fence after it), as for the upscalers. Copy mode always waits.
+    bool evaluate(const EvaluateDesc &desc, std::string &error, bool synchronise = true);
 
     // Super resolution and ray reconstruction (Kind::SuperResolution, Kind::RayReconstruction).
     // The feature is made again only when what it is made for changes.

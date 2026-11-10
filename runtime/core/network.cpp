@@ -918,7 +918,7 @@ void Network::release(SharedImage &t) {
     t.mipmapped_array = t.array = t.external_memory = nullptr;
 }
 
-bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
+bool Network::evaluate(const EvaluateDesc &d, std::string &error, bool synchronise) {
     Own &o = *own_;
     if (!o.feature) {
         error = "the network has no feature";
@@ -982,7 +982,11 @@ bool Network::evaluate(const EvaluateDesc &d, std::string &error) {
         p->Set(nr_param::Reset, (pass > 0 || d.reset) ? 1 : 0);
         p->Set(nr_param::LocalToneStrength, (pass > 0 && !d.keep_local_tone) ? 0.0f : d.controls.local_tone);
         if (!ngx_ok(o.ngx_evaluate(o.feature, p), "NVSDK_NGX_CUDA_EvaluateFeature", error)) return false;
-        if (!cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error)) return false;
+        // The passes follow each other on the stream; only the last is waited for, and not even that when the
+        // caller orders the GPU's work with a fence.
+        if ((synchronise || copy_mode_) && pass == passes - 1 &&
+            !cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize", error))
+            return false;
         source = target;
     }
     return !copy_mode_ || copy_out(d, error);

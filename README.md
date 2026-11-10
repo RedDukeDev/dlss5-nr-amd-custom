@@ -44,10 +44,10 @@ inside its frame, is in [docs/DESIGN.md](docs/DESIGN.md).
 
 There can be some artifacts in some scenarios, specially ghosting/trail effects.
 
-The raw performance should be comparable to other DLSS5 on AMD implementations, 
-for example on RDNA3 it runs at around 20 fps at 1440p with "Before the upsclaer" on and 
-async mode off ("Wait for the network" on).
-With async mode (enabled by default) this huge performance loss is almost gone
+The raw performance should be comparable to other DLSS5 on AMD implementations,
+for example on RDNA3 it runs at around 20 fps at 1440p with "Before the upsclaer" on and
+in the default mode, where every frame goes through the network in order.
+With *Asynchronous Mode* on this huge performance loss is almost gone
 
 Hardware-specific status:
 - **RDNA4** This implementation has been tested on RDNA3, it already should be able of take advantage of RDNA4 hardware FP8 features, but there bay still be some issues. Please report any problem you encounter.
@@ -109,7 +109,8 @@ If the game uses no upscaler, the network runs on the finished image instead,
 just before it is shown. Two things are different then:
 
 - There are no motion vectors, so the result cannot follow the scene: it
-  trails behind whatever moves. Turn on *Wait for the network* to avoid that (note: it introduces a huge performance loss).
+  trails behind whatever moves in *Asynchronous Mode*. The default mode, where every frame goes through the network in
+  order, avoids that (note: the frame rate is then the network's).
 - The game's own interface is part of the image, and is enhanced with it.
 
 An HDR10 image is not supported in this mode; SDR and scRGB are.
@@ -139,7 +140,7 @@ way; any value set there is respected.
   with the Direct3D 12 fences imported as timeline semaphores for the order between the two APIs.
   The menu is drawn after it, so it is not enhanced. As without an upscaler in Direct3D 12, there are no
   depth or motion vectors to follow, and the game's interface is part of the image: the result trails
-  behind what moves, which *Wait for the network* avoids at a cost in frame rate.
+  behind what moves in *Asynchronous Mode*, which the default mode avoids at a cost in frame rate.
 
 The first gives the better picture, at the cost of OptiScaler's copies of the upscaler's inputs and
 output, and is what `auto` chooses. Set a native one, `fsr22` for instance, to get the second.
@@ -152,7 +153,7 @@ upscaler both hold 60 fps. Not tested yet: HDR swapchains and window resizing.
 
 OptiScaler has no Direct3D 9 or 10 support of its own, and those games give no motion vectors (nor a
 depth that can be read) in any case: all there is is the finished image, so the result trails behind what
-moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that at a cost in frame rate).
+moves in *Asynchronous Mode*, as without an upscaler in Direct3D 12 (the default mode avoids that at a cost in frame rate).
 
 - **Direct3D 9 with DXVK** works: with DXVK's `d3d9.dll` beside the game, the game is a Vulkan one, and
   the Vulkan way above enhances its image. OptiScaler goes in under a name the game loads that DXVK does
@@ -251,13 +252,16 @@ All in the *Neural Rendering* tab of the menu, also shown in the *Custom* tab:
   lower quality. Off, it runs on the upscaled image.
 - **Without an upscaler** (on by default): lets the network run on the
   finished image when the game uses no upscaler.
-- **Wait for the network:** the game waits for the network on every frame and
-  the frame rate becomes the network's: use it with a low network resolution,
-  or before the upscaler. Each frame gets the answer for the frame before it,
-  carried along the motion vectors. **Apply on the same frame** (experimental,
-  off) makes the GPU wait inside the frame instead and applies the answer to
-  that very frame: nothing trails and the network keeps its history, which
-  steadies the detail, but every frame takes about twice as long.
+- **Asynchronous Mode** (off by default): off, every frame goes through the
+  network in order and its answer is applied to that very frame. Nothing trails
+  behind moving objects and the network keeps its history, which steadies the
+  detail, but the frame rate becomes the network's: use it with a low network
+  resolution, or before the upscaler. The game's command list is split where the
+  network runs, which needs the same hooks DLSS on AMD does. On, the network
+  runs beside the game, on its own, and its result is carried along the motion
+  vectors to the frame the game shows: the frame rate stays the game's, and the
+  image is enhanced as often as the network manages. *Follow motion*, *Network
+  history*, *Blend frames* and *Max age* are about this mode.
 - **Network resolution:** runs the network on a smaller copy of the image. Its
   cost follows its pixels. Not shown when running before the upscaler, where
   the image is the game's own render resolution.

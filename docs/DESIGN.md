@@ -190,46 +190,39 @@ An answer of the network for that very point, even an older one, beats a
 guess. What is left in the end is a patch with the right light and none of
 the network's detail, for as long as the next result takes.
 
-`wait_for_network` avoids most of it at the cost of the frame rate:
-`dlss5nr_present` waits for the frame's own result, every frame is composed
-with a result one frame old, and the game runs at the network's rate.
+The linear mode avoids all of it, at the cost of the frame rate (`dlss5nr_process_queue`; the default of
+OptiScaler's menu, whose *Asynchronous Mode* is what the text above describes). The frame goes through the network
+in order, the way the upscalers do (see the section on them): what the game recorded up to the image to enhance has
+been submitted to the queue (OptiScaler splits the game's command list there, with the module taken from d4r), and the
+runtime then puts three things on the queue itself. First the capture of the image, depth and motion vectors into the
+network's own textures. Then the network: the queue signals a fence value when the capture is done and waits for a second one, which
+the network's side signals when it has run, through one Direct3D 12 fence imported into CUDA as a semaphore. The
+network is run by a thread of the runtime that waits, on the CPU, for the first value and only then queues the network's
+kernels and the second signal. It has to be that way round: a wait for the game's queue queued on the network's side
+ahead of time (what the first version did) stops everything else that waits for that side to be idle, and the frame
+generation does, from inside the hook on the queue's submissions: the queue waited for the frame generation, which
+waited for the network's side, which waited for the queue (a freeze after minutes of play, at a change of size).
+The game's thread only queues, and spends about a tenth of a millisecond in the call. (Where the fence cannot be
+shared, under Wine when the textures cannot, the game's thread waits for the capture and for the network itself.) Then the composition of the answer into the very frame it was made from, as a luminance ratio against
+the capture, with no displacement map, no result carried to a later frame and nothing to fill in. What the host submits
+next comes after the whole of it. Every frame is captured and evaluated, so the network keeps its own history (the
+capture before is the previous frame, and the game's motion vectors lead back to it): without it every frame's detail
+is decided anew and flickers.
 
-`wait_inside` (experimental) avoids all of it: the game's command list itself
-waits for the network, so that its answer is composed into the frame it was made
-from, and the game runs at the network's rate. It is slower than the other, and
-here is why: the host learns that the capture is in place from a word the GPU
-writes, and that write stays in the GPU's cache for between ten and a couple of
-hundred milliseconds (every way of writing it that was tried: the command
-processor's marker, a shader's store or atomic, a copy), until the reads of the
-wait itself push it out; the network only starts when the host has seen it.
-Waiting on the GPU for the capture, from the network's side, would avoid it
-(not done). Every
-frame is captured, so the network's own history is kept (the capture before is
-the previous frame, and the game's motion vectors lead back to it): without it
-every frame's detail is decided anew and flickers. The game may record the next
-frame while the network works on this one, which hides the time the game itself
-takes; frames are answered in order, and none is passed over.
+No worker thread is in the way: the worker only prepares what a size or a setting needs (the images imported into CUDA,
+the network's feature built, which takes seconds, and one evaluation to get the first launches out of the way), and
+until it has, frames pass through as they came. A size or a setting that keeps changing is not followed frame by frame,
+as in the asynchronous mode. The network has one user at a time (`net_lock`): an evaluation of the asynchronous mode
+(a switch of modes while a result is being made) or a feature being built leaves the frames passing through.
 
-How the wait works. After the capture the list has the command processor write
-the capture's number into host memory (`WriteBufferImmediate`, which reaches
-memory at once, where a shader's write waits in the GPU's cache), and then a
-compute pass that reads lines of host memory, one after the other, until it
-finds that number. The worker thread, which was woken when the capture was
-recorded and looks for the number, runs the network and then writes the number
-into every line the pass has yet to read. The reading has to go from line to
-line: what a GPU has read stays in its cache, a word it keeps looking at is
-never seen to change, and only a line it has not read before comes from memory
-as it is then (measured here; every attempt with one word failed). A line is
-128 bytes, and a few frames' worth of them are kept apart so that none is read
-twice while still cached. A few microseconds pass between two looks, so that the
-lines, and the host memory they take, are not too many for the longest wait.
-The pass has a limit of lines, about three times what the network last took,
-so that a wait that ran out ends: the frame then goes on without the effect. The number of lines read is written back to the host;
-three waits in a row that ran out, and the frame goes back to waiting at
-present for ten seconds. The time one look takes (about a microsecond) is
-measured when it is first needed (two lengths, so that what a submission takes
-is not counted), together with a test that the answer is seen, and corrected
-as the waits go on.
+Measured on an RX 7900 XT, the network at a fraction of a 2559 x 1439 image, one frame of the harness each (`--sync`):
+the network takes 11 ms at 0.25, 17 ms at 0.5, 31 ms at 0.75 and 51 ms at 1, and a frame takes the network's time plus
+about 4 ms more, which is the two crossings of the fence between the APIs.
+
+A freeze is looked into from the log: when no frame has been presented for six seconds (`DLSS5NR_STALL_MS` changes
+that) the runtime writes, once, the fence's values and where every thread of the process is (module and offset) to its
+log, with the prefix `STALL`. OptiScaler's own log (`LogToFile=true`) carries it. The offsets are named with a map file of
+the build (`/MAP` at the link); the code of a build does not change with it.
 
 When the images are copied through host memory (Wine) the frame's own list
 copies the capture to the staging buffers and, after the wait, the answer from

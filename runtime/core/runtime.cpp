@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <emmintrin.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <chrono>
@@ -34,6 +35,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -163,11 +166,6 @@ struct Slot {
     uint64_t previous_frame = ~0ull;
     bool reset = false;
     bool depth_inverted = false;
-    // Not 0: the number of this capture when the frame waits for the network
-    // (shaders.h, "sync"), and the GPU, not the present fence, says when it is in
-    // place; and the stretch of lines the answer is written to.
-    uint32_t sync_id = 0;
-    uint32_t sync_line = 0, sync_lines = 0;
 };
 
 // The slots' images at one size. Letting go of a set and importing another
@@ -181,13 +179,6 @@ struct Slot {
 // worked out).
 constexpr size_t kParkedSets = 2;
 
-// Host memory for waiting inside the frame: a signal area of 32 lines of 128
-// bytes, then a stretch of lines per frame (shaders.h, "sync"), a few frames
-// apart so that no line is read again while the GPU still has it in its cache.
-constexpr uint32_t kSyncFirstLine = 32;
-constexpr uint32_t kSyncMaxLines = 120000;
-constexpr uint32_t kSyncRing = 4;
-constexpr size_t kSyncBytes = (size_t)(kSyncFirstLine + kSyncRing * kSyncMaxLines) * 128;
 struct SlotSet {
     uint32_t width = 0, height = 0;
     uint64_t parked_at = 0;   // the game frame, to find the oldest
@@ -213,6 +204,29 @@ struct Retired {
     uint64_t fence;
 };
 
+// The linear mode (dlss5nr_process_queue): the images one frame goes through at one network size, and the
+// residual its answer leaves. Made by the game thread; the worker imports them into CUDA and builds the
+// network's feature for `controls`, and says so in `ready`.
+struct LinearSet {
+    uint32_t width = 0, height = 0;
+    SharedImage color, depth, motion, output;
+    ID3D12Resource *residual = nullptr;
+    D3D12_RESOURCE_STATES residual_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    NetworkControls controls;
+    std::atomic<int> ready{0};      // 0 being prepared, 1 usable, -1 could not be prepared
+    std::atomic<int> pending{0};    // evaluations queued on its images and not finished
+};
+constexpr int kLinearRing = 3;
+
+// An evaluation for the linear mode's thread: wait (on the CPU) until the capture has been done, run the network on
+// it, and tell the game's queue.
+struct LinearJob {
+    LinearSet *set = nullptr;
+    uint64_t before = 0, after = 0;   // the fence values: the capture is done / the network is
+    uint64_t frame = 0;
+    EvaluateDesc desc;
+};
+
 } // namespace
 
 struct dlss5nr_context {
@@ -226,25 +240,6 @@ struct dlss5nr_context {
 
     Passes passes;
     ID3D12Resource *exposure_buffer = nullptr;
-    // Waiting for the network inside the frame (shaders.h, "sync"): host memory
-    // the GPU and the worker pass words through, the answer of the wait as a
-    // 1 x 1 texture, and what the wait has been measured to take.
-    ID3D12Resource *sync_flags = nullptr;
-    volatile uint32_t *sync_mem = nullptr;
-    ID3D12Resource *sync_status = nullptr;
-    D3D12_RESOURCE_STATES sync_status_state = {};
-    // Copy mode: the capture's number, in a buffer the copies of the images are followed
-    // by a copy of it from (to sync_flags), a word to a frame of four.
-    ID3D12Resource *sync_stamp = nullptr;
-    volatile uint32_t *sync_stamp_mem = nullptr;
-    uint32_t sync_id = 0;
-    float sync_look_us = 0.0f;           // how long one look takes; 0 until measured, -1 if it cannot be done
-    std::atomic<float> sync_wait_us{0.0f};   // how long the last wait went on, as the worker saw it
-    uint32_t sync_lines_last = 0;        // how many lines the last wait had
-    std::atomic<int> sync_failures{0};   // in a row
-    std::chrono::steady_clock::time_point sync_retry_at{};
-    bool sync_was_active = false;
-    uint64_t sync_last_frame = ~0ull;    // the frame of the capture before, if the network can continue from it
     ID3D12Fence *fence = nullptr;     // signalled at present, read by the worker
     uint64_t fence_value = 0;
 
@@ -293,6 +288,47 @@ struct dlss5nr_context {
     bool depth_history_valid = false;
     std::vector<Retired> retired;
 
+    // The linear mode (dlss5nr_process_queue). Game thread only, but for what is said.
+    // The network has one user at a time: the worker evaluating a slot, a feature being built, the linear mode.
+    std::mutex net_lock;
+    std::unique_ptr<LinearSet> lin_set;           // the images in use
+    std::unique_ptr<LinearSet> lin_next;          // being prepared by the worker, for another size
+    LinearSet *lin_request = nullptr;             // what the worker is to prepare next, under `lock`
+    NetworkControls lin_asked;                    // the controls last asked for, and since when
+    std::chrono::steady_clock::time_point lin_asked_at{};
+    uint32_t lin_wanted_width = 0, lin_wanted_height = 0;
+    std::chrono::steady_clock::time_point lin_wanted_since{};
+    ID3D12CommandAllocator *lin_allocator[kLinearRing][2] = {};
+    ID3D12GraphicsCommandList *lin_list[kLinearRing][2] = {};
+    ID3D12Fence *lin_fence = nullptr;
+    void *lin_fence_handle = nullptr;
+    void *lin_semaphore = nullptr;                // lin_fence in CUDA
+    bool lin_gpu = false;                         // the GPU waits (else the CPU does)
+    bool lin_made = false, lin_failed = false;
+    std::atomic<int> lin_trace{0};                            // calls left to log step by step (after a new set is first used)
+    bool lin_cpu_forced = false;                  // DLSS5NR_LINEAR_CPU_WAIT=1
+    bool lin_import_tried = false;                // the fence given to the network, once it is loaded
+    HANDLE lin_event = nullptr;
+    uint64_t lin_value = 0, lin_ring_value[kLinearRing] = {};
+    uint32_t lin_ring = 0;
+    std::atomic<uint64_t> lin_last_frame{~0ull};  // the frame of the last evaluation: the network's history is it
+    std::atomic<int> lin_failures{0};             // evaluations in a row that failed
+    // The thread that runs the network for the linear mode. It is the only one that waits for the capture, on the CPU,
+    // so that nothing is ever queued on the network's side that waits for the game's queue: anything else that
+    // waits for the network's side to be idle (the frame generation does) would hold up the very queue that
+    // wait is for.
+    std::thread lin_thread;
+    std::mutex lin_job_lock;
+    std::condition_variable lin_job_wake;
+    std::deque<LinearJob> lin_jobs;
+    bool lin_job_stop = false;
+    std::vector<std::unique_ptr<LinearSet>> lin_graveyard;   // retired while evaluations were still queued on them
+    double lin_profile_ms = 0.0;
+    uint64_t lin_profile_calls = 0;
+    std::chrono::steady_clock::time_point lin_retry_at{};   // when the evaluations are tried again after failing
+    std::chrono::steady_clock::time_point lin_last_began{};  // the last evaluation, for how often they come
+    std::atomic<uint32_t> lin_width{0}, lin_height{0};   // for the status
+
     // Shared with the worker, under lock.
     std::mutex lock;
     std::condition_variable wake;
@@ -339,6 +375,12 @@ struct dlss5nr_context {
 
     Network network;
     std::thread worker;
+    // Watches for the game standing still (no frame presented for seconds): then it writes where every thread of the
+    // process is to the log, once, which is what a freeze needs to be understood.
+    std::thread watchdog;
+    std::atomic<bool> watchdog_stop{false};
+    std::atomic<int64_t> last_present_ms{0};
+    std::atomic<uint64_t> presents{0};
 
     void log(int level, const char *fmt, ...) {
         char line[1200];
@@ -361,7 +403,6 @@ struct dlss5nr_context {
     }
 
     void run_worker();
-    void measure_sync();
 
     // Failed, the worker waits here for dlss5nr_destroy instead of ending. A
     // thread that ends while the game runs has the thread-detach notification of
@@ -434,20 +475,57 @@ void dlss5nr_context::run_worker() {
         {
             std::unique_lock<std::mutex> guard(lock);
             wake.wait(guard, [&] {
-                if (stop || (resize_requested && !resize_released) || !evicting.empty()) return true;
+                if (stop || (resize_requested && !resize_released) || !evicting.empty() || lin_request) return true;
                 for (const Slot &s : slots)
-                    if (s.state == Slot::Captured && (s.fence || s.sync_id)) return true;
+                    if (s.state == Slot::Captured && s.fence) return true;
                 return false;
             });
             if (stop) break;
-            if (!evicting.empty()) {
-                // Sets given up for good: only this thread has the CUDA context.
-                for (SlotSet &set : evicting) {
-                    for (auto &images : set.image)
-                        for (SharedImage &image : images) network.release(image);
-                    evicted.push_back(std::move(set));
+            if (lin_request) {
+                // The linear mode's images for another size or other controls: into CUDA, and the feature built.
+                // Seconds, and the network is nobody else's meanwhile.
+                LinearSet *set = lin_request;
+                lin_request = nullptr;
+                guard.unlock();
+                std::string why;
+                std::lock_guard<std::mutex> use(net_lock);
+                bool ok = network.import(set->color, why) && network.import(set->depth, why) &&
+                          network.import(set->motion, why) && network.import(set->output, why) &&
+                          network.create_feature(set->width, set->height, set->controls, why);
+                if (ok) {
+                    // One evaluation on whatever the images hold, so that the first frames do not pay for the
+                    // network's first launches (measured: ~9 ms of the game thread's time per frame, for the first
+                    // dozens of them).
+                    EvaluateDesc warm;
+                    warm.color = &set->color;
+                    warm.depth = &set->depth;
+                    warm.motion = &set->motion;
+                    warm.output = &set->output;
+                    warm.reset = true;
+                    warm.controls = set->controls;
+                    ok = network.evaluate(warm, why);
                 }
+                if (ok) log(2, "the network is ready at %ux%u for the linear mode", set->width, set->height);
+                else log(0, "the network could not be prepared for the linear mode: %s", why.c_str());
+                set->ready = ok ? 1 : -1;
+                continue;
+            }
+            if (!evicting.empty()) {
+                // Sets given up for good. Letting go of a CUDA image waits for the GPU, so it is done with neither
+                // the context's lock held (the game's thread may need it to finish what the GPU waits for) nor
+                // while the game's thread is using the network (the linear mode evaluates on it): net_lock first,
+                // and the lock only again when it is over.
+                std::vector<SlotSet> mine = std::move(evicting);
                 evicting.clear();
+                guard.unlock();
+                {
+                    std::lock_guard<std::mutex> use(net_lock);
+                    for (SlotSet &set : mine)
+                        for (auto &images : set.image)
+                            for (SharedImage &image : images) network.release(image);
+                }
+                guard.lock();
+                for (SlotSet &set : mine) evicted.push_back(std::move(set));
                 wake.notify_all();
                 continue;
             }
@@ -462,23 +540,13 @@ void dlss5nr_context::run_worker() {
             // go back to free, which also tells the next evaluation that
             // frames were skipped.
             uint64_t newest = 0;
-            // A frame that waits for the network is answered, the oldest first, and
-            // none is passed over: its command list is on the GPU, waiting.
-            uint64_t oldest = ~0ull;
             for (int i = 0; i < kSlots; ++i)
-                if (slots[i].state == Slot::Captured && slots[i].sync_id && slots[i].frame < oldest) {
-                    oldest = slots[i].frame;
+                if (slots[i].state == Slot::Captured && slots[i].fence && slots[i].frame >= newest) {
+                    newest = slots[i].frame;
                     chosen = i;
                 }
-            if (chosen < 0) {
-                for (int i = 0; i < kSlots; ++i)
-                    if (slots[i].state == Slot::Captured && slots[i].fence && slots[i].frame >= newest) {
-                        newest = slots[i].frame;
-                        chosen = i;
-                    }
-                for (int i = 0; i < kSlots; ++i)
-                    if (i != chosen && slots[i].state == Slot::Captured && slots[i].fence) slots[i].state = Slot::Free;
-            }
+            for (int i = 0; i < kSlots; ++i)
+                if (i != chosen && slots[i].state == Slot::Captured && slots[i].fence) slots[i].state = Slot::Free;
             slots[chosen].state = Slot::Evaluating;
             controls_now = controls;
             passes_now = network_passes;
@@ -486,29 +554,8 @@ void dlss5nr_context::run_worker() {
         }
 
         Slot &slot = slots[chosen];
-        // The capture has to have run before the network reads it. When the frame
-        // waits for the network, the game's command list is on the GPU already
-        // and says so itself, from inside, once the capture is in place.
-        bool sync_arrived = true;
-        const uint32_t sync_id = slot.sync_id;
-        if (sync_id) {
-            const auto asked = std::chrono::steady_clock::now();
-            sync_arrived = false;
-            for (unsigned spins = 0;; ++spins) {
-                if (sync_mem[(sync_id % 4) * 32] == sync_id) {
-                    sync_arrived = true;
-                    break;
-                }
-                // Not a loop that only spins: a thread doing that for the tens of milliseconds
-                // the GPU takes to get here slows down the game's own (measured: a frame
-                // taking four times as long), where giving up the turn each time does not.
-                Sleep(0);
-                if (spins % 256 == 255) {
-                    std::lock_guard<std::mutex> guard(lock);
-                    if (stop || std::chrono::steady_clock::now() - asked > std::chrono::seconds(3)) break;
-                }
-            }
-        } else if (fence->GetCompletedValue() < slot.fence) {
+        // The capture has to have run before the network reads it.
+        if (fence->GetCompletedValue() < slot.fence) {
             fence->SetEventOnCompletion(slot.fence, fence_event);
             while (WaitForSingleObject(fence_event, 100) == WAIT_TIMEOUT) {
                 std::lock_guard<std::mutex> guard(lock);
@@ -516,6 +563,8 @@ void dlss5nr_context::run_worker() {
             }
         }
 
+        // The network is this evaluation's for as long as it takes (the linear mode may be using it too).
+        std::unique_lock<std::mutex> use_network(net_lock);
         const auto began = std::chrono::steady_clock::now();
         if (controls_now != asked_controls) {
             asked_controls = controls_now;
@@ -525,20 +574,9 @@ void dlss5nr_context::run_worker() {
             created_controls = asked_controls;
             created = true;
         }
-        bool ok = sync_arrived;
-        if (!ok) error = "the capture never came out of the frame";
-        ok = ok && network.import(slot.color, error) && network.import(slot.depth, error) &&
+        bool ok = network.import(slot.color, error) && network.import(slot.depth, error) &&
              network.import(slot.motion, error) && network.import(slot.output, error) &&
              network.create_feature(slot.color.width, slot.color.height, created_controls, error);
-        // A frame that waits copies its inputs from inside its own list, and so every slot
-        // has to have its staging buffers before the first of them is wanted.
-        if (ok && g_copy_interop)
-            for (int i = 0; i < kSlots && ok; ++i) {
-                Slot &other = slots[i];
-                if (other.color.resource && other.state != Slot::Evaluating)
-                    ok = network.import(other.color, error) && network.import(other.depth, error) &&
-                         network.import(other.motion, error) && network.import(other.output, error);
-            }
         if (ok) {
             EvaluateDesc desc;
             desc.color = &slot.color;
@@ -550,34 +588,13 @@ void dlss5nr_context::run_worker() {
             desc.controls = created_controls;
             desc.passes = passes_now;
             desc.keep_local_tone = keep_tone_now;
-            desc.staged_by_list = sync_id != 0 && g_copy_interop;
             ok = network.evaluate(desc, error);
         }
+        use_network.unlock();
         const auto finished = std::chrono::steady_clock::now();
-        if (sync_id) {
-            // The wait on the GPU goes on when it reads this: the capture's number, with the
-            // top bit set if the network failed, in every line it has still to look at.
-            const uint32_t answer = ok ? sync_id : (sync_id | 0x80000000u);
-            // The wait is somewhere in its lines by now, at the rate measured: half way
-            // there is a safe place to start, and the lines before it need no answer.
-            const double elapsed_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - began).count();
-            const uint32_t first = (uint32_t)std::min<double>(slot.sync_lines / 2, 0.5 * elapsed_us / std::max(sync_look_us, 0.3f));
-            for (uint32_t i = first; i < slot.sync_lines; ++i) sync_mem[(size_t)(slot.sync_line + i) * 32] = answer;
-            _mm_sfence();
-            sync_wait_us = (float)std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - began).count();
-            if (!ok) sync_failures++;
-        }
-
         std::lock_guard<std::mutex> guard(lock);
         history_frame = ok ? slot.frame : ~0ull;
-        if (ok && sync_id) {
-            // Used by the frame itself already: nothing is left to hand over.
-            failures = 0;
-            slot.state = Slot::Free;
-            slot.sync_id = 0;
-            ++results;
-            evaluation_ms = (float)std::chrono::duration<double, std::milli>(finished - began).count();
-        } else if (ok) {
+        if (ok) {
             failures = 0;
             slot.state = Slot::Ready;
             slot.sequence = ++sequence;
@@ -587,95 +604,30 @@ void dlss5nr_context::run_worker() {
             if (period > 0.0) evaluations_per_second = (float)(1.0 / period);
         } else {
             slot.state = Slot::Free;
-            slot.sync_id = 0;
             log(0, "evaluation failed: %s", error.c_str());
-            if (sync_arrived && ++failures >= kMaxFailures) {
+            if (++failures >= kMaxFailures) {
                 set_message("the network failed: " + error);
                 state = DLSS5NR_STATE_FAILED;
                 wake.notify_all();
                 break;
             }
         }
-        wake.notify_all();   // dlss5nr_present may be waiting for this result
+        wake.notify_all();
     }
     CloseHandle(fence_event);
+    {
+        // The linear mode's CUDA side: only this thread's context may let go of it.
+        std::lock_guard<std::mutex> use(net_lock);
+        if (lin_semaphore) {
+            network.destroy_fence(lin_semaphore);
+            lin_semaphore = nullptr;
+        }
+        for (LinearSet *set : {lin_set.get(), lin_next.get()})
+            if (set)
+                for (SharedImage *image : {&set->color, &set->depth, &set->motion, &set->output}) network.release(*image);
+    }
     network.shutdown();
     park();
-}
-
-// How long one look of the wait on the GPU takes, and whether it sees what the
-// host writes after it has begun: a wait on a queue of its own, once against an
-// answer that never comes, once against one written 20 ms in. If the answer is
-// not seen the frame does not wait inside, only at present.
-void dlss5nr_context::measure_sync() {
-    sync_look_us = -1.0f;   // not tried again, whatever comes of it
-    ID3D12CommandQueue *queue = nullptr;
-    ID3D12CommandAllocator *allocator = nullptr;
-    ID3D12GraphicsCommandList *list = nullptr;
-    ID3D12Fence *done = nullptr;
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) &&
-        SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
-        SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
-                                            IID_PPV_ARGS(&list))) &&
-        SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)))) {
-        list->Close();
-        uint64_t value = 0;
-        // Runs the wait over `lines` lines from kSyncFirstLine; the host answers
-        // after `answer_ms` if it is not negative. Returns how long it took.
-        auto run = [&](uint32_t id, uint32_t lines, int answer_ms) {
-            allocator->Reset();
-            list->Reset(allocator, nullptr);
-            Constants k{};
-            k.size[0] = id;
-            k.size[1] = lines;
-            k.exposure_mode = kSyncFirstLine;
-            Bindings b;
-            b.uav[0] = sync_status;
-            b.exposure_buffer = sync_flags;
-            b.buffer_words = kSyncBytes / 4;
-            passes.dispatch(list, Pass::SyncWait, k, b, 1, 1);
-            list->Close();
-            ID3D12CommandList *lists[] = {list};
-            const auto began = std::chrono::steady_clock::now();
-            queue->ExecuteCommandLists(1, lists);
-            queue->Signal(done, ++value);
-            if (answer_ms >= 0) {
-                Sleep((DWORD)answer_ms);
-                for (uint32_t i = 0; i < lines; ++i) sync_mem[(size_t)(kSyncFirstLine + i) * 32] = id;
-                _mm_sfence();
-            }
-            done->SetEventOnCompletion(value, event);
-            WaitForSingleObject(event, 5000);
-            if (done->GetCompletedValue() < value) return -1.0;
-            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
-        };
-        // Two lengths, for the time per look not to include what a submission takes
-        // whatever its length; and the pages of the buffer are new to the GPU the first
-        // time, which in a game they are not.
-        const uint32_t short_wait = 4000, long_wait = 44000;
-        run(0xFFFFFF01u, long_wait, -1);
-        const double ms_short = run(0xFFFFFF01u, short_wait, -1);
-        const double ms_long = run(0xFFFFFF01u, long_wait, -1);
-        const double ms = ms_long - ms_short;
-        if (ms_short > 0.0 && ms_long > ms_short) {
-            const float us = (float)(ms * 1000.0 / (long_wait - short_wait));
-            const uint32_t lines = (uint32_t)std::min<double>(kSyncMaxLines, 400000.0 / us);   // ~400 ms of them
-            const double seen = run(7, lines, 20);
-            const uint32_t looked = sync_mem[128];
-            log(2, "waiting inside the frame: a look takes %.2f us; answered after 20 ms, the wait read %u of %u lines (%.1f ms)",
-                us, looked, lines, seen);
-            if (seen > 0.0 && looked < lines / 2 + 1 && (double)looked * us / 1000.0 < 200.0) sync_look_us = us;
-            else log(1, "the wait did not see the answer: the frame will wait at present");
-        }
-    }
-    CloseHandle(event);
-    release(done);
-    release(list);
-    release(allocator);
-    release(queue);
 }
 
 extern "C" {
@@ -700,13 +652,96 @@ DLSS5NR_API void dlss5nr_default_settings(dlss5nr_settings *s) {
     s->exposure = 1.0f;
     s->follow_motion = 1;
     s->network_history = 0;
-    s->wait_for_network = 0;
     s->passes = 1;
     s->keep_local_tone = 1;
     s->blend_frames = 4;
-    s->wait_inside = 0;
     s->network_preset = 0;
 }
+
+namespace {
+
+int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Where every other thread of the process is, as module + offset, to the log. The threads are stopped one at a time and
+// only long enough to read their stacks into memory that is already there (a thread that is stopped may hold a lock
+// this one would need to log), and the names are put to the addresses after they run again.
+void dump_stacks(dlss5nr_context *c) {
+    constexpr int kThreads = 96, kFrames = 28;
+    static DWORD ids[kThreads];
+    static DWORD64 frames[kThreads][kFrames];
+    static int depth[kThreads];
+    static ULONGLONG user_ms[kThreads], kernel_ms[kThreads];
+    int count = 0;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te{};
+        te.dwSize = sizeof te;
+        for (BOOL ok = Thread32First(snap, &te); ok && count < kThreads; ok = Thread32Next(snap, &te))
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) ids[count++] = te.th32ThreadID;
+        CloseHandle(snap);
+    }
+    for (int i = 0; i < count; ++i) {
+        depth[i] = 0;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, ids[i]);
+        if (!th) continue;
+        FILETIME created, exited, kernel, user;
+        if (GetThreadTimes(th, &created, &exited, &kernel, &user)) {
+            user_ms[i] = ((ULONGLONG)user.dwHighDateTime << 32 | user.dwLowDateTime) / 10000;
+            kernel_ms[i] = ((ULONGLONG)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) / 10000;
+        }
+        if (SuspendThread(th) != (DWORD)-1) {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(th, &ctx)) {
+                for (int f = 0; f < kFrames && ctx.Rip; ++f) {
+                    frames[i][depth[i]++] = ctx.Rip;
+                    DWORD64 base = 0;
+                    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+                    if (!entry) {
+                        // A leaf: the return address is on top of the stack.
+                        if (!ctx.Rsp) break;
+                        ctx.Rip = *(DWORD64 *)ctx.Rsp;
+                        ctx.Rsp += 8;
+                    } else {
+                        PVOID handler_data = nullptr;
+                        DWORD64 frame_base = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, entry, &ctx, &handler_data, &frame_base,
+                                         nullptr);
+                    }
+                }
+            }
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    }
+    c->log(0, "STALL: no frame presented for seconds; frame %llu, linear fence at %llu of %llu, state %d",
+           (unsigned long long)c->frame, c->lin_fence ? (unsigned long long)c->lin_fence->GetCompletedValue() : 0ull,
+           (unsigned long long)c->lin_value, (int)c->state.load());
+    for (int i = 0; i < count; ++i) {
+        c->log(0, "STALL: thread %lu%s (user %llu ms, kernel %llu ms)", ids[i],
+               ids[i] == c->worker_thread_id.load() ? " [dlss5nr worker]" : "", (unsigned long long)user_ms[i],
+               (unsigned long long)kernel_ms[i]);
+        for (int f = 0; f < depth[i]; ++f) {
+            HMODULE module = nullptr;
+            wchar_t path[MAX_PATH] = {};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)frames[i][f], &module) &&
+                GetModuleFileNameW(module, path, MAX_PATH)) {
+                const wchar_t *name = wcsrchr(path, L'\\');
+                c->log(0, "STALL:   %ls+0x%llx", name ? name + 1 : path,
+                       (unsigned long long)(frames[i][f] - (DWORD64)module));
+            } else {
+                c->log(0, "STALL:   0x%llx", (unsigned long long)frames[i][f]);
+            }
+        }
+    }
+}
+
+} // namespace
 
 DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context **out) {
     if (!info || !out || !info->device || info->struct_size < sizeof(uint32_t) + sizeof(void *)) return -1;
@@ -757,45 +792,27 @@ DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context 
         dlss5nr_destroy(c);
         return -4;
     }
-    // For waiting inside the frame: host memory the GPU can read and write while
-    // the CPU does too. If it cannot be made, the frame only waits at present.
-    {
-        D3D12_HEAP_PROPERTIES host{};
-        host.Type = D3D12_HEAP_TYPE_CUSTOM;
-        host.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
-        host.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-        D3D12_RESOURCE_DESC host_desc = desc;
-        host_desc.Width = kSyncBytes;
-        void *mapped = nullptr;
-        if (SUCCEEDED(c->device->CreateCommittedResource(&host, D3D12_HEAP_FLAG_NONE, &host_desc,
-                                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                         IID_PPV_ARGS(&c->sync_flags))) &&
-            SUCCEEDED(c->sync_flags->Map(0, nullptr, &mapped)) && mapped) {
-            c->sync_mem = (volatile uint32_t *)mapped;
-            memset((void *)c->sync_mem, 0, kSyncBytes);
-            c->sync_status = make_texture(c->device, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, false,
-                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            c->sync_status_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        }
-        D3D12_HEAP_PROPERTIES upload{};
-        upload.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC stamp_desc = desc;
-        stamp_desc.Width = 256;
-        stamp_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        void *stamp_mapped = nullptr;
-        if (SUCCEEDED(c->device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &stamp_desc,
-                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                         IID_PPV_ARGS(&c->sync_stamp))) &&
-            SUCCEEDED(c->sync_stamp->Map(0, nullptr, &stamp_mapped)) && stamp_mapped)
-            c->sync_stamp_mem = (volatile uint32_t *)stamp_mapped;
-        if (!c->sync_mem || !c->sync_status || !c->sync_stamp_mem)
-            c->log(1, "no host memory for waiting inside the frame: the frame will wait at present");
-    }
-
     c->log(2, "runtime starting: files in %ls, network %ls", c->paths.runtime_dir.c_str(), c->paths.snippet.c_str());
     c->worker = std::thread([c] {
         c->worker_thread_id = GetCurrentThreadId();
         c->run_worker();
+    });
+    c->watchdog = std::thread([c] {
+        bool dumped = false;
+        char value[16] = {};
+        const int64_t stall_ms = GetEnvironmentVariableA("DLSS5NR_STALL_MS", value, sizeof value) ? atoi(value) : 6000;
+        while (!c->watchdog_stop) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const int64_t last = c->last_present_ms;
+            if (!last || c->presents < 120) continue;
+            const int64_t idle = steady_ms() - last;
+            if (idle > stall_ms && !dumped) {
+                dumped = true;
+                dump_stacks(c);
+            } else if (idle < 1000) {
+                dumped = false;
+            }
+        }
     });
     // Known before anything is loaded on it: the host may start filtering
     // library loads as soon as this returns.
@@ -806,11 +823,21 @@ DLSS5NR_API int dlss5nr_create(const dlss5nr_create_info *info, dlss5nr_context 
 
 DLSS5NR_API void dlss5nr_destroy(dlss5nr_context *c) {
     if (!c) return;
+    // The linear mode's thread first: it uses the network and the fence, and signals what is still queued without
+    // running the network.
+    {
+        std::lock_guard<std::mutex> guard(c->lin_job_lock);
+        c->lin_job_stop = true;
+    }
+    c->lin_job_wake.notify_all();
+    if (c->lin_thread.joinable()) c->lin_thread.join();
     {
         std::lock_guard<std::mutex> guard(c->lock);
         c->stop = true;
     }
     c->wake.notify_all();
+    c->watchdog_stop = true;
+    if (c->watchdog.joinable()) c->watchdog.join();
     if (c->worker.joinable()) c->worker.join();
     for (Slot &s : c->slots) {
         destroy_shared(s.color);
@@ -818,6 +845,24 @@ DLSS5NR_API void dlss5nr_destroy(dlss5nr_context *c) {
         destroy_shared(s.motion);
         destroy_shared(s.output);
     }
+    std::vector<LinearSet *> linear_sets = {c->lin_set.get(), c->lin_next.get()};
+    for (auto &gone : c->lin_graveyard) linear_sets.push_back(gone.get());
+    for (LinearSet *set : linear_sets)
+        if (set) {
+            destroy_shared(set->color);
+            destroy_shared(set->depth);
+            destroy_shared(set->motion);
+            destroy_shared(set->output);
+            release(set->residual);
+        }
+    for (int i = 0; i < kLinearRing; ++i)
+        for (int k = 0; k < 2; ++k) {
+            release(c->lin_list[i][k]);
+            release(c->lin_allocator[i][k]);
+        }
+    release(c->lin_fence);
+    if (c->lin_fence_handle) CloseHandle((HANDLE)c->lin_fence_handle);
+    if (c->lin_event) CloseHandle(c->lin_event);
     for (std::vector<SlotSet> *sets : {&c->slot_cache, &c->evicting, &c->evicted})
         for (SlotSet &set : *sets)
             for (auto &images : set.image)
@@ -838,11 +883,6 @@ DLSS5NR_API void dlss5nr_destroy(dlss5nr_context *c) {
         for (ID3D12Resource *&map : flow.map) release(map);
     for (ID3D12Resource *&depth : c->depth_history) release(depth);
     release(c->exposure_buffer);
-    if (c->sync_flags && c->sync_mem) c->sync_flags->Unmap(0, nullptr);
-    release(c->sync_flags);
-    release(c->sync_status);
-    if (c->sync_stamp && c->sync_stamp_mem) c->sync_stamp->Unmap(0, nullptr);
-    release(c->sync_stamp);
     release(c->fence);
     c->passes.shutdown();
     if (c->log_file) fclose(c->log_file);
@@ -885,8 +925,8 @@ DLSS5NR_API void dlss5nr_get_status(dlss5nr_context *c, dlss5nr_status *s) {
     }
     {
         std::lock_guard<std::mutex> guard(c->lock);
-        out.network_width = c->slot_width;
-        out.network_height = c->slot_height;
+        out.network_width = c->lin_width ? c->lin_width.load() : c->slot_width;
+        out.network_height = c->lin_width ? c->lin_height.load() : c->slot_height;
     }
     out.evaluation_ms = c->evaluation_ms;
     out.evaluations_per_second = c->evaluations_per_second;
@@ -907,6 +947,8 @@ DLSS5NR_API void dlss5nr_present(dlss5nr_context *c, ID3D12CommandQueue *queue) 
     if (!c || !queue) return;
     c->mark_host_ready();
     ++c->frame;
+    c->last_present_ms = steady_ms();
+    ++c->presents;
     const uint64_t value = ++c->fence_value;
     queue->Signal(c->fence, value);
 
@@ -944,30 +986,6 @@ DLSS5NR_API void dlss5nr_present(dlss5nr_context *c, ID3D12CommandQueue *queue) 
     c->pending_slot = -1;
     c->wake.notify_all();
 
-    // Waiting for the network: the game does not go on until the frame it
-    // just presented has its result, which the next frame composes one frame
-    // late instead of many. The frame rate becomes the network's. Bounded, so
-    // that a network that stops answering cannot stop the game.
-    if (c->settings.wait_for_network && c->state == DLSS5NR_STATE_RUNNING) {
-        std::unique_lock<std::mutex> guard(c->lock);
-        // A frame that waits inside its own command list needs no waiting for here,
-        // but for the one before it: the game may record the next frame while the
-        // network works on this one, which hides the time the game itself takes.
-        const bool inside = c->slots[captured].sync_id != 0;
-        const bool answered = c->wake.wait_for(guard, std::chrono::seconds(2), [&] {
-            if (c->stop || c->state != DLSS5NR_STATE_RUNNING) return true;
-            if (inside) {
-                int outstanding = 0;
-                for (const Slot &slot : c->slots)
-                    if (slot.sync_id && (slot.state == Slot::Captured || slot.state == Slot::Evaluating)) ++outstanding;
-                return outstanding <= 1;
-            }
-            const Slot::State state = c->slots[captured].state;
-            return state != Slot::Captured && state != Slot::Evaluating;
-        });
-        guard.unlock();
-        if (!answered) c->log(1, "waited 2 s for the network's result and went on without it");
-    }
 }
 
 DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
@@ -1199,187 +1217,11 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
-    // ------------------------------------------------------- waiting inside the frame
-    // With wait_for_network the game's command list holds the whole round: the
-    // capture, a wait on the GPU until the network has answered, and the
-    // composition of that answer into the very frame it was made from. No
-    // displacement, no residual carried over, no pixel to fill in: this is the
-    // network applied to every frame, at the network's frame rate. Only once the
-    // network has answered a first time (its feature takes seconds to build), and
-    // not after it has failed to answer three times running.
-    if (c->sync_failures >= 3) {
-        // Given up on for a while: the network may have been busy building a feature.
-        if (c->sync_retry_at == std::chrono::steady_clock::time_point{})
-            c->sync_retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        else if (std::chrono::steady_clock::now() >= c->sync_retry_at) {
-            c->sync_failures = 0;
-            c->sync_retry_at = {};
-        }
-    }
-    const bool sync_wanted = running && s.wait_for_network && s.wait_inside && can_capture && c->sync_flags && c->sync_mem &&
-                             c->sync_status && c->sync_stamp_mem && c->results > 0 && c->sync_failures < 3;
-    if (sync_wanted && c->sync_look_us == 0.0f) c->measure_sync();
-    const bool sync_active = sync_wanted && c->sync_look_us > 0.0f;
-    if (sync_active != c->sync_was_active) {
-        // Whatever was tracked belongs to the other way of working.
-        c->sync_was_active = sync_active;
-        c->sync_last_frame = ~0ull;
-        c->residual_valid = false;
-        c->applied_flow.valid = false;
-        c->previous_flow.valid = false;
-        for (Flow &flow : c->slot_flow) flow.valid = false;
-        c->depth_history_valid = false;
-    }
-    int sync_slot = -1;
-    bool has_history = false;
-    if (sync_active && c->pending_slot < 0) {
-        // The wait of the frame before: did it end because the answer came, or because
-        // it ran out of lines?
-        if (c->sync_id && c->sync_lines_last) {
-            if (c->sync_mem[129] && c->sync_mem[128] >= c->sync_mem[129]) {
-                c->log(1, "the wait on the GPU ran out before the network answered (%u lines, a look takes %.2f us, the network took %.1f ms)",
-                       c->sync_mem[129], c->sync_look_us, c->evaluation_ms.load());
-                c->sync_failures++;
-            } else if (c->sync_failures > 0 && c->sync_failures < 3) {
-                c->sync_failures = 0;
-            }
-        }
-        // How long a look really takes: what the last wait went on for over how many
-        // lines it read, which is not what the probe measured once the GPU has the
-        // pages and is busy with the network.
-        if (c->sync_id && c->sync_wait_us > 0.0f && c->sync_mem[128] > 2000 && c->sync_mem[128] < c->sync_mem[129]) {
-            const float seen = c->sync_wait_us / (float)c->sync_mem[128];
-            c->sync_look_us = std::min(std::max(0.6f * c->sync_look_us + 0.4f * seen, 0.3f), 40.0f);
-        }
-        // As many lines as the network is expected to take, three times over.
-        const float expected_us = std::max(c->evaluation_ms.load(), 20.0f) * 1000.0f * 3.0f;
-        const uint32_t lines = (uint32_t)std::min<float>(kSyncMaxLines, std::max(expected_us / c->sync_look_us, 8000.0f));
-        uint32_t id = 0;
-        {
-            std::lock_guard<std::mutex> guard(c->lock);
-            // In copy mode only a slot whose images already have staging buffers.
-            auto usable = [&](const Slot &slot) {
-                return !g_copy_interop || (Network::staged(slot.color) && Network::staged(slot.depth) &&
-                                           Network::staged(slot.motion) && Network::staged(slot.output));
-            };
-            for (int i = 0; i < kSlots && sync_slot < 0; ++i)
-                if (c->slots[i].state == Slot::Free && usable(c->slots[i])) sync_slot = i;
-            // Results nobody will compose any more are free as well.
-            for (int i = 0; i < kSlots && sync_slot < 0; ++i)
-                if ((c->slots[i].state == Slot::Ready || (c->slots[i].state == Slot::Captured && !c->slots[i].sync_id)) &&
-                    usable(c->slots[i])) {
-                    c->slots[i].state = Slot::Free;
-                    sync_slot = i;
-                }
-            if (sync_slot >= 0) {
-                if (++c->sync_id == 0) ++c->sync_id;
-                id = c->sync_id;
-                Slot &slot = c->slots[sync_slot];
-                slot.state = Slot::Captured;
-                slot.fence = 0;
-                slot.sync_id = id;
-                slot.sync_line = kSyncFirstLine + (id % kSyncRing) * kSyncMaxLines;
-                slot.sync_lines = lines;
-                slot.frame = c->frame;
-                // Every frame is captured, so the one before is the one the network's own
-                // history holds, and the game's motion vectors are the way back to it.
-                has_history = guided && f->reset == 0 && s.passes <= 1 && c->sync_last_frame + 1 == c->frame;
-                slot.previous_frame = has_history ? c->sync_last_frame : ~0ull;
-                slot.reset = !has_history;
-                c->sync_last_frame = c->frame;
-                slot.depth_inverted = f->depth_inverted != 0;
-            }
-        }
-        if (sync_slot >= 0) {
-            Slot &slot = c->slots[sync_slot];
-            c->pending_slot = sync_slot;
-            c->sync_lines_last = lines;
-            // The worker has to be there already, looking: the capture is not
-            // handed over at present, the frame is waiting for what it makes.
-            c->wake.notify_all();
-            // The capture, with no earlier frame to lead back to.
-            Constants k = network_constants();
-            k.flags |= has_history ? FLAG_RAWMV : FLAG_IDENTITY;
-            for (ID3D12Resource *r : {slot.color.resource, slot.depth.resource, slot.motion.resource})
-                transition(cmd, r, D3D12_RESOURCE_STATE_COMMON, write);
-            Bindings b;
-            b.srv[0] = f->input;
-            b.srv[1] = f->depth;
-            b.srv[2] = has_history ? f->motion : nullptr;
-            b.uav[0] = slot.color.resource;
-            b.uav[1] = slot.depth.resource;
-            b.uav[2] = slot.motion.resource;
-            b.exposure_buffer = c->exposure_buffer;
-            c->passes.dispatch(cmd, Pass::Capture, k, b, nw, nh);
-            for (ID3D12Resource *r : {slot.color.resource, slot.depth.resource, slot.motion.resource})
-                transition(cmd, r, write, D3D12_RESOURCE_STATE_COMMON);
-            // The capture is in place: say so, and wait for the answer.
-            if (g_copy_interop)
-                for (SharedImage *image : {&slot.color, &slot.depth, &slot.motion}) Network::record_stage_in(cmd, *image);
-            // Written by the command processor once everything before it is done,
-            // straight to memory: a write from a shader waits in the GPU's cache for as
-            // long as it likes, and here it is the host that has to see this at once.
-            ID3D12GraphicsCommandList2 *list2 = nullptr;
-            if (g_copy_interop) {
-                // The images were copied to the host above; the number goes the same way, after
-                // them, so that it is not seen before they are all there.
-                c->sync_stamp_mem[(id % 4) * 16] = id;
-                transition(cmd, c->sync_flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-                cmd->CopyBufferRegion(c->sync_flags, (UINT64)(id % 4) * 128, c->sync_stamp, (UINT64)(id % 4) * 64, 4);
-                transition(cmd, c->sync_flags, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            } else if (SUCCEEDED(cmd->QueryInterface(IID_PPV_ARGS(&list2)))) {
-                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER parameter{c->sync_flags->GetGPUVirtualAddress() + (id % 4) * 128, id};
-                D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
-                list2->WriteBufferImmediate(1, &parameter, &mode);
-                list2->Release();
-            } else {
-                Constants sk = base;
-                sk.size[0] = id;
-                Bindings sb;
-                sb.exposure_buffer = c->sync_flags;
-                sb.buffer_words = (uint32_t)(kSyncBytes / 4);
-                c->passes.dispatch(cmd, Pass::SyncSignal, sk, sb, 1, 1);
-                uav_barrier(cmd, c->sync_flags);
-            }
-            Constants wk = base;
-            wk.size[0] = id;
-            wk.size[1] = lines;
-            wk.exposure_mode = slot.sync_line;
-            to_state(c->sync_status, c->sync_status_state, write);
-            Bindings wb;
-            wb.uav[0] = c->sync_status;
-            wb.exposure_buffer = c->sync_flags;
-            wb.buffer_words = (uint32_t)(kSyncBytes / 4);
-            c->passes.dispatch(cmd, Pass::SyncWait, wk, wb, 1, 1);
-            uav_barrier(cmd, c->sync_status);
-            to_state(c->sync_status, c->sync_status_state, read);
-            if (g_copy_interop) Network::record_stage_out(cmd, slot.output);
-            // What the network made of it.
-            transition(cmd, slot.output.resource, D3D12_RESOURCE_STATE_COMMON, read);
-            transition(cmd, slot.color.resource, D3D12_RESOURCE_STATE_COMMON, read);
-            transition(cmd, slot.depth.resource, D3D12_RESOURCE_STATE_COMMON, read);
-            to_state(c->residual, c->residual_state, write);
-            Bindings rb;
-            rb.srv[0] = slot.output.resource;
-            rb.srv[1] = slot.color.resource;
-            rb.srv[2] = slot.depth.resource;
-            rb.uav[0] = c->residual;
-            rb.exposure_buffer = c->exposure_buffer;
-            c->passes.dispatch(cmd, Pass::Refresh, network_constants(), rb, nw, nh);
-            to_state(c->residual, c->residual_state, read);
-            transition(cmd, slot.output.resource, read, D3D12_RESOURCE_STATE_COMMON);
-            transition(cmd, slot.color.resource, read, D3D12_RESOURCE_STATE_COMMON);
-            transition(cmd, slot.depth.resource, read, D3D12_RESOURCE_STATE_COMMON);
-        }
-        transition(cmd, f->depth, readable(depth_state), depth_state);
-        transition(cmd, f->motion, readable(motion_state), motion_state);
-    }
-
     // ------------------------------------------------------------------- track
     // Every map moves on by this frame's motion, before anything reads it: a
     // capture made now starts from here, and the result composed now is found
     // through its map as of this frame.
-    if (running && !sync_active && (f->reset || guided != c->guided)) {
+    if (running && (f->reset || guided != c->guided)) {
         // A cut, or motion vectors coming or going: nothing before it
         // describes what is on screen now.
         c->guided = guided;
@@ -1389,7 +1231,7 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         for (Flow &flow : c->slot_flow) flow.valid = false;
         c->depth_history_valid = false;
     }
-    if (running && !sync_active && guided) {
+    if (running && guided) {
         bool in_flight[kSlots] = {};
         {
             std::lock_guard<std::mutex> guard(c->lock);
@@ -1439,7 +1281,7 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
     }
 
     // ----------------------------------------------------------------- capture
-    if (can_capture && !sync_active && c->pending_slot < 0) {
+    if (can_capture && c->pending_slot < 0) {
         // A capture the network has not taken yet is replaced by this frame:
         // when the network is free again it starts from the newest frame
         // there is, not from one that waited through a whole evaluation. That
@@ -1480,7 +1322,6 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
                 Slot &slot = c->slots[free_slot];
                 slot.state = Slot::Captured;
                 slot.fence = 0;
-                slot.sync_id = 0;
                 slot.frame = c->frame;
                 slot.previous_frame = previous_frame;
                 // With more than one pass the network starts afresh on every one,
@@ -1515,7 +1356,7 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
     }
 
     // ------------------------------------------------------------------ result
-    if (running && !sync_active) {
+    if (running) {
         int ready = -1;
         {
             std::lock_guard<std::mutex> guard(c->lock);
@@ -1622,25 +1463,17 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         const int blend_frames =
             std::min(std::min(std::max(s.blend_frames, 0), 8), (int)std::min<uint32_t>(c->result_interval, 8));
         k.blend = blend_frames > 0 ? std::min(1.0f, (float)(c->residual_age + 1) / (float)blend_frames) : 1.0f;
-        const bool apply = sync_active ? sync_slot >= 0 && s.detail_strength != 0.0f
-                                       : running && c->residual_valid && c->applied_flow.valid && k.fade > 0.01f &&
-                                             s.detail_strength != 0.0f;
+        const bool apply = running && c->residual_valid && c->applied_flow.valid && k.fade > 0.01f &&
+                           s.detail_strength != 0.0f;
         if (!apply) k.flags |= FLAG_COPY;
-        if (sync_active) {
-            // The network's own answer for this frame: laid on it as it is.
-            if (apply) k.flags |= FLAG_IDENTITY | FLAG_SYNC;
-            k.blend = 1.0f;
-            k.fade = 1.0f;
-        } else {
-            if (apply && (c->applied_flow.identity || !s.follow_motion)) k.flags |= FLAG_IDENTITY;
-            if (apply && c->depth_history_valid) k.flags |= FLAG_FILL;
-        }
+        if (apply && (c->applied_flow.identity || !s.follow_motion)) k.flags |= FLAG_IDENTITY;
+        if (apply && c->depth_history_valid) k.flags |= FLAG_FILL;
         if (s.show_tracking) k.flags |= FLAG_SHOW_TRACKING;
-        const bool older = !sync_active && apply && c->previous_flow.valid && !c->previous_flow.identity &&
+        const bool older = apply && c->previous_flow.valid && !c->previous_flow.identity &&
                            s.follow_motion;
         if (older) k.flags |= FLAG_PREVIOUS;
         // Halos around edges that have moved since: needs this frame's depth.
-        const bool edges = !sync_active && apply && c->depth_history_valid && s.follow_motion &&
+        const bool edges = apply && c->depth_history_valid && s.follow_motion &&
                            !(c->applied_flow.identity);
         if (edges) k.flags |= FLAG_EDGES;
         if (s.composition == DLSS5NR_COMPOSITION_REPLACE) k.flags |= FLAG_REPLACE;
@@ -1650,11 +1483,10 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         b.srv[0] = f->input;
         b.srv[1] = apply ? c->residual_soft : nullptr;
         b.srv[3] = apply ? c->residual : nullptr;
-        b.srv[4] = apply && !sync_active && !c->applied_flow.identity ? c->applied_flow.map[c->applied_flow.current]
+        b.srv[4] = apply && !c->applied_flow.identity ? c->applied_flow.map[c->applied_flow.current]
                                                                       : nullptr;
         // This frame's depth at the network's size, kept while tracking.
-        b.srv[5] = apply && !sync_active && c->depth_history_valid ? c->depth_history[c->depth_current] : nullptr;
-        b.srv[7] = apply && sync_active ? c->sync_status : nullptr;
+        b.srv[5] = apply && c->depth_history_valid ? c->depth_history[c->depth_current] : nullptr;
         b.srv[2] = older ? c->residual_previous : nullptr;
         b.srv[8] = edges ? c->residual_edges : nullptr;
         b.srv[9] = edges && older ? c->residual_previous_edges : nullptr;
@@ -1668,6 +1500,591 @@ DLSS5NR_API int dlss5nr_process(dlss5nr_context *c, const dlss5nr_frame *f) {
         transition(cmd, f->output, output_write, output_state);
     }
     transition(cmd, f->input, input_read, input_state);
+    return 0;
+}
+
+} // extern "C"
+
+// ------------------------------------------------------------------------------------------------------------
+// The linear mode: dlss5nr_process_queue. The frame goes through the network in order and is composed from its
+// own answer: capture on the queue, the network when the capture is done (the GPU waits on a fence the network's
+// side signals), the composition on the queue after it. No slots, no worker thread in the way, no displacement
+// maps, no result carried to a later frame. The worker only makes the images and the network's feature ready.
+// ------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr auto kLinearSizeSettle = std::chrono::milliseconds(750);
+constexpr auto kLinearControlsSettle = std::chrono::milliseconds(500);
+constexpr auto kLinearRetry = std::chrono::seconds(10);
+constexpr int kLinearMaxFailures = 3;
+
+// False if the fence did not reach the value in time: the GPU is stuck behind something, and the game must
+// not be held for it frame after frame.
+constexpr DWORD kLinearWaitMs = 2000;
+
+bool linear_wait_cpu(dlss5nr_context *c, uint64_t value, HANDLE event) {
+    if (!value || c->lin_fence->GetCompletedValue() >= value) return true;
+    c->lin_fence->SetEventOnCompletion(value, event);
+    if (WaitForSingleObject(event, kLinearWaitMs) == WAIT_OBJECT_0) return true;
+    c->log(0, "the GPU did not reach fence value %llu in %lu ms", (unsigned long long)value, kLinearWaitMs);
+    return false;
+}
+
+void linear_thread_main(dlss5nr_context *c);
+
+// The command lists, the fence both sides wait on. False: the linear mode cannot be had.
+bool linear_init(dlss5nr_context *c) {
+    if (c->lin_made) return true;
+    if (c->lin_failed) return false;
+    c->lin_failed = true;   // until it is all made
+    ID3D12Device *device = c->device;
+    for (int i = 0; i < kLinearRing; ++i)
+        for (int k = 0; k < 2; ++k) {
+            if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&c->lin_allocator[i][k]))) ||
+                FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->lin_allocator[i][k], nullptr,
+                                                 IID_PPV_ARGS(&c->lin_list[i][k]))))
+                return false;
+            c->lin_list[i][k]->Close();
+        }
+    if (FAILED(device->CreateFence(0, g_copy_interop ? D3D12_FENCE_FLAG_NONE : D3D12_FENCE_FLAG_SHARED,
+                                   IID_PPV_ARGS(&c->lin_fence))))
+        return false;
+    c->lin_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    char cpu_wait[8] = {};
+    c->lin_cpu_forced =
+        GetEnvironmentVariableA("DLSS5NR_LINEAR_CPU_WAIT", cpu_wait, sizeof cpu_wait) && cpu_wait[0] == '1';
+    c->lin_thread = std::thread(linear_thread_main, c);
+    c->lin_made = true;
+    c->lin_failed = false;
+    return true;
+}
+
+// Gives the fence to the network, once it is loaded (it is not when the first frame comes): the GPU then waits
+// for the capture and the game's queue waits for the network, with no wait on the CPU. Otherwise the CPU does both.
+void linear_import(dlss5nr_context *c) {
+    c->lin_import_tried = true;
+    if (!c->lin_cpu_forced && !g_copy_interop) {
+        HANDLE handle = nullptr;
+        std::string why;
+        if (SUCCEEDED(c->device->CreateSharedHandle(c->lin_fence, nullptr, GENERIC_ALL, nullptr, &handle)) &&
+            c->network.make_current(why) && c->network.import_fence(handle, &c->lin_semaphore, why)) {
+            c->lin_fence_handle = handle;
+            c->lin_gpu = true;
+        } else {
+            if (handle) CloseHandle(handle);
+            c->log(1, "the linear mode will wait on the CPU: the fence could not be shared with the network (%s)",
+                   why.c_str());
+        }
+    }
+    c->log(2, "the linear mode waits for the network on the %s", c->lin_gpu ? "GPU" : "CPU");
+}
+
+void linear_thread_main(dlss5nr_context *c) {
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (;;) {
+        LinearJob job;
+        {
+            std::unique_lock<std::mutex> guard(c->lin_job_lock);
+            c->lin_job_wake.wait(guard, [&] { return c->lin_job_stop || !c->lin_jobs.empty(); });
+            if (c->lin_jobs.empty()) break;
+            job = std::move(c->lin_jobs.front());
+            c->lin_jobs.pop_front();
+        }
+        auto trace = [&](const char *step) {
+            if (c->lin_trace > 0) c->log(2, "linear job %llu: %s", (unsigned long long)job.frame, step);
+        };
+        std::string error;
+        bool ok = !c->lin_job_stop;
+        // The capture is made by the game's queue, which is behind whatever the game gave it: this waits as long as
+        // that takes, here and not where the game's thread is.
+        if (ok && !linear_wait_cpu(c, job.before, event)) {
+            error = "the capture did not finish";
+            ok = false;
+        }
+        trace(ok ? "capture done" : "no evaluation");
+        const auto began = std::chrono::steady_clock::now();
+        bool signalled = false;
+        {
+            std::unique_lock<std::mutex> use(c->net_lock, std::try_to_lock);
+            // A feature being built holds the network for seconds: not waited for, the frame goes without.
+            for (int i = 0; ok && !use.owns_lock() && i < 25; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                use.try_lock();
+            }
+            std::string current;
+            const bool have_context = c->network.make_current(current);
+            if (ok && !use.owns_lock()) {
+                error = "the network is busy";
+                ok = false;
+            }
+            if (ok) ok = have_context && c->network.evaluate(job.desc, error, false);
+            // Always: the game's queue is waiting for it, and what it shows is the last result if there is none.
+            if (have_context) {
+                std::string why;
+                signalled = c->network.signal_fence(c->lin_semaphore, job.after, why);
+                if (!signalled) c->log(0, "could not signal the fence: %s", why.c_str());
+            }
+        }
+        trace("network queued");
+        if (signalled && !linear_wait_cpu(c, job.after, event)) ok = false;
+        if (ok) {
+            c->evaluation_ms = (float)std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - began).count();
+        } else {
+            c->log(0, "the network failed on a frame: %s", error.c_str());
+            c->lin_last_frame = ~0ull;
+            if (++c->lin_failures >= kLinearMaxFailures)
+                c->log(1, "the network failed %d times in a row: the frames go through as they are for a while",
+                       kLinearMaxFailures);
+        }
+        trace("job done");
+        --job.set->pending;
+    }
+    CloseHandle(event);
+}
+
+// Gives a set up: its Direct3D side once the GPU is past this frame, its CUDA side to the worker.
+void linear_retire(dlss5nr_context *c, std::unique_ptr<LinearSet> set) {
+    if (!set) return;
+    if (set->pending > 0) {
+        // The thread still has the network on these images.
+        c->lin_graveyard.push_back(std::move(set));
+        return;
+    }
+    if (set->residual) c->retired.push_back({set->residual, nullptr, c->fence_value + 1});
+    set->residual = nullptr;
+    SlotSet gone;
+    gone.width = set->width;
+    gone.height = set->height;
+    gone.image[0][0] = set->color;
+    gone.image[0][1] = set->depth;
+    gone.image[0][2] = set->motion;
+    gone.image[0][3] = set->output;
+    std::lock_guard<std::mutex> guard(c->lock);
+    c->evicting.push_back(std::move(gone));
+    c->wake.notify_all();
+}
+
+std::unique_ptr<LinearSet> linear_make(dlss5nr_context *c, uint32_t nw, uint32_t nh, const NetworkControls &controls) {
+    auto set = std::make_unique<LinearSet>();
+    set->width = nw;
+    set->height = nh;
+    set->controls = controls;
+    auto give_up = [&]() {
+        destroy_shared(set->color);
+        destroy_shared(set->depth);
+        destroy_shared(set->motion);
+        destroy_shared(set->output);
+        release(set->residual);
+        return std::unique_ptr<LinearSet>();
+    };
+    if (!make_shared(c->device, set->color, nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, false) ||
+        !make_shared(c->device, set->depth, nw, nh, DXGI_FORMAT_R32_FLOAT, false) ||
+        !make_shared(c->device, set->motion, nw, nh, DXGI_FORMAT_R16G16_FLOAT, false) ||
+        !make_shared(c->device, set->output, nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, true)) {
+        c->log(0, "could not create the network's %ux%u images", nw, nh);
+        return give_up();
+    }
+    set->residual = make_texture(c->device, nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (!set->residual) return give_up();
+    return set;
+}
+
+void linear_request(dlss5nr_context *c, LinearSet *set) {
+    set->ready = 0;
+    std::lock_guard<std::mutex> guard(c->lock);
+    c->lin_request = set;
+    c->wake.notify_all();
+}
+
+// The set to run the network on at this size, with the controls asked for, or null while there is none ready.
+// A new size or new controls are not followed at once (a slider being dragged would rebuild the network dozens of
+// times), and the network takes seconds to be ready for them: until it is, frames pass through as they came.
+LinearSet *linear_prepare(dlss5nr_context *c, uint32_t &nw, uint32_t &nh) {
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < c->lin_graveyard.size();) {
+        if (c->lin_graveyard[i]->pending == 0) {
+            std::unique_ptr<LinearSet> done = std::move(c->lin_graveyard[i]);
+            c->lin_graveyard.erase(c->lin_graveyard.begin() + i);
+            linear_retire(c, std::move(done));
+        } else {
+            ++i;
+        }
+    }
+    NetworkControls want;
+    {
+        std::lock_guard<std::mutex> guard(c->lock);
+        want = c->controls;
+    }
+    if (c->lin_set && (nw != c->lin_set->width || nh != c->lin_set->height)) {
+        if (c->lin_wanted_width != nw || c->lin_wanted_height != nh) {
+            c->lin_wanted_width = nw;
+            c->lin_wanted_height = nh;
+            c->lin_wanted_since = now;
+        }
+        if (now - c->lin_wanted_since < kLinearSizeSettle) {
+            nw = c->lin_set->width;
+            nh = c->lin_set->height;
+        }
+    } else {
+        c->lin_wanted_width = c->lin_wanted_height = 0;
+    }
+
+    if (c->lin_next) {
+        const int state = c->lin_next->ready;
+        if (state == 0) return nullptr;
+        if (state == 1) {
+            linear_retire(c, std::move(c->lin_set));
+            c->lin_set = std::move(c->lin_next);
+            c->lin_trace = 12;
+            c->lin_width = c->lin_set->width;
+            c->lin_height = c->lin_set->height;
+        } else {
+            linear_retire(c, std::move(c->lin_next));
+            c->lin_asked_at = now;   // tried again in a while
+            return nullptr;
+        }
+    }
+    if (!c->lin_set || c->lin_set->width != nw || c->lin_set->height != nh) {
+        if (!c->lin_set && c->lin_asked_at != std::chrono::steady_clock::time_point{} &&
+            now - c->lin_asked_at < kLinearRetry)
+            return nullptr;
+        c->lin_next = linear_make(c, nw, nh, want);
+        if (!c->lin_next) {
+            c->lin_asked_at = now;
+            return nullptr;
+        }
+        c->lin_asked_at = {};
+        linear_request(c, c->lin_next.get());
+        return nullptr;
+    }
+    LinearSet *set = c->lin_set.get();
+    const int state = set->ready;
+    if (state == 1) {
+        if (set->controls != want) {
+            if (want != c->lin_asked) {
+                c->lin_asked = want;
+                c->lin_asked_at = now;
+            } else if (now - c->lin_asked_at >= kLinearControlsSettle) {
+                set->controls = want;
+                linear_request(c, set);   // the feature again, for the new controls
+                return nullptr;
+            }
+        }
+        return set;
+    }
+    if (state == -1 && now - c->lin_asked_at >= kLinearRetry) {
+        c->lin_asked_at = now;
+        set->controls = want;
+        linear_request(c, set);
+    }
+    return nullptr;
+}
+
+} // namespace
+
+extern "C" {
+
+DLSS5NR_API int dlss5nr_process_queue(dlss5nr_context *c, ID3D12CommandQueue *queue, const dlss5nr_frame *f) {
+    if (!c || !queue || !f || f->struct_size < offsetof(dlss5nr_frame, exposure) || !f->input || !f->output ||
+        !f->width || !f->height)
+        return -1;
+    c->mark_host_ready();
+    const dlss5nr_settings &s = c->settings;
+    const D3D12_RESOURCE_STATES input_state = (D3D12_RESOURCE_STATES)f->input_state;
+    const D3D12_RESOURCE_STATES output_state = (D3D12_RESOURCE_STATES)f->output_state;
+    if (view_format(f->input->GetDesc().Format) == DXGI_FORMAT_UNKNOWN ||
+        view_format(f->output->GetDesc().Format) == DXGI_FORMAT_UNKNOWN)
+        return -2;
+
+    const bool running = c->state == DLSS5NR_STATE_RUNNING && s.enabled;
+    const bool guided = f->depth && f->motion;
+    const int encoding = s.encoding != DLSS5NR_ENCODING_AUTO ? (s.encoding == DLSS5NR_ENCODING_DISPLAY ? 1 : 0)
+                         : f->hdr                             ? 0
+                                                              : 1;
+    auto region_scale = [](ID3D12Resource *r, uint32_t w, uint32_t h, float out[2]) {
+        const D3D12_RESOURCE_DESC d = r->GetDesc();
+        out[0] = (float)w / (float)d.Width;
+        out[1] = (float)h / (float)d.Height;
+    };
+
+    Constants base{};
+    base.encoding = (uint32_t)encoding;
+    base.colour_strength = s.colour_strength;
+    base.exposure_mul = s.exposure;
+    base.pre_exposure = f->pre_exposure > 0.0f ? f->pre_exposure : 1.0f;
+    base.exposure_mode = (uint32_t)(s.exposure_mode == DLSS5NR_EXPOSURE_GAME && !f->exposure ? DLSS5NR_EXPOSURE_AUTO
+                                                                                            : s.exposure_mode);
+    base.adaptation = base.exposure_mode == DLSS5NR_EXPOSURE_GAME ? 1.0f : 0.05f;
+    base.flags = (f->reset ? FLAG_RESET : 0) | (f->depth_inverted ? FLAG_DEPTH_INVERTED : 0);
+
+    // Rounded to a multiple of 8: the network works in 8x8 windows.
+    uint32_t nw = (uint32_t)(f->width * s.resolution_scale + 0.5f) & ~7u;
+    uint32_t nh = (uint32_t)(f->height * s.resolution_scale + 0.5f) & ~7u;
+    if (nw < 64) nw = 64;
+    if (nh < 64) nh = 64;
+
+    // DLSS5NR_LINEAR_PROFILE=1: how long this call takes on the CPU, in the log, every 60 frames.
+    static const bool profile = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("DLSS5NR_LINEAR_PROFILE", v, sizeof v) && v[0] == '1';
+    }();
+    struct ProfileScope {
+        dlss5nr_context *c;
+        bool on;
+        std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        ~ProfileScope() {
+            if (!on) return;
+            c->lin_profile_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+            if (++c->lin_profile_calls % 60 == 0) {
+                c->log(2, "linear mode: %.2f ms of CPU per call over the last 60 calls", c->lin_profile_ms / 60.0);
+                c->lin_profile_ms = 0.0;
+            }
+        }
+    } profile_scope{c, profile};
+
+    auto trace = [&](const char *step) {
+        if (c->lin_trace > 0) c->log(2, "linear frame %llu: %s", (unsigned long long)c->frame, step);
+    };
+    trace("begin");
+    if (!linear_init(c)) return -3;
+    if (c->lin_failures >= kLinearMaxFailures) {
+        // Given up on for a while: it may have been the network busy building a feature.
+        if (c->lin_retry_at == std::chrono::steady_clock::time_point{})
+            c->lin_retry_at = std::chrono::steady_clock::now() + kLinearRetry;
+        else if (std::chrono::steady_clock::now() >= c->lin_retry_at) {
+            c->lin_failures = 0;
+            c->lin_retry_at = {};
+        }
+    }
+    LinearSet *set = running && c->lin_failures < kLinearMaxFailures ? linear_prepare(c, nw, nh) : nullptr;
+
+    trace(set ? "set ready" : "no set: the frame passes through");
+    const uint32_t slot = c->lin_ring++ % kLinearRing;
+    linear_wait_cpu(c, c->lin_ring_value[slot], c->lin_event);
+    trace("slot free");   // the lists of this slot were last used a few frames ago
+
+    const D3D12_RESOURCE_STATES input_read = readable(input_state);
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES depth_state = (D3D12_RESOURCE_STATES)f->depth_state;
+    const D3D12_RESOURCE_STATES motion_state = (D3D12_RESOURCE_STATES)f->motion_state;
+
+    auto network_constants = [&]() {
+        Constants k = base;
+        k.size[0] = nw;
+        k.size[1] = nh;
+        k.inv_size[0] = 1.0f / nw;
+        k.inv_size[1] = 1.0f / nh;
+        region_scale(f->input, f->width, f->height, k.uv0_scale);
+        if (guided) {
+            region_scale(f->depth, f->depth_width, f->depth_height, k.uv1_scale);
+            region_scale(f->motion, f->motion_width, f->motion_height, k.uv2_scale);
+        }
+        k.motion_to_px[0] = f->motion_width ? f->motion_scale_x * (float)nw / (float)f->motion_width : 0.0f;
+        k.motion_to_px[1] = f->motion_height ? f->motion_scale_y * (float)nh / (float)f->motion_height : 0.0f;
+        return k;
+    };
+
+    // ---------------------------------------------------------------------------------- the network's turn
+    bool evaluated = false;
+    std::unique_lock<std::mutex> use_network(c->net_lock, std::try_to_lock);
+    if (set && use_network.owns_lock() && s.detail_strength != 0.0f) {
+        if (!c->lin_import_tried) linear_import(c);
+        const auto began = std::chrono::steady_clock::now();
+        // The network keeps its history from the frame before, along the game's own motion vectors: every
+        // frame is evaluated, so there is always one, unless there was a cut or the frames were not consecutive.
+        static const bool history_allowed = [] {
+            char v[8] = {};
+            return !(GetEnvironmentVariableA("DLSS5NR_LINEAR_HISTORY", v, sizeof v) && v[0] == '0');
+        }();
+        const bool has_history = history_allowed && guided && f->reset == 0 && s.passes <= 1 &&
+                                 c->lin_last_frame != ~0ull && c->lin_last_frame + 1 == c->frame;
+        ID3D12GraphicsCommandList *in = c->lin_list[slot][0];
+        c->lin_allocator[slot][0]->Reset();
+        in->Reset(c->lin_allocator[slot][0], nullptr);
+        transition(in, f->input, input_state, input_read);
+        if (encoding != 1 && base.exposure_mode != DLSS5NR_EXPOSURE_FIXED) {
+            Constants k = base;
+            region_scale(f->input, f->width, f->height, k.uv0_scale);
+            Bindings b;
+            b.srv[0] = f->input;
+            const D3D12_RESOURCE_STATES exposure_state = (D3D12_RESOURCE_STATES)f->exposure_state;
+            if (base.exposure_mode == DLSS5NR_EXPOSURE_GAME) {
+                b.srv[1] = f->exposure;
+                transition(in, f->exposure, exposure_state, readable(exposure_state));
+            }
+            b.exposure_buffer = c->exposure_buffer;
+            c->passes.dispatch(in, Pass::Exposure, k, b, 1, 1);
+            uav_barrier(in, c->exposure_buffer);
+            if (base.exposure_mode == DLSS5NR_EXPOSURE_GAME)
+                transition(in, f->exposure, readable(exposure_state), exposure_state);
+        }
+        if (guided) {
+            transition(in, f->depth, depth_state, readable(depth_state));
+            transition(in, f->motion, motion_state, readable(motion_state));
+        }
+        Constants k = network_constants();
+        k.flags |= has_history ? FLAG_RAWMV : FLAG_IDENTITY;
+        for (ID3D12Resource *r : {set->color.resource, set->depth.resource, set->motion.resource})
+            transition(in, r, D3D12_RESOURCE_STATE_COMMON, write);
+        Bindings capture;
+        capture.srv[0] = f->input;
+        capture.srv[1] = f->depth;
+        capture.srv[2] = has_history ? f->motion : nullptr;
+        capture.uav[0] = set->color.resource;
+        capture.uav[1] = set->depth.resource;
+        capture.uav[2] = set->motion.resource;
+        capture.exposure_buffer = c->exposure_buffer;
+        c->passes.dispatch(in, Pass::Capture, k, capture, nw, nh);
+        for (ID3D12Resource *r : {set->color.resource, set->depth.resource, set->motion.resource})
+            transition(in, r, write, D3D12_RESOURCE_STATE_COMMON);
+        if (guided) {
+            transition(in, f->depth, readable(depth_state), depth_state);
+            transition(in, f->motion, readable(motion_state), motion_state);
+        }
+        transition(in, f->input, input_read, input_state);
+        in->Close();
+        ID3D12CommandList *first[] = {in};
+        trace("capture list ready");
+        queue->ExecuteCommandLists(1, first);
+        const uint64_t before = ++c->lin_value;
+        queue->Signal(c->lin_fence, before);
+        trace("capture submitted");
+
+        EvaluateDesc desc;
+        desc.color = &set->color;
+        desc.depth = &set->depth;
+        desc.motion = &set->motion;
+        desc.output = &set->output;
+        desc.depth_inverted = f->depth_inverted != 0;
+        desc.reset = !has_history;
+        desc.controls = set->controls;
+        {
+            std::lock_guard<std::mutex> guard(c->lock);
+            desc.passes = c->network_passes;
+            desc.keep_local_tone = c->keep_local_tone;
+        }
+        std::string error;
+        bool ok = true;
+        if (c->lin_gpu) {
+            // The network runs on the thread made for it, once the capture is done; the game's queue waits for the
+            // answer on the GPU. Nothing waits here.
+            use_network.unlock();
+            const uint64_t after = ++c->lin_value;
+            LinearJob job;
+            job.set = set;
+            job.before = before;
+            job.after = after;
+            job.frame = c->frame;
+            job.desc = desc;
+            ++set->pending;
+            {
+                std::lock_guard<std::mutex> guard(c->lin_job_lock);
+                c->lin_jobs.push_back(std::move(job));
+            }
+            c->lin_job_wake.notify_one();
+            queue->Wait(c->lin_fence, after);
+            trace("network queued for the thread");
+        } else {
+            trace("network on the CPU's wait");
+            ok = c->network.make_current(error);
+            if (ok && !linear_wait_cpu(c, before, c->lin_event)) {
+                error = "the capture did not finish";
+                ok = false;
+            }
+            if (ok) {
+                const auto network_began = std::chrono::steady_clock::now();
+                ok = c->network.evaluate(desc, error, true);
+                if (ok)
+                    c->evaluation_ms = (float)std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - network_began).count();
+            }
+        }
+        if (ok) {
+            c->lin_failures = 0;
+            c->lin_last_frame = c->frame;
+            evaluated = true;
+            ++c->results;
+            c->result_age = 0;
+            c->result_latency = 0;
+            if (c->lin_last_began != std::chrono::steady_clock::time_point{}) {
+                const double period = std::chrono::duration<double>(began - c->lin_last_began).count();
+                if (period > 0.0)
+                    c->evaluations_per_second = 0.9f * c->evaluations_per_second.load() + 0.1f * (float)(1.0 / period);
+            }
+            c->lin_last_began = began;
+        } else {
+            c->log(0, "the network failed on a frame: %s", error.c_str());
+            c->lin_last_frame = ~0ull;
+            if (++c->lin_failures >= kLinearMaxFailures)
+                c->log(1, "the network failed %d times in a row: the frames go through as they are for a while",
+                       kLinearMaxFailures);
+        }
+    }
+    if (use_network.owns_lock()) use_network.unlock();
+    trace("network done");
+
+    // ------------------------------------------------------------------------------------- the composition
+    ID3D12GraphicsCommandList *out = c->lin_list[slot][1];
+    c->lin_allocator[slot][1]->Reset();
+    out->Reset(c->lin_allocator[slot][1], nullptr);
+    transition(out, f->input, input_state, input_read);
+    if (evaluated) {
+        // What the network made of it, as a luminance ratio against the image it was shown.
+        transition(out, set->output.resource, D3D12_RESOURCE_STATE_COMMON, read);
+        transition(out, set->color.resource, D3D12_RESOURCE_STATE_COMMON, read);
+        transition(out, set->depth.resource, D3D12_RESOURCE_STATE_COMMON, read);
+        transition(out, set->residual, set->residual_state, write);
+        Bindings b;
+        b.srv[0] = set->output.resource;
+        b.srv[1] = set->color.resource;
+        b.srv[2] = set->depth.resource;
+        b.uav[0] = set->residual;
+        b.exposure_buffer = c->exposure_buffer;
+        c->passes.dispatch(out, Pass::Refresh, network_constants(), b, nw, nh);
+        transition(out, set->residual, write, read);
+        set->residual_state = read;
+        transition(out, set->output.resource, read, D3D12_RESOURCE_STATE_COMMON);
+        transition(out, set->color.resource, read, D3D12_RESOURCE_STATE_COMMON);
+        transition(out, set->depth.resource, read, D3D12_RESOURCE_STATE_COMMON);
+    }
+    {
+        Constants k = base;
+        k.size[0] = f->width;
+        k.size[1] = f->height;
+        k.inv_size[0] = 1.0f / f->width;
+        k.inv_size[1] = 1.0f / f->height;
+        k.uv1_scale[0] = 1.0f / nw;
+        k.uv1_scale[1] = 1.0f / nh;
+        k.strength = s.detail_strength;
+        k.max_ratio = s.max_ratio;
+        k.fade = 1.0f;
+        k.blend = 1.0f;
+        // The network's own answer for this frame, laid on it where it was made; or the frame as it came.
+        k.flags |= evaluated ? FLAG_IDENTITY : FLAG_COPY;
+        if (s.composition == DLSS5NR_COMPOSITION_REPLACE) k.flags |= FLAG_REPLACE;
+        transition(out, f->output, output_state, write);
+        Bindings b;
+        b.srv[0] = f->input;
+        b.srv[3] = evaluated ? set->residual : nullptr;
+        b.uav[0] = f->output;
+        b.exposure_buffer = c->exposure_buffer;
+        c->passes.dispatch(out, Pass::Compose, k, b, f->width, f->height);
+        if (output_state == write) uav_barrier(out, f->output);
+        transition(out, f->output, write, output_state);
+    }
+    transition(out, f->input, input_read, input_state);
+    out->Close();
+    ID3D12CommandList *second[] = {out};
+    queue->ExecuteCommandLists(1, second);
+    c->lin_ring_value[slot] = ++c->lin_value;
+    queue->Signal(c->lin_fence, c->lin_ring_value[slot]);
+    trace("composition submitted");
+    if (c->lin_trace > 0) --c->lin_trace;
     return 0;
 }
 

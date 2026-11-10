@@ -828,51 +828,6 @@ void compose_main(uint3 id : SV_DispatchThreadID)
     }
     u0[id.xy] = result;
 }
-
-// ------------------------------------------------------------------- sync
-// Waiting for the network inside the frame. The game's command list goes on
-// only once the network has answered, so the answer is composed into the very
-// frame it was made from. The GPU and the worker thread talk through host
-// memory (u3), a line of 128 bytes to a word: the capture's number is written
-// when it is in place (by the command processor, or sync_signal when the list
-// does not allow that), to the line of its own in a ring of four, which the worker
-// looks for; no shader writes to those lines, since a line a shader has written
-// stays in the GPU's cache and hides what is written to it after. The worker answers by
-// writing the capture's number (with the top bit set if the network failed)
-// into every line of a stretch of the buffer, from line exposure_mode on, and
-// sync_wait reads those lines one after the other, size.y of them at most,
-// until it finds its number. Every line is read once: what a GPU has read
-// stays in its cache, and a word it keeps looking at is never seen to change,
-// whatever the way it is read (measured), where a line it has not looked at
-// before is read from memory as it is then. Ending at the last line is the
-// wait running out; how many it read goes to the host (byte 512), and u0 gets 1
-// if the network answered, 0 if not.
-[numthreads(1, 1, 1)]
-void sync_signal_main()
-{
-    u3.Store((size.x % 4) * 128, size.x);
-    DeviceMemoryBarrier();
-}
-
-[numthreads(1, 1, 1)]
-void sync_wait_main()
-{
-    uint spins = 0;
-    uint answer = 0;
-    uint idle = 1;
-    [loop] while (spins < size.y) {
-        answer = u3.Load((exposure_mode + spins) * 128);
-        if ((answer & 0x7FFFFFFFu) == size.x) break;
-        ++spins;
-        // A few microseconds between two looks: the lines to read, and so the host
-        // memory they take, are as many as the wait is long over this.
-        [loop] for (uint i = 0; i < 3000; ++i) idle = idle * 1664525u + 1013904223u;
-    }
-    u3.Store(520, idle);
-    u3.Store(512, spins);
-    u3.Store(516, size.y);
-    u0[uint2(0, 0)] = float4(answer == size.x ? 1.0 : 0.0, 0.0, 0.0, 0.0);
-}
 )HLSL";
 
 } // namespace dlss5nr

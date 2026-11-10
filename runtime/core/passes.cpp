@@ -188,7 +188,7 @@ void Passes::dispatch(ID3D12GraphicsCommandList *cmd, Pass pass, const Constants
     cmd->SetPipelineState(pipelines_[(int)pass]);
     cmd->SetComputeRoot32BitConstants(0, sizeof(Constants) / 4, &constants, 0);
     cmd->SetComputeRootDescriptorTable(1, gpu);
-    if (pass == Pass::Exposure || pass == Pass::SyncSignal || pass == Pass::SyncWait)
+    if (pass == Pass::Exposure)
         cmd->Dispatch(1, 1, 1);
     else
         cmd->Dispatch((width + 7) / 8, (height + 7) / 8, 1);

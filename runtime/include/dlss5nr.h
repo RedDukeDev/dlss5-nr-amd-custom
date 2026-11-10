@@ -137,15 +137,6 @@ typedef struct dlss5nr_settings {
      * outside the image in the frame of the capture: green where they were
      * filled in from around them, red where not. For diagnosis. */
     int32_t show_tracking;
-    /* 1: the frame waits for the network. The GPU waits inside the game's own
-     * command list until the network has answered for the frame it just
-     * captured, and the answer is composed into that very frame: nothing is
-     * carried along motion vectors, nothing trails, and the frame rate is the
-     * network's. (Until the network has answered once, and where the wait
-     * cannot be done, dlss5nr_present waits instead and every frame gets a
-     * result one frame old.) 0: the game never waits, and a result is as many
-     * frames old as its evaluation took. */
-    int32_t wait_for_network;
 
     /* How many times the network runs on a frame, 1 .. 8. Each pass after the
      * first takes the result of the one before as its picture, so the effect
@@ -163,14 +154,6 @@ typedef struct dlss5nr_settings {
      * with every result, which shows as a flicker at each switch; 0 switches at
      * once. */
     int32_t blend_frames;
-
-    /* With wait_for_network: 1 composes the network's answer into the very frame it was
-     * made from (the GPU waits for it inside the game's command list), 0 into the next
-     * one, which has a result one frame old to follow motion vectors with. The first
-     * leaves nothing trailing behind moving objects, but its frame takes longer: the
-     * capture is only known to the host after the GPU's cache has written it out, which
-     * takes some tens of milliseconds more. Experimental. */
-    int32_t wait_inside;
 
     /* Which network the library runs: 0 the library's own default, 1 and up the
      * presets it carries, in its order (version 310.9.16 carries two: 1 the
@@ -198,8 +181,8 @@ typedef struct dlss5nr_frame {
      * resolution, which is also the image's when the network runs before the
      * upscaler). Both may be null, for a host that only has the finished
      * image: the network then runs without them and without its history, and
-     * its result cannot follow the scene, so it trails behind whatever moves
-     * unless wait_for_network is set. */
+     * its result cannot follow the scene, so with dlss5nr_process it trails
+     * behind whatever moves (dlss5nr_process_queue has no such lag). */
     ID3D12Resource *depth;
     uint32_t depth_state;
     ID3D12Resource *motion;
@@ -264,6 +247,19 @@ DLSS5NR_API void dlss5nr_set_settings(dlss5nr_context *context, const dlss5nr_se
  * host should write output itself. Changes the descriptor heaps and the
  * compute state of the command list, as any upscaler does. */
 DLSS5NR_API int dlss5nr_process(dlss5nr_context *context, const dlss5nr_frame *frame);
+
+/* The linear mode: the frame goes through the network in order, and its answer is composed into that very frame.
+ * Everything the game recorded up to the image to enhance has been submitted to `queue`; this puts the capture
+ * of the image on the queue, runs the network when the capture is done, and puts the composition of its answer
+ * on the queue after it, so that what the host submits next comes after the whole of it. The GPU does the
+ * waiting, through a fence shared with the network's side (where that cannot be, the CPU does, for this call).
+ * Nothing trails behind moving objects, nothing is carried between frames but the network's own history, and
+ * the frame takes as long as the network does. dlss5nr_frame is as for dlss5nr_process, but command_list is not
+ * used (may be null): the runtime records its own lists. Returns 0 when output holds the frame, enhanced or, while
+ * the network is not ready yet (its feature takes seconds to build, again for each new size or setting) or has
+ * failed, as it came in; anything else when nothing was written and the host has to write output itself.
+ * Called from the thread that submits to queue, in place of dlss5nr_process: a host uses one of the two. */
+DLSS5NR_API int dlss5nr_process_queue(dlss5nr_context *context, ID3D12CommandQueue *queue, const dlss5nr_frame *frame);
 
 /* Tells the runtime that everything recorded for this frame has been
  * submitted to queue, which must be the queue the command lists went to.

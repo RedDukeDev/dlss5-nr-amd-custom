@@ -58,7 +58,7 @@ struct Runtime {
     decltype(&dlss5nr_destroy) destroy = nullptr;
     decltype(&dlss5nr_default_settings) default_settings = nullptr;
     decltype(&dlss5nr_set_settings) set_settings = nullptr;
-    decltype(&dlss5nr_process) process = nullptr;
+    decltype(&dlss5nr_process_queue) process_queue = nullptr;
     decltype(&dlss5nr_present) present = nullptr;
     decltype(&dlss5nr_get_status) get_status = nullptr;
 
@@ -70,11 +70,11 @@ struct Runtime {
         BIND(destroy);
         BIND(default_settings);
         BIND(set_settings);
-        BIND(process);
+        BIND(process_queue);
         BIND(present);
         BIND(get_status);
 #undef BIND
-        return create && destroy && default_settings && set_settings && process && present && get_status;
+        return create && destroy && default_settings && set_settings && process_queue && present && get_status;
     }
 };
 
@@ -265,9 +265,9 @@ void fill_effective(const dlss5nr_settings &s, bridge::Settings &e) {
     e.smoothing = g_smoothing;
 }
 
-// What the host needs of the runtime, whatever the user chose: the frame waits for the
-// network and carries nothing along (there are no motion vectors), because the result is
-// turned into a gain and applied by the client to a later frame.
+// What the host needs of the runtime, whatever the user chose: the picture goes through the
+// network in order (dlss5nr_process_queue) and nothing is carried along (there are no motion
+// vectors), because the result is turned into a gain and applied by the client to a later frame.
 void force_settings(dlss5nr_settings &s) {
     s.enabled = 1;
     // The client sends the picture at the network's resolution already, and the gain it gets back is
@@ -275,8 +275,6 @@ void force_settings(dlss5nr_settings &s) {
     s.resolution_scale = 1.0f;
     s.composition = DLSS5NR_COMPOSITION_RATIO;
     s.encoding = DLSS5NR_ENCODING_DISPLAY;
-    s.wait_for_network = 1;
-    s.wait_inside = 0;
     s.follow_motion = 0;
     s.network_history = 0;
     s.blend_frames = 0;
@@ -519,7 +517,7 @@ int wmain(int argc, wchar_t **argv) {
             }
             dlss5nr_frame f{};
             f.struct_size = sizeof f;
-            f.command_list = gpu.cmd;
+            f.command_list = nullptr;
             f.input = frame.input;
             f.input_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             f.output = frame.output;
@@ -528,7 +526,11 @@ int wmain(int argc, wchar_t **argv) {
             f.height = hh;
             f.pre_exposure = 1.0f;
             f.reset = 0;
-            if (rt.process(nr, &f) != 0) return fail("dlss5nr_process failed");
+            // What the list holds so far (the picture, the first time) goes to the queue; the runtime puts
+            // the network's round after it, and the empty list that follows waits for all of it.
+            gpu.submit_and_wait();
+            if (rt.process_queue(nr, gpu.queue, &f) != 0) return fail("dlss5nr_process_queue failed");
+            gpu.begin();
             gpu.submit_and_wait();
             rt.present(nr, gpu.queue);
             rt.get_status(nr, &status);

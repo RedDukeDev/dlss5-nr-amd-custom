@@ -33,9 +33,9 @@
 //                   [--runtime-dir dir] [--data-dir dir] [--frames 60]
 //                   [--scale 1.0] [--motion dx,dy] [--depth 0.0] [--evaluations 3]
 //                   [--linear] [--hdr] [--ratio] [--scroll dx,dy]
-//                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--wait] [--bare]
+//                   [--object dx,dy] [--orbit dx,dy] [--show-tracking] [--bare] [--sync]
 //                   [--churn n] [--passes n] [--no-keep-tone]
-//                   [--light-step frame,gain] [--snap f1,f2,...] [--inside]
+//                   [--light-step frame,gain] [--snap f1,f2,...]
 //                   [--depths object,scene] [--depth-inverted] [--dolly r]
 //                   [--skin v] [--local-tone v] [--local-structure v]
 //                   [--intensity v] [--style n]
@@ -312,27 +312,25 @@ int wmain(int argc, wchar_t **argv) {
     // (with the far plane at 0, towards it; away from it otherwise), as when it orbits a
     // character or walks: the same surface keeps changing its depth.
     float dolly = 0.0f;
-    bool inside = false;
     // The network's own controls, when given; the runtime's defaults otherwise.
     float skin = -2.0f, local_tone = -2.0f, local_structure = -2.0f, intensity = -2.0f;
     int style = -1;
-    bool linear = false, hdr = false, ratio = false, show_tracking = false, wait = false, bare = false;
+    bool linear = false, hdr = false, ratio = false, show_tracking = false, bare = false, sync_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::wstring flag = argv[i];
         linear |= flag == L"--linear" || flag == L"--hdr";
         hdr |= flag == L"--hdr";
         ratio |= flag == L"--ratio";
         show_tracking |= flag == L"--show-tracking";
-        wait |= flag == L"--wait";
         bare |= flag == L"--bare";
+        sync_mode |= flag == L"--sync";
         if (flag == L"--no-keep-tone") keep_tone = false;
-        inside |= flag == L"--inside";
         depth_inverted |= flag == L"--depth-inverted";
     }
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::wstring key = argv[i], value = argv[i + 1];
         if (key == L"--linear" || key == L"--hdr" || key == L"--ratio" || key == L"--show-tracking" ||
-            key == L"--wait" || key == L"--bare" || key == L"--no-keep-tone" || key == L"--inside" || key == L"--depth-inverted") {
+            key == L"--bare" || key == L"--sync" || key == L"--no-keep-tone" || key == L"--depth-inverted") {
             --i;
             continue;
         }
@@ -508,12 +506,10 @@ int wmain(int argc, wchar_t **argv) {
     if (local_structure > -2.0f) settings.local_structure = local_structure;
     if (intensity > -2.0f) settings.intensity = intensity;
     if (style >= 0) settings.style = style;
-    settings.wait_for_network = wait ? 1 : 0;
     settings.passes = passes;
     settings.keep_local_tone = keep_tone ? 1 : 0;
     if (blend_frames >= 0) settings.blend_frames = blend_frames;
     settings.network_preset = preset;
-    settings.wait_inside = inside ? 1 : 0;
     dlss5nr_set_settings(nr, &settings);
 
     // Until the network runs, frames are copies; wait for it rather than
@@ -718,9 +714,20 @@ int wmain(int argc, wchar_t **argv) {
         f.hdr = hdr ? 1 : 0;
         f.reset = frame == 0;
         const auto t0 = std::chrono::steady_clock::now();
-        if (dlss5nr_process(nr, &f) != 0) return fail("dlss5nr_process failed"), 1;
-        record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        gpu.submit_and_wait();
+        if (sync_mode) {
+            // The linear mode: what the frame holds so far goes to the queue, and the runtime puts the network's
+            // round after it, on the queue; the empty list that follows waits for all of it.
+            f.command_list = nullptr;
+            gpu.submit_and_wait();
+            if (dlss5nr_process_queue(nr, gpu.queue, &f) != 0) return fail("dlss5nr_process_queue failed"), 1;
+            record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            gpu.begin();
+            gpu.submit_and_wait();
+        } else {
+            if (dlss5nr_process(nr, &f) != 0) return fail("dlss5nr_process failed"), 1;
+            record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            gpu.submit_and_wait();
+        }
         dlss5nr_present(nr, gpu.queue);
         if (rider) {
             dlss5nr_upscaler_frame uf{};

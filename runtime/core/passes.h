@@ -13,7 +13,7 @@
 
 namespace dlss5nr {
 
-enum class Pass { Exposure, Capture, Refresh, Soften, Track, Compose, SyncSignal, SyncWait, Count };
+enum class Pass { Exposure, Capture, Refresh, Soften, Track, Compose, Count };
 
 // Mirrors the cbuffer in shaders.h, 24 dwords.
 struct Constants {
