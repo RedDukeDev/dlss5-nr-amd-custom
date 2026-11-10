@@ -170,7 +170,7 @@ moves, as without an upscaler in Direct3D 12 (*Wait for the network* avoids that
 
 ### DXVK comes with the package
 
-DXVK 3.1.1 (zlib license; the exact files and their hashes are listed in `dxvk/README.txt`) is in the
+DXVK 3.1.1 (zlib license; the exact files and their hashes are listed in `third_party/dxvk/README.txt`) is in the
 `dxvk` folder of the package, so there is nothing to download. `setup_windows.bat` takes care of it:
 
 1. Run it in the game's folder as usual. It asks whether the game is an old one, Direct3D 9 or 10 (answer 1,
@@ -310,7 +310,7 @@ problem.
 - **Kernels:** `python kernels\build_kernels.py`, which builds every kernel
   `kernels\kernels.txt` names, in parallel (the AMD HIP SDK and Visual Studio).
 - **ZLUDA:** see `third_party/ZLUDA`.
-- **OptiScaler:** `optiscaler\OptiScaler.sln`.
+- **OptiScaler:** `third_party\optiscaler\OptiScaler.sln`.
 - **NVIDIA's libraries:** they are too large for the repository and are only shipped in the
   release package; `third_party\` keeps a copy for building and packaging, which `.gitignore`
   leaves out. Put there `nvngx_dlssnr.dll` (neural rendering, version 310.9.16.0), `nvngx_dlss.dll`
